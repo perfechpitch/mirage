@@ -415,9 +415,23 @@ __device__ __forceinline__ uint32_t cnt_ld(uint32_t const *c) {
                : "memory");
   return v;
 }
+// the pause between a poll's rounds (0: spin): STATIC_CNT_POLL_NS a counter's
+// (cnt_wait), STATIC_POLL_NS a polled buffer's (data-as-flag); a layer may
+// set them (StaticMegakernel.poll_ns)
+#ifndef STATIC_CNT_POLL_NS
+#define STATIC_CNT_POLL_NS 200
+#endif
+#ifndef STATIC_POLL_NS
+#define STATIC_POLL_NS 64
+#endif
+__device__ __forceinline__ void poll_pause(int ns) {
+  if (ns > 0) {
+    __nanosleep(ns);
+  }
+}
 __device__ __forceinline__ void cnt_wait(uint32_t const *c, uint32_t target) {
   while (cnt_ld(c) < target) {
-    __nanosleep(200);
+    poll_pause(STATIC_CNT_POLL_NS);
   }
 }
 // sums several SMs add into (shared gate_up's K parts, gemm_tile.cuh): int64
@@ -486,7 +500,7 @@ __device__ __forceinline__ uint4 poll16(
     if ((v.x & v.y & v.z & v.w) != 0xFFFFFFFFu) {
       return v;
     }
-    __nanosleep(64);
+    poll_pause(STATIC_POLL_NS);
   }
 }
 __device__ __forceinline__ bool validf(float v) {
@@ -925,6 +939,11 @@ __device__ __forceinline__ void issue_job(TileJob const &j,
                                    // issuers at least one stage / piece
 }
 
+// the TMEM column of issue_job_warp's first weight-scale slot: 232, between the
+// accumulators and the free columns; T = 64 (11-21, DeepSeek-V4.1's
+// swiglu_moe_experts): 256, past the accumulators' 256 columns
+constexpr int TM_W13_SF = T == 64 ? 256 : 232;
+
 // moe_experts' issuer iss for a kind 1 job (W13: piece iss of every stage),
 // run by a whole warp (all 32 lanes call it; one elected lane issues each
 // operation). Each (ring stage st, piece at) has its own weight-scale slot in
@@ -961,7 +980,7 @@ __device__ __forceinline__ void
     int const na = (j.natoms - 2 * s < 2) ? j.natoms - 2 * s : 2;
     for (int at = 0; at < na; at++) {
       int const atom = 2 * s + at;
-      uint32_t const sfp = tb + 232 + 4 * (st * 2 + at);
+      uint32_t const sfp = tb + TM_W13_SF + 4 * (st * 2 + at);
       if (one) {
         cp_sf(sfp, base + OFF_WSF + (st * 2 + at) * SF_CHUNK);
       }
@@ -990,10 +1009,11 @@ __device__ __forceinline__ void
 
 // epilogue (warps 2..5, 128 threads): wait for accumulator stage a, add the two
 // issuers' accumulators -> v[TW] (one per token: the first T) of this thread's
-// row; returns the row (0..ROWS-1), or -1 for a thread without a row. ROWS =
-// 128: row = TMEM lane. ROWS = 64 (MMA M = 64): each warp's 32-lane TMEM slice
-// holds 16 rows in lanes 0..15 (16 data paths per slice), so row = 16 x slice +
-// lane for lanes 0..15 and lanes 16..31 have no row
+// row; returns
+// the row (0..ROWS-1), or -1 for a thread without a row. ROWS = 128: row = TMEM
+// lane. ROWS = 64 (MMA M = 64): each warp's 32-lane TMEM slice holds 16 rows in
+// lanes 0..15 (16 data paths per slice), so row = 16 x slice + lane for lanes
+// 0..15 and lanes 16..31 have no row
 template <int ROWS = 128>
 __device__ int drain_acc(uint32_t tb, int a, int parity, float *v) {
   int const warp = threadIdx.x >> 5, lane = threadIdx.x & 31, lgrp = warp & 3;

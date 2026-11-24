@@ -638,6 +638,9 @@ def main():
     ap.add_argument("--cupti", action="store_true", help="also time --reps launches with the torch profiler: the kernel's "
                     "duration in its trace (CUPTI), as SGLang's kernels are timed from their profiler trace")
     ap.add_argument("--save-plan", default=None, metavar="FILE", help="write the plan the layer was built with to FILE")
+    ap.add_argument("--save-y", default=None, metavar="FILE",
+                    help="write the first launch's y (bf16 [T, 5120]) to this raw file: the T = 1 vs T = 8 check (the same "
+                         "seed gives row t the same inputs at every T, so a T < 8 layer's row 0 must equal a T = 8 layer's)")
     ap.add_argument("--golden", help="a golden dir (the official implementation's cases): check the layer against its cases "
                     "of --layer instead")
     ap.add_argument("--cases", nargs="*", default=None, help="with --golden: these cases only")
@@ -689,6 +692,9 @@ def main():
         random_inputs(wg, variant, ratio, args.pos)
     h.launch(timeout_s=60)   # the same inputs each launch: every later launch writes the same cache rows again
     y0 = w["y"].cpu()
+    if args.save_y:
+        y0.to(torch.bfloat16).contiguous().view(T, HID).numpy().tofile(args.save_y)
+        print(f"y [T={T}, {HID}] written to {args.save_y}", flush=True)
     if multi:   # the all-reduce's result: the same bits on every GPU
         diff = [g for g, wg in enumerate(ws) if not torch.equal(wg["y"].cpu().view(torch.int16), y0.view(torch.int16))]
         if diff:
