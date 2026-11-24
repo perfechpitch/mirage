@@ -42,6 +42,9 @@ def main():
     ap.add_argument("--override", default=None, help="--json-model-override-args")
     ap.add_argument("--load-format", default=None)
     ap.add_argument("--engram-config", default=None, help="--engram-config JSON (e.g. '{\"placement\": \"cpu\"}')")
+    ap.add_argument("--watchdog", type=float, default=None,
+                    help="watchdog timeout in seconds (SGLang's default 300 kills a run whose first step "
+                         "spends longer compiling JIT kernels)")
     ap.add_argument("--no-bounded-replay", action="store_true", help="a truncated model: --no-enable-decoder-swa-bounded-replay")
     ap.add_argument("--no-autotune", action="store_true", help="--disable-flashinfer-autotune: about 10 min less at startup")
     ap.add_argument("--out", default=None)
@@ -74,7 +77,7 @@ def main():
                      max_running_requests=max(8, a.prompts), cuda_graph_max_bs_decode=max(8, a.prompts), context_length=a.ctx,
                      max_total_tokens=a.max_total_tokens,
                      mem_fraction_static=a.mem_fraction, disable_radix_cache=True, disable_cuda_graph=not a.graph,
-                     log_level="warning", **extra)
+                     log_level="warning", **({"watchdog_timeout": a.watchdog} if a.watchdog else {}), **extra)
     t0 = time.perf_counter()
     out = llm.generate(input_ids=ids, sampling_params={"max_new_tokens": a.tokens, "ignore_eos": a.same_length_copies or a.ignore_eos,
                                                        "temperature": 0.0})

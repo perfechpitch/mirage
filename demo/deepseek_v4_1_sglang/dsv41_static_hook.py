@@ -865,15 +865,17 @@ if HEAD_ARGMAX:
         def before_forward(self, forward_batch, *, replays_graph, decode_graph_runner):
             self._replayed_batch = forward_batch if replays_graph else None
 
-        def recorded_ids(self, logits_output, forward_batch, *, watermark_state):
+        def recorded_ids(self, logits_output, forward_batch, *, watermark_state=None):
             lg = logits_output.next_token_logits
             hd = None if lg is None else _head_by_logits(lg)
             si = forward_batch.sampling_info
             rows = 0 if lg is None or lg.dim() != 2 else lg.shape[0]   # (DSV41_STATIC_ROWS: a step of fewer rows)
+            # (the sampler passes watermark_state before SGLang moved the watermark onto sampling_info)
+            watermark = getattr(si, "watermark", None) if watermark_state is None else watermark_state
             ok = (self.recorded and hd is not None and lg is not None and lg.dim() == 2 and _ok_rows(rows)
                   and lg.data_ptr() == hd.w["logits"].data_ptr() and forward_batch is self._replayed_batch
                   and forward_batch.forward_mode.is_decode() and si.is_all_greedy and not forward_batch.return_logprob
-                  and not (watermark_state is not None and si.has_watermark_candidates)
+                  and watermark is None
                   and si.logit_bias is None and si.grammar_mask is None and not si.has_custom_logit_processor
                   and not (si.penalizer_orchestrator is not None and si.penalizer_orchestrator.is_required)
                   and not _envs3.SGLANG_SANITIZE_NAN_LOGITS.get())
@@ -961,11 +963,11 @@ if S2_DEFER:
         def before_forward(self, forward_batch, *, replays_graph, decode_graph_runner):
             self._replayed_batch = forward_batch if replays_graph else None
 
-        def recorded_ids(self, logits_output, forward_batch, *, watermark_state):
+        def recorded_ids(self, logits_output, forward_batch, *, watermark_state=None):
             lg = logits_output.next_token_logits
             if not self.recorded or lg is None or lg.dim() != 2 or lg.shape[-1] >= self.lp.vocab_size:
                 return None   # (full logits: the sampler's own argmax)
-            return super().recorded_ids(logits_output, forward_batch, watermark_state=watermark_state)
+            return super().recorded_ids(logits_output, forward_batch)
 
     _orig_init_ugg = _mr.ModelRunner.maybe_init_uocr_greedy_graph
 
@@ -987,7 +989,7 @@ if S2_DEFER:
         g = self.uocr_greedy_graph
         lg = logits_output.next_token_logits
         if isinstance(g, _DeferredGreedy) and lg is not None and lg.dim() == 2 and lg.shape[-1] < g.lp.vocab_size:
-            if g.recorded_ids(logits_output, forward_batch, watermark_state=self.watermark_state) is None:
+            if g.recorded_ids(logits_output, forward_batch, watermark_state=getattr(self, "watermark_state", None)) is None:
                 logits_output.next_token_logits = _shard_gather(g.lp, lg)   # (not the recorded case: full logits)
                 _s2_used[1] += 1
             else:
