@@ -365,7 +365,7 @@ CustomOPTranspileResult
   int cur_custom_kernel_idx = custom_kernel_idx_counter++;
   string func_name = fmt("custom_kernel_$", cur_custom_kernel_idx);
 
-  if (GPU_CC::B200 != config.target_cc ||
+  if (GPU_CC::B200 > config.target_cc ||
       (config::MAX_NUM_WARP_GROUPS <
        config.num_consumer_wgs + config.num_producer_wgs) ||
       (num_threads !=
@@ -478,7 +478,7 @@ CustomOPTranspileResult
       if (GPU_CC::H100 == config.target_cc) {
         // Hopper wgmma
         assert(num_threads >= 128);
-      } else if (config.target_cc == GPU_CC::B200) {
+      } else if (config.target_cc >= GPU_CC::B200) {
         // Blackwell umma
         assert(num_threads >= 32);
       } else {
@@ -499,7 +499,7 @@ CustomOPTranspileResult
       // For threadblock matmul, cute requires 2-d matrices as inputs / outputs,
       // we assert that all other leading dimensions are of size 1, and only use
       // the last two dimensions when generating layouts
-      if (config.target_cc == GPU_CC::B200) {
+      if (config.target_cc >= GPU_CC::B200) {
 
         code.e("auto tiled_mma = "
                "cutlass::gemm::collective::detail::sm100_make_2sm_trivial_"
@@ -811,7 +811,7 @@ CustomOPTranspileResult
   code.e("");
   code.e("__syncthreads();");
 
-  if (GPU_CC::B200 == config.target_cc) {
+  if (GPU_CC::B200 <= config.target_cc) {
     assert(g.cluster_dim.x > 0 && g.cluster_dim.y > 0 && g.cluster_dim.z > 0);
     string tma;
     string tmplt;

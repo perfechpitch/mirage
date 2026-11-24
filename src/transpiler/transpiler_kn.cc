@@ -339,7 +339,7 @@ TranspileResult Transpiler::transpile_ugraph() {
   header.e("#define USE_NVSHMEM $", use_nvshmem);
   if (config.target_cc == GPU_CC::H100) {
     header.e("#define MIRAGE_GRACE_HOPPER");
-  } else if (config.target_cc == GPU_CC::B200) {
+  } else if (config.target_cc >= GPU_CC::B200) {
     header.e("#define MIRAGE_BLACKWELL");
   }
   header.e("#include \"runtime.h\"");
@@ -644,7 +644,7 @@ TranspileResult Transpiler::transpile_ugraph() {
           result = transpile_kn_custom_op_hopper(cur_op);
           // only generate for first tb graph now
           config.profiling = false;
-        } else if (config.target_cc == GPU_CC::B200) {
+        } else if (config.target_cc >= GPU_CC::B200) {
           result = transpile_kn_custom_op_blackwell(cur_op);
           config.profiling = false;
         } else {
@@ -663,7 +663,7 @@ TranspileResult Transpiler::transpile_ugraph() {
         profiler_buf_size += result.profiler_buf_size;
 
         // Checkings against grid dim and block dim
-        if (config.target_cc <= GPU_CC::B200) {
+        if (config.target_cc <= GPU_CC::B300) {
           // According to
           // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications,
           // all GPUs up to H100 have the same restriction
@@ -731,7 +731,7 @@ TranspileResult Transpiler::transpile_ugraph() {
             }
           }
           // init tiled_mmas
-          if (config.target_cc == GPU_CC::B200 && use_2sm_mma) {
+          if (config.target_cc >= GPU_CC::B200 && use_2sm_mma) {
             exec.e("dim3 cluster_dim($, $, $);",
                    bgraph.cluster_dim.x,
                    bgraph.cluster_dim.y,
@@ -783,7 +783,7 @@ TranspileResult Transpiler::transpile_ugraph() {
           if (result.tmaParamsList.size() > 0) {
             exec.e(fmt("std::vector<bool> minputs = {$};", m_inputs));
             CodeKeeper res;
-            if (config.target_cc == GPU_CC::B200) {
+            if (config.target_cc >= GPU_CC::B200) {
               generate_tma_code_blackwell(
                   res, result.tmaParamsList, use_2sm_mma, cur_op, config);
             } else if (config.target_cc == GPU_CC::H100) {
@@ -796,7 +796,7 @@ TranspileResult Transpiler::transpile_ugraph() {
           }
 
           if (result.tmaParamsList.size() > 0) {
-            if (config.target_cc == GPU_CC::B200) {
+            if (config.target_cc >= GPU_CC::B200) {
               exec.e(
                   fmt("auto kernel_ptr = &$<$>;", result.func_name, tma_tmps));
               exec.e("cudaFuncSetAttribute(kernel_ptr, "
@@ -821,7 +821,7 @@ TranspileResult Transpiler::transpile_ugraph() {
                    result.func_name,
                    tmas,
                    ptr_names);
-          } else if (config.target_cc == GPU_CC::B200) {
+          } else if (config.target_cc >= GPU_CC::B200) {
             exec.e("cutlass::ClusterLaunchParams params = {grid_dim, "
                    "block_dim, cluster_dim, $};",
                    result.smem_size);

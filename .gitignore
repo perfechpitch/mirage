@@ -103,3 +103,6 @@ benchmark/microbench/sync_primitives
 benchmark/microbench/tma_bandwidth
 benchmark/microbench/.build_flags
 benchmark/microbench/*.json
+
+# profiler CSV dumps written next to the demo
+/demo/qwen3/mirage_*.csv

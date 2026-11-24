@@ -203,6 +203,10 @@ static constexpr int T4 = 75;
 static constexpr int A100 = 80;
 static constexpr int H100 = 90;
 static constexpr int B200 = 100;
+// B300 (Blackwell Ultra) is sm_103. Its SM100 task set and CUTLASS UMMA/TMEM
+// path are the same as B200's, so every `== B200` gate below is written as
+// `>= B200` and this constant only exists to bound the range.
+static constexpr int B300 = 103;
 } // namespace GPU_CC
 
 // A handy iterator class for combining two iterators

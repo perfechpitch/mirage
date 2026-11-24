@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdlib>
 #include "mirage/kernel/task_register.h"
 #include "mirage/kernel/operator.h"
 #include "mirage/transpiler/utils.h"
@@ -2055,22 +2056,38 @@ int TaskRegister::register_linear_sm100_task(threadblock::Graph const &bgraph,
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   // define MMA
-  constexpr int MMA_M = 128;
+  // MMA_M is the smem tile height. It must be >= the real per-task row count,
+  // otherwise the TMA box is clamped and the rest of the smem tile is zero
+  // fill (4x waste at TP=2, 2x at TP=1). Tunable so the tile can be matched.
+  const int MMA_M = [] {
+    char const *v = std::getenv("MIRAGE_MMA_M");
+    return v ? std::atoi(v) : 128;
+  }();
   constexpr int MMA_N = 16;
-  constexpr int bM = 128;
+  const int bM = MMA_M;
   constexpr int bN = MMA_N;
-  constexpr int bK = 64;
-  constexpr int num_ab_stages = 8;
-  constexpr int num_acc_stages = 2;
-  constexpr int num_c_stages = 4;
-  constexpr int num_tmem_columns = bN * num_acc_stages;
+  const int bK = [] {
+    char const *v = std::getenv("MIRAGE_BK");
+    return v ? std::atoi(v) : 64;
+  }();
+  // Tunable via env so pipeline depth can be swept without editing source.
+  const int num_ab_stages = [] {
+    char const *v = std::getenv("MIRAGE_NUM_AB_STAGES");
+    return v ? std::atoi(v) : 8;
+  }();
+  const int num_acc_stages = 2;
+  const int num_c_stages = [] {
+    char const *v = std::getenv("MIRAGE_NUM_C_STAGES");
+    return v ? std::atoi(v) : 4;
+  }();
+  const int num_tmem_columns = bN * num_acc_stages;
   assert(num_tmem_columns <= 512);
   // define TMAs
   constexpr int B = 3;
   constexpr int M = 3;
   constexpr int S = 3;
   constexpr int TMA_CP_ASYNC_SIZE = 64;
-  constexpr int TILE_SIZE = 64;
+  const int TILE_SIZE = bK;
   int const output_tma_cp_size = 128;
   int const output_atom_size = 128;
   code.e("using TMA_A = kernel::tma::tma_2d<cute::bfloat16_t, $, $, $, $, $, "
@@ -2210,22 +2227,38 @@ int TaskRegister::register_splitk_linear_sm100_task(
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   // define MMA
-  constexpr int MMA_M = 128;
+  // MMA_M is the smem tile height. It must be >= the real per-task row count,
+  // otherwise the TMA box is clamped and the rest of the smem tile is zero
+  // fill (4x waste at TP=2, 2x at TP=1). Tunable so the tile can be matched.
+  const int MMA_M = [] {
+    char const *v = std::getenv("MIRAGE_MMA_M");
+    return v ? std::atoi(v) : 128;
+  }();
   constexpr int MMA_N = 16;
-  constexpr int bM = 128;
+  const int bM = MMA_M;
   constexpr int bN = MMA_N;
-  constexpr int bK = 64;
-  constexpr int num_ab_stages = 8;
-  constexpr int num_acc_stages = 2;
-  constexpr int num_c_stages = 4;
-  constexpr int num_tmem_columns = bN * num_acc_stages;
+  const int bK = [] {
+    char const *v = std::getenv("MIRAGE_BK");
+    return v ? std::atoi(v) : 64;
+  }();
+  // Tunable via env so pipeline depth can be swept without editing source.
+  const int num_ab_stages = [] {
+    char const *v = std::getenv("MIRAGE_NUM_AB_STAGES");
+    return v ? std::atoi(v) : 8;
+  }();
+  const int num_acc_stages = 2;
+  const int num_c_stages = [] {
+    char const *v = std::getenv("MIRAGE_NUM_C_STAGES");
+    return v ? std::atoi(v) : 4;
+  }();
+  const int num_tmem_columns = bN * num_acc_stages;
   assert(num_tmem_columns <= 512);
   // define TMAs
   constexpr int B = 3;
   constexpr int M = 3;
   constexpr int S = 3;
   constexpr int TMA_CP_ASYNC_SIZE = 64;
-  constexpr int TILE_SIZE = 64;
+  const int TILE_SIZE = bK;
   int const output_tma_cp_size = 128;
   int const output_atom_size = 128;
   code.e("using TMA_A = kernel::tma::tma_2d<cute::bfloat16_t, $, $, $, $, $, "
@@ -3058,22 +3091,38 @@ int TaskRegister::register_moe_linear_sm100_task(
   // MoE constant:
   int expert_stride = (w13_linear) ? 10 : 8;
   // define MMA
-  constexpr int MMA_M = 128;
+  // MMA_M is the smem tile height. It must be >= the real per-task row count,
+  // otherwise the TMA box is clamped and the rest of the smem tile is zero
+  // fill (4x waste at TP=2, 2x at TP=1). Tunable so the tile can be matched.
+  const int MMA_M = [] {
+    char const *v = std::getenv("MIRAGE_MMA_M");
+    return v ? std::atoi(v) : 128;
+  }();
   constexpr int MMA_N = 16;
-  constexpr int bM = 128;
+  const int bM = MMA_M;
   constexpr int bN = MMA_N;
-  constexpr int bK = 64;
-  constexpr int num_ab_stages = 8;
-  constexpr int num_acc_stages = 2;
-  constexpr int num_c_stages = 4;
-  constexpr int num_tmem_columns = bN * num_acc_stages;
+  const int bK = [] {
+    char const *v = std::getenv("MIRAGE_BK");
+    return v ? std::atoi(v) : 64;
+  }();
+  // Tunable via env so pipeline depth can be swept without editing source.
+  const int num_ab_stages = [] {
+    char const *v = std::getenv("MIRAGE_NUM_AB_STAGES");
+    return v ? std::atoi(v) : 8;
+  }();
+  const int num_acc_stages = 2;
+  const int num_c_stages = [] {
+    char const *v = std::getenv("MIRAGE_NUM_C_STAGES");
+    return v ? std::atoi(v) : 4;
+  }();
+  const int num_tmem_columns = bN * num_acc_stages;
   assert(num_tmem_columns <= 512);
   // define TMAs
   constexpr int B = 3;
   constexpr int M = 3;
   constexpr int S = 3;
   constexpr int TMA_CP_ASYNC_SIZE = 64;
-  constexpr int TILE_SIZE = 64;
+  const int TILE_SIZE = bK;
   int const output_tma_cp_size = 128;
   int const output_atom_size = 128;
   // TMA_B for expert weights

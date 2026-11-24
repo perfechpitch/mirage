@@ -198,14 +198,24 @@ class AllReduceStrategy_NvshmemTile(AllReduceStrategy):
         # if len(tensors) > 0:
         #     print(f"{self} Unused tensors: {tensors.keys()}")
 
-        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # Elements of the contiguous (hidden) dimension handled by one task.
+        # The task count per collective is width // dimx, and every task pays a
+        # full cross-GPU dissemination barrier, so a larger dimx means fewer
+        # barriers but less parallelism. Sweep with MIRAGE_AR_DIMX.
+        width = int(input_tensor.dim(1))
+        dimx = int(os.environ.get("MIRAGE_AR_DIMX", 64))
+        dimx = min(dimx, width)
+        assert width % dimx == 0, (width, dimx)
+        grid = (width // dimx, 1, 1)
+
+        tb_graph = TBGraph(CyTBGraph(grid, block_dim, 1, dimx))
         tb_graph.new_input(input_tensor, (1, -1, -1), -1, True)
         tb_graph.new_input(output_tensor, (1, -1, -1), -1, True)
         mpk.kn_graph.customized([input_tensor, output_tensor], tb_graph)
         mpk.kn_graph.register_task(tb_graph, "nvshmem_tile_allreduce", params)
 
         # We should set NVSHMEM_MAX_TEAMS environment variable
-        allocate_nvshmem_teams(mpk, grid_dim[0] * grid_dim[1] * grid_dim[2])
+        allocate_nvshmem_teams(mpk, grid[0] * grid[1] * grid[2])
 
 # ============================================================================
 # Concrete AllGather Implementations

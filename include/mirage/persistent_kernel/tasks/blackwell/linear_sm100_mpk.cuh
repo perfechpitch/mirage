@@ -1,4 +1,11 @@
 #pragma once
+
+// bK (MMA K-tile) is overridable so the GEMM pipeline width can be swept.
+// Per-stage shared-memory footprint scales with bK, so raising bK requires
+// lowering NUM_AB_STAGE to stay under the 227 KB sm_103 smem limit.
+#ifndef MIRAGE_BK
+#define MIRAGE_BK 64
+#endif
 #include <cstdio>
 #include <iostream>
 
@@ -71,8 +78,9 @@ __device__ __noinline__ void
   auto bN = cute::tile_size<1>(
       tiled_mma); // MMA Tile N. We'll use 1 MMAs per MMA Tile N.
   auto bK = cute::tile_size<2>(tiled_mma) *
-            cute::Int<4>{}; // MMA Tile K. We'll use 4 MMAs per MMA Tile K. For
-                            // 16b types, tcgen05.mma has K16.
+            cute::Int<(MIRAGE_BK / 16)>{}; // MMA Tile K. We'll use (MIRAGE_BK/16)
+                                           // MMAs per MMA Tile K. For 16b types,
+                                           // tcgen05.mma has K16.
 
   auto mma_tiler = cute::make_shape(bM, bN, bK); // (MMA_M, MMA_N, MMA_K)
 
@@ -310,10 +318,13 @@ __device__ __noinline__ void
       sizeof(T_) * kClampedBN * cute::size<2>(mma_tiler) +
       sizeof(T_) * cute::size<0>(mma_tiler) * cute::size<2>(mma_tiler);
 
-  constexpr int TILE_SIZE = 64;
-  constexpr int INPUT_TMA_TILE_SIZE = 64;
-  constexpr int WEIGHT_TMA_TILE_SIZE = 64;
-  constexpr int OUTPUT_ATOM_SIZE = 128;
+  constexpr int TILE_SIZE = MIRAGE_BK;
+  constexpr int INPUT_TMA_TILE_SIZE = MIRAGE_BK;
+  constexpr int WEIGHT_TMA_TILE_SIZE = MIRAGE_BK;
+  // M-atom row count. Must equal MMA_M: it is both the TMA box height for the
+  // weight tile and the stage stride into smem, so a mismatch would either
+  // waste smem or step out of bounds.
+  constexpr int OUTPUT_ATOM_SIZE = MMA_M;
   constexpr int B = 3;
   constexpr int M = 3;
   constexpr int S = 3;
@@ -331,7 +342,7 @@ __device__ __noinline__ void
                              S,
                              MMA_N,
                              INPUT_TMA_TILE_SIZE,
-                             1>; // 64/64 = 1
+                             MIRAGE_BK / 64>; // TMA box is 64 wide
   InputSmem input_smem(shared_input);
 
   using WeightSmem = smem_tma<T_,
@@ -340,7 +351,7 @@ __device__ __noinline__ void
                               S,
                               OUTPUT_ATOM_SIZE,
                               WEIGHT_TMA_TILE_SIZE,
-                              1>; // 64/64 = 1
+                              MIRAGE_BK / 64>; // TMA box is 64 wide
   WeightSmem input_weight_smem(shared_weight);
 
   using OutputSmem = smem_tma<T_, 0, M, S, MMA_N, OUTPUT_ATOM_SIZE, 1>;

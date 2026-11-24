@@ -31,12 +31,54 @@ mapping = {
 }
 
 DEFAULT_SAVE_DIR = os.path.join("outputs", "qwen3")
-MAX_SAVE_TOKENS = 100
+MAX_SAVE_TOKENS = int(os.environ.get("MIRAGE_SAVE_TOKENS", 100))
 
 # print limitation
 # torch.set_printoptions(threshold=2000)
 
+# Number of output columns each GEMM task owns. Set from
+# --linear-cols-per-task. 0 keeps the original size-based heuristic.
+# Larger -> fewer, fatter tasks: fewer dependency handoffs and more bytes in
+# flight per task (the SM100 GEMM is latency-bound at 64 columns).
+LINEAR_COLS_PER_TASK = 0
+# If set (>0), every linear aims for exactly this many tasks (= blocks).
+LINEAR_GRID_TARGET = 0
+
+_WARNED_LINEAR_SIZE = set()
+
+def _warn_linear_override_skipped(size: int, why: str):
+    # A silently ignored override makes whole benchmark sweeps no-ops while
+    # still producing plausible-looking numbers. Never fail quietly.
+    if size in _WARNED_LINEAR_SIZE:
+        return
+    _WARNED_LINEAR_SIZE.add(size)
+    import sys as _sys
+    print(
+        f"[WARN] linear tiling override skipped for size={size}: {why}. "
+        f"Falling back to the default heuristic (96 or 64 tasks). "
+        f"This run does NOT reflect the requested configuration.",
+        file=_sys.stderr,
+        flush=True,
+    )
+
 def grid_for_rmsnorm_linear_layer(size: int, use_cutlass_kernel: bool = True):
+    if LINEAR_COLS_PER_TASK:
+        if size % LINEAR_COLS_PER_TASK == 0:
+            return size // LINEAR_COLS_PER_TASK
+        _warn_linear_override_skipped(
+            size,
+            f"size ({size}) %% cols_per_task ({LINEAR_COLS_PER_TASK}) != 0")
+    if LINEAR_GRID_TARGET:
+        if size % LINEAR_GRID_TARGET == 0:
+            cols = size // LINEAR_GRID_TARGET
+            if cols % 8 == 0:
+                return LINEAR_GRID_TARGET
+            _warn_linear_override_skipped(
+                size, f"cols ({cols}) is not a multiple of 8")
+        else:
+            _warn_linear_override_skipped(
+                size,
+                f"size ({size}) %% grid_target ({LINEAR_GRID_TARGET}) != 0")
     # 96 and 64 are enough to cover all Qwen3 model? Please update the method
     # if you meet any incompatibility.
     if size % 64 == 0 and not use_cutlass_kernel:
@@ -82,6 +124,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profiling", action="store_true", help="Use Profiler to generate trace"
     )
+    parser.add_argument(
+        "--load-dir", default=None,
+        help="Reuse a pre-compiled MPK kernel from this output dir instead of "
+             "recompiling (skips the ~3 min nvcc build).")
+    parser.add_argument(
+        "--bench-json", default=None,
+        help="Write raw timing data (run_time_ms, tokens_generated) to this path "
+             "so decode-only latency can be fitted across runs.")
+    parser.add_argument(
+        "--linear-cols-per-task", default=0, type=int,
+        help="Output columns owned by each SM100 GEMM task. 0 = original "
+             "heuristic. Larger gives fewer/fatter tasks.")
+    parser.add_argument(
+        "--linear-grid", default=0, type=int,
+        help="Target number of tasks (= blocks) per linear layer. 0 = off. "
+             "E.g. 128 spreads every GEMM over all 128 workers.")
     # lookahead or promptlookup
     parser.add_argument(
         "--spec-decode",
@@ -155,6 +213,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--split-kv-cache", action="store_true", help="Use split-kv cache")
     args = parser.parse_args()
+    globals()["LINEAR_COLS_PER_TASK"] = args.linear_cols_per_task
+    globals()["LINEAR_GRID_TARGET"] = args.linear_grid
     if args.do_sample and args.temperature <= 0.0:
         parser.error("--do-sample needs --temperature > 0 "
                      "(temperature 0 is greedy decoding, i.e. no --do-sample)")
@@ -679,7 +739,7 @@ if __name__ == "__main__":
                     weight=w,
                     residual=x,
                     output=attn_proj_out,
-                    grid_dim=(hidden_size // 64, 1, 1),
+                    grid_dim=(grid_for_rmsnorm_linear_layer(hidden_size), 1, 1),
                     block_dim=(128, 1, 1),
                 )
             # reset residual input as x
@@ -759,7 +819,7 @@ if __name__ == "__main__":
                     weight=w,
                     residual=x,
                     output=mlp_out,
-                    grid_dim=(hidden_size // 64, 1, 1),
+                    grid_dim=(grid_for_rmsnorm_linear_layer(hidden_size), 1, 1),
                     block_dim=(128, 1, 1),
                 )
             # reset residual input as x
@@ -859,7 +919,10 @@ if __name__ == "__main__":
         with open(f"kernel_{rank}.cu", "w") as f:
             f.write(results["cuda_code"])
 
-        mpk.compile(output_dir=args.output_dir)
+        if args.load_dir:
+            mpk.load_mpk_kernel(args.load_dir, skip_validation=True)
+        else:
+            mpk.compile(output_dir=args.output_dir)
 
     # g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
@@ -918,13 +981,23 @@ if __name__ == "__main__":
         end_idx = prev_pos + 1
         generated_ids = tokens[:, :end_idx]
         tokens_generated = max(0, end_idx - prompt_len)
-        per_tok_ms = run_time / max(prompt_len + tokens_generated, 1)
+        # run_time covers only the post-warmup decode steps, so the denominator
+        # must be the number of steps actually inside the timed region. The
+        # historical "prompt_len + tokens_generated" mixes prefill tokens into a
+        # decode-only window and overstates throughput by ~13% at short prompts.
+        timed_steps = max(1, end_idx - (prompt_len + warmup))
+        per_tok_ms = run_time / timed_steps
 
         response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
         print(response)
         print(
-            "Prompt length {}, generate length {}, per-token latency {:.3f} ms".format(
-                prompt_len, tokens_generated, per_tok_ms
+            "Prompt length {}, generate length {}, per-token latency {:.3f} ms "
+            "({:.1f} tok/s decode, {} timed steps)".format(
+                prompt_len,
+                tokens_generated,
+                per_tok_ms,
+                1000.0 / per_tok_ms if per_tok_ms > 0 else 0.0,
+                timed_steps,
             )
         )
 
@@ -962,6 +1035,20 @@ if __name__ == "__main__":
 
         tokens_generated = step.max().item() + 1 - prompt_lengths[0].item()
         per_tok_ms = run_time / max(prompt_lengths[0].item() + tokens_generated, 1)
+
+        if args.bench_json is not None and rank == 0:
+            import json as _json
+            with open(args.bench_json, "w") as _f:
+                _json.dump({
+                    "run_time_ms": run_time,
+                    "tokens_generated": int(tokens_generated),
+                    "prompt_length": int(prompt_lengths[0].item()),
+                    "timed_steps": int(timed_steps),
+                    "per_token_ms_decode": per_tok_ms,
+                    "tok_per_s_decode": (1000.0 / per_tok_ms) if per_tok_ms > 0 else 0.0,
+                    "build": "load" if args.load_dir else "compile",
+                }, _f)
+            print(f"[bench] wrote {args.bench_json}")
 
         print("Prompt length {}, generate length {}, per-token latency: {:.3f} ms".format(
               prompt_lengths[0], tokens_generated, per_tok_ms

@@ -105,7 +105,7 @@ public:
                T,
                T,
                Shape<Int<32>, Int<128>>,
-               FusionOp>());
+               /*IsBlockScaleSupported=*/false>());
 
   using SMemStoreOp =
       decltype(cutlass::epilogue::collective::detail::sm100_get_smem_store_op<

@@ -1284,8 +1284,17 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
     // Up to 4 scheduler warps share one block but the profiler has one
     // slot per block (num_groups=1).  Only warp 0 writes so events from
     // different warps don't interleave.
-    PROFILER_INIT(
-        static_cast<uint64_t *>(config.profiler_buffer), 0, 1, (warp_id == 0));
+    // The scheduler kernel runs as a SEPARATE launch (grid = num_schedulers)
+    // that shares config.profiler_buffer with the worker kernel
+    // (grid = num_workers). Both derive their tag base from block_idx, so
+    // profiling them into one buffer makes tags collide and lets the
+    // scheduler launch clobber the worker launch's header (nblocks).
+    // Keep the closure params for the macros, but never write.
+    PROFILER_CLOSURE_PARAMS_DECL;
+    profiler_write_ptr = nullptr;
+    profiler_write_stride = 0;
+    profiler_entry_tag_base = 0;
+    profiler_write_thread_predicate = false;
     uint32_t sched_profiling_cnt = 0;
 #endif
 

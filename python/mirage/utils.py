@@ -1,3 +1,4 @@
+import os
 import torch
 
 # This function returns the shared memory limit (in bytes)
@@ -15,8 +16,8 @@ def get_shared_memory_capacity(target_cc):
     elif target_cc == 90:
         # H100 GPUs
         return 223 * 1024
-    elif target_cc == 100:
-        # B200 GPUs
+    elif target_cc in (100, 103):
+        # B200 (sm_100) / B300 Blackwell Ultra (sm_103) GPUs
         return 227 * 1024
     else:
         assert False, "Unsupported compute capacity: {}".format(target_cc)
@@ -35,6 +36,12 @@ def get_configurations_from_gpu(rank):
     props = torch.cuda.get_device_properties(rank)
     sm_cnt = props.multi_processor_count
     print("sm_cnt: ", sm_cnt)
+    override = os.environ.get("MIRAGE_NUM_WORKERS")
+    if override:
+        worker = int(override)
+        scheduler = 4 * (sm_cnt - worker)
+        assert scheduler > 0, "MIRAGE_NUM_WORKERS leaves no SM for schedulers"
+        return worker, scheduler
     worker = 0
     if sm_cnt >= 160:
         worker = 144
