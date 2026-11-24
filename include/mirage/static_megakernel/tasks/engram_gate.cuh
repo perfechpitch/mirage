@@ -334,6 +334,23 @@ __device__ __forceinline__ void run_engram_gate(Maps const &,
                                     "its tasks");
   static_assert(SELF::x == HC && SELF::y == T,
                 "engram_gate: grid (HC copies, T tokens)");
+  // The TEN / NX buffers exist only in those builds (BUF_SLOTS is the plain
+  // {R', w, R''} for them): picking one with ?: still instantiates slot_at for
+  // the arm not taken, so a plain build would need slots it never declares.
+  unsigned char const *kvt = nullptr;
+  uint32_t *vcnt = nullptr;
+  float const *pre = nullptr;
+  __nv_bfloat16 const *gam = nullptr;
+  __nv_bfloat16 *xo = nullptr;
+  if constexpr (TEN) {
+    kvt = buf_at<unsigned char const>(g, slot_at<BUF_SLOTS, 3>());
+    vcnt = cnt_now(g) + SELF::counter + tk.y;
+  }
+  if constexpr (NX) {
+    pre = buf_at<float const>(g, slot_at<BUF_SLOTS, 4>());
+    gam = buf_at<__nv_bfloat16 const>(g, slot_at<BUF_SLOTS, 5>());
+    xo = buf_at<__nv_bfloat16>(g, slot_at<BUF_SLOTS, 6>());
+  }
   engram_gate_task<TEN ? 0 : exchange_offset[TEN ? 0 : SEND::buf], H, HC, W, TEN, NX>(
       g,
       buf_at<__nv_bfloat16 const>(g, slot_at<BUF_SLOTS, 0>()),
@@ -346,11 +363,11 @@ __device__ __forceinline__ void run_engram_gate(Maps const &,
       __int_as_float(PARAMS::v[2]),
       __int_as_float(PARAMS::v[3]),
       warm,
-      TEN ? buf_at<unsigned char const>(g, slot_at<BUF_SLOTS, 3>()) : nullptr,
-      TEN ? cnt_now(g) + SELF::counter + tk.y : nullptr,
-      NX ? buf_at<float const>(g, slot_at<BUF_SLOTS, NX ? 4 : 0>()) : nullptr,
-      NX ? buf_at<__nv_bfloat16 const>(g, slot_at<BUF_SLOTS, NX ? 5 : 0>()) : nullptr,
-      NX ? buf_at<__nv_bfloat16>(g, slot_at<BUF_SLOTS, NX ? 6 : 0>()) : nullptr,
+      kvt,
+      vcnt,
+      pre,
+      gam,
+      xo,
       NX ? __int_as_float(param_or<PARAMS, 7, 0>()) : 0.f STAGE_STAMP_ARG(L.stage_stamps));
 }
 

@@ -229,6 +229,10 @@ def header_code(pk, nodes: Dict[str, dict], num_gpus: int, num_lists: int, profi
             "// the kernel-wide sizes (config.cuh): tokens per step and GPUs (the graph's: StaticMegakernel.tokens, num_gpus), SMs (the",
             "// schedules' task lists per GPU)",
             f"#define STATIC_TOKENS {pk.tokens}", f"#define STATIC_GPUS {num_gpus}", f"#define STATIC_SMS {num_lists}", ""] + (
+            # the polls' sleep between rounds (runtime.cuh poll_pause): a layer of few tasks and short chains waits 0 (spin);
+            # StaticMegakernel.poll_ns (None: runtime.cuh's defaults)
+            [f"#define STATIC_CNT_POLL_NS {int(pk.poll_ns)}",
+             f"#define STATIC_POLL_NS {int(pk.poll_ns)}", ""] if getattr(pk, "poll_ns", None) is not None else []) + (
             ["#define STATIC_AR_TWOSHOT 1   // the all-reduce as a two-shot by token (core.cuh; ar_twoshot)", ""]
             if ar_twoshot(used, pk.tokens, num_gpus) else []) + (
             [f"#define STATIC_MAX_BUFS {pk.max_bufs}   // buffer slots (config.cuh MAX_BUFS; StaticMegakernel.max_bufs)", ""]

@@ -277,6 +277,12 @@ def hand_plan(mpk: StaticMegakernel, heads: int, cap: int, cmp_rows: int, sms: i
         if "eg_emb" in names.values():   # (DSV41_EG_ROWS=1) the table lookup (engram_rows: its output eg_emb)
             grid["eg_emb"] = (T, 1, 1)
     rows = [(idx, (x, 0, 0)) for idx, name in names.items() if name == "eg_emb" for x in range(T)]
+    # GRID_OVERRIDE ("wq_a_part=10,8;wkv_part=4,4"): a measurement knob, one node's grid per entry, by tensor name; the lists
+    # below are built from the grids, so an override moves the tasks too. compile_plan still checks them (candidate_grids)
+    for spec in filter(None, os.environ.get("GRID_OVERRIDE", "").split(";")):
+        node_name, dims = spec.split("=")
+        d3 = [int(d) for d in dims.split(",")]
+        grid[node_name] = tuple(d3 + [1] * (3 - len(d3)))
     grids = {idx: grid[name] for idx, name in names.items()}
     # T > 8 (11-21): a node whose tasks of one token run at once along x (the post with the next input, the Engram gate)
     # token by token, so that a token's tasks land on different SMs (as moe_demo.hand_plan)

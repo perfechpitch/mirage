@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--mem-fraction", type=float, default=0.7)
     ap.add_argument("--override", default=None, help="--json-model-override-args")
     ap.add_argument("--load-format", default=None)
+    ap.add_argument("--engram-config", default=None, help="--engram-config JSON (e.g. '{\"placement\": \"cpu\"}')")
     ap.add_argument("--no-bounded-replay", action="store_true", help="a truncated model: --no-enable-decoder-swa-bounded-replay")
     ap.add_argument("--no-autotune", action="store_true", help="--disable-flashinfer-autotune: about 10 min less at startup")
     ap.add_argument("--out", default=None)
@@ -65,6 +66,8 @@ def main():
         extra["disable_flashinfer_autotune"] = True
     if a.no_bounded_replay:
         extra["enable_decoder_swa_bounded_replay"] = False
+    if a.engram_config:
+        extra["engram_config"] = json.loads(a.engram_config)
     if a.deterministic:
         extra["enable_deterministic_inference"] = True
     llm = sgl.Engine(model_path=a.model, tokenizer_path=a.tokenizer or a.model, trust_remote_code=True, tp_size=int(os.environ.get("SGL_TP", "4")),
