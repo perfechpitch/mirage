@@ -13,6 +13,7 @@ to the plan. The sizes come from the graph: each layer reads them from its tenso
 the node's params; the kernel-wide ones (tokens per step, GPUs) are the StaticMegakernel's (tokens, num_gpus), which the
 generated layer defines (config.cuh).
 """
+import os
 import math
 import struct
 
@@ -43,13 +44,35 @@ DSA_TOPK_BINS, DSA_TOPK_REC, DSA_TOPK_CH, DSA_INDEX_KEY_BYTES = 4096, 19, 1024, 
 
 
 def zq_bytes(tokens: int, width: int) -> int:
-    """tasks/sum_quant_send.cuh zq_bytes: z_q [tokens][width] e4m3, then its scale chunks (one per 128 columns)."""
+    """tasks/sum_quant_send.cuh zq_bytes: z_q [tokens][width] e4m3, then its scale chunks (one per 128 columns). Also the
+    layout of act_quant's and q_norm's x_q."""
     return tokens * width + width // 128 * SF_CHUNK
+
+
+def at_most_parts(p, most: int):
+    """Narrow GEMM node p's changeable K parts (grid y) to at most `most`, a consumer's limit (it adds the parts in registers):
+    p's tasks then take at least K / unit / most pieces of K, as sum_send_layer does for MAX_SUM_PARTS."""
+    spec = p.info["changeable_grid_dims"].get(1)
+    if spec is not None:
+        unit, lo, hi = (spec, 1, None) if isinstance(spec, int) else tuple(spec)
+        p.info["changeable_grid_dims"][1] = (unit, max(lo, -(-(p.inputs[1].dim(1) // unit) // most)), hi)
 
 
 def zq32_bytes(tokens: int, width: int) -> int:
     """tasks/group_quant.cuh zq32_bytes: z_q [tokens][width] e4m3, then its fp32 scales [width / 128][tokens]."""
     return tokens * width + (width // 128) * tokens * 4
+
+
+def w8_scale_chunks(scale: torch.Tensor) -> torch.Tensor:
+    """An e4m3 weight's block scales [N / 32, K / 32] (e8m0, one per 32 x 32 block) -> the scale chunks gemm_fp8_tile reads
+    (tasks/gemm_fp8_tile.cuh), uint8 [N / 128, K / 128, 512]: one chunk per 128 x 128 tile, in the layout of the MMA's scale copy
+    (tcgen05.cp 32x128b.warpx4): the scale of row r and K columns 32 j .. + 31 of the tile at byte 16 (r % 32) + 4 (r // 32) + j.
+    Rows in one block of 32 share a scale, so the chunk's 32 lines of 16 B are the same."""
+    n32, k32 = scale.shape
+    assert n32 % 4 == 0 and k32 % 4 == 0, "whole 128 x 128 tiles"
+    b = scale.contiguous().view(torch.uint8).view(n32 // 4, 4, k32 // 4, 4)   # [row tile][r // 32][K tile][j]
+    line = b.permute(0, 2, 1, 3)                                              # [row tile][K tile][r // 32][j]: one 16-B line
+    return line.unsqueeze(2).expand(n32 // 4, k32 // 4, 32, 4, 4).reshape(n32 // 4, k32 // 4, SF_CHUNK).contiguous()
 
 
 def float_bits(v: float) -> int:
@@ -69,6 +92,10 @@ class StaticMegakernel(PersistentKernel):
         self.num_gpus = num_gpus
         self.num_sms = num_sms
         self.tokens = None        # tokens per step: the first dimension of the layers' token-major tensors (_tokens; config.cuh T)
+        self.poll_ns = None       # the waits' sleep between polls, ns (runtime.cuh STATIC_*POLL_NS: cnt_wait and the tasks
+                                  # that pause with poll_pause; the others keep their own sleeps); None: their defaults
+        self.moe_rows_poll = False   # (C12, 11-18) the layer is built with -DMOE_ROWS_POLL: swiglu_moe_experts' rows 0xFF
+                                     # before the launch, polled and re-armed by sum_store (tasks/sum_store.cuh)
         self._static_nodes = {}   # graph index -> what compiler.py needs about a node (_add_node)
         self._bufs = []           # G::buf slot -> {"kind": out | exchange | scratch | tensor, ...} (_add_node, _scratch, _tensor_slot)
         self._maps = []           # Maps::m slot -> (kind, source, dims) (_map)
@@ -170,12 +197,13 @@ class StaticMegakernel(PersistentKernel):
         self._bufs.append(entry)
         return len(self._bufs) - 1
 
-    def _scratch(self, name: str, nbytes, reset: int = -1) -> int:
+    def _scratch(self, name: str, nbytes, reset: int = -1, by_reader: bool = False) -> int:
         """A buffer only the node's tasks use (allocated by the host code; reset before each launch to the byte `reset`, -1: none),
         made by a layer method before its _add_node, which gives it the node. nbytes: an int, or a function of the node as compiled
-        (0: no buffer). Returns its buffer slot."""
+        (0: no buffer). by_reader: each byte's one reader re-arms it (REARM; host.cuh: a serving host fills it once). Returns its
+        buffer slot."""
         size = nbytes if callable(nbytes) else (lambda n: nbytes)
-        return self._new_buf({"kind": "scratch", "name": name, "fill": lambda n: (size(n), reset, False)})
+        return self._new_buf({"kind": "scratch", "name": name, "fill": lambda n: (size(n), reset, by_reader)})
 
     def _tensor_slot(self, tensor: DTensor) -> int:
         """The buffer slot of a graph tensor the task reads or writes by pointer (the same tensor again: the same slot)."""
@@ -191,7 +219,8 @@ class StaticMegakernel(PersistentKernel):
         """A tensor map slot (Maps::m; the same map again: the same slot). source: ("t", tensor) a graph tensor or a node's output
         by its tensor; ("b", buffer slot, byte offset); ("x", exchange buffer slot, byte offset, set) in the exchange region's set.
         kind and dims as host.cuh reads them: bf16 (rows, K, box rows), wblk (MXFP4 pieces, box pieces), wblk8 (e4m3 pieces, box
-        pieces), sf (chunks, box chunks), act8 (K bytes, rows), act8kt (K bytes, rows, K tiles). Returns the slot."""
+        pieces), sf (chunks, box chunks), act8 (K bytes, rows), act8kt (K bytes, rows, K tiles; box 8 rows), w8kt (K bytes, rows,
+        K tiles; box 128 rows). Returns the slot."""
         key = (kind, (source[0], source[1].guid) + tuple(source[2:]) if source[0] == "t" else tuple(source), tuple(dims))
         for i, m in enumerate(self._maps):
             if m[3] == key:
@@ -450,12 +479,18 @@ class StaticMegakernel(PersistentKernel):
         valid_rows: int = None,    # the live rows (default all T): a serving framework's speculative verify step of fewer rows
                                    # than T; a row past them is not routed (its routed pairs: the shared experts, or expert 0,
                                    # at weight 0: no expert of its own is streamed)
+        score_func: str = "sigmoid",   # "sigmoid" (K3, GLM) or "sqrtsoftplus" (DeepSeek-V4's gate, below)
         block_dim: tuple = (256, 1, 1),
+        idle_row0: bool = False,   # (11-21, with valid_rows < T, no shared experts) an idle row's pairs: row 0's experts at
+                                   # weight 0, not expert 0 (params[7] = 1: tasks/topk_route.cuh COPY0)
     ):
         """Task t = token t: adds the router's partial sums of row t, top K ((output.dim(1) - shared_experts) / sub_experts)
         of the E experts (bias.dim(0)). params = [E, K], [E, K, the routed scaling factor as fp32 bits], with sub-experts [E, K,
         the scaling factor's bits (0: none), sub_experts], with shared experts [E, K, bits, sub_experts, shared_experts],
-        with valid_rows < T [E, K, bits, sub_experts, shared_experts, valid_rows]."""
+        with valid_rows < T [E, K, bits, sub_experts, shared_experts, valid_rows]; "sqrtsoftplus" adds a 7th param, 1 (0s in
+        the unused places). "sqrtsoftplus" is DeepSeek-V4's Gate.forward as torch computes it (tasks/topk_route.cuh SCORE 1):
+        scores sqrt(softplus(logit)), weights = scores / (sum + 1e-20) with the 6 scores summed in torch's order, and the pairs
+        of a token sorted by expert id (the order MoE.forward adds the experts in); K must be 6."""
         T, E, DUP, SH = self._tokens(input.dim(0)), bias.dim(0), sub_experts, shared_experts
         self._dtypes("topk_route_layer", input=(input, float32), bias=(bias, float32), output=(output, int64))
         assert input.num_dims == 2 and input.dim(1) >= E and input.dim(1) % 4 == 0 and bias.num_dims == 1
@@ -473,6 +508,15 @@ class StaticMegakernel(PersistentKernel):
             if not 0 < valid_rows < T:
                 raise ValueError(f"topk_route_layer: valid_rows {valid_rows} must be in 1 .. {T}")
             params = params + [0] * (5 - len(params)) + [valid_rows]
+        if score_func == "sqrtsoftplus":
+            if K != 6:
+                raise ValueError(f"topk_route_layer: sqrtsoftplus takes K = 6 (torch's sum order is fitted for 6), not {K}")
+            params = params + [0] * (6 - len(params)) + [1]
+        elif score_func != "sigmoid":
+            raise ValueError(f"topk_route_layer: score_func 'sigmoid' or 'sqrtsoftplus', not {score_func!r}")
+        if idle_row0:
+            assert valid_rows is not None and valid_rows < T and SH == 0, "idle_row0: valid_rows < T, no shared experts"
+            params = params + [0] * (7 - len(params)) + [1]
         self._add_node("topk_route", (output.dim(0), 1, 1), block_dim, [input, bias, output],
                        [(0, -1, -1), (-1, -1, -1), (0, -1, -1)], params,
                        out_buffer=lambda n: (T * (K * DUP + SH) * 8, 0xFF, False),   # the pairs, u64, polled by every moe_experts task
@@ -526,6 +570,601 @@ class StaticMegakernel(PersistentKernel):
                        [(1, -1, -1) if p is None else (-1, -1, -1), (1, -1, -1)], [L],
                        out_buffer=lambda n: (zq32_bytes(T, L), 0xFF, False), exchange=True,
                        counters=1, buf_slots=[-1 if p is not None else self._tensor_slot(input)])
+
+    def act_quant_layer(
+        self,
+        input: DTensor,     # x [T, K]: bf16, a graph input; or fp32, a gemm_fp8_tile node's output in slots (its K parts)
+        output: DTensor,    # x_q [T, K] e4m3 bytes (uint8)
+        block_dim: tuple = (256, 1, 1),
+        swiglu_limit: float = None,   # x = SwiGLU of a gemm_fp8_tile's gate | up K parts, clamped at this limit (below)
+        poll: bool = False,   # (11-20) x a graph tensor 0xFF before the launch, written in it (engram_rows): polled, re-armed
+    ):
+        """Task (t, y) = token t, columns [y K / C, (y + 1) K / C) (default C = 1 for x a graph input, K / 2048 for a GEMM's K
+        parts): DeepSeek-V4.1's act_quant of row t (per 32 columns a power-of-2 scale, e8m0), into the node's buffer
+        (x_q, then its scale chunks: per 128 columns 4 scale bytes per row, the layout gemm_fp8_tile's MMA reads; every byte
+        written each launch); the node's counter counts the tasks. x a graph input (read by pointer), or a GEMM's K parts
+        (wo_a's output before wo_b), added in part order (polled) and rounded to bf16 first. params = [K].
+        swiglu_limit L: input = a gemm_fp8_tile's K parts [T, 2 I] of gate (columns [0, I)) and up ([I, 2 I)); x = bf16(silu(
+        min(gate, L)) * clamp(up, -L, L)) with gate and up rounded to bf16 first (model.py Expert.forward, the shared expert);
+        output [T, K], K >= I a multiple of 256 (the next GEMM's K), columns [I, K) zero. One task per token. params = [K, I, L's
+        fp32 bits]."""
+        T, K = self._tokens(input.dim(0)), input.dim(1)
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if swiglu_limit is not None:   # tasks/act_quant.cuh act_quant_swiglu_task
+            I, KO = K // 2, output.dim(1)
+            if p is None or p.name != "gemm_fp8_tile" or p.params[0] != COMBINE["slots"]:
+                raise ValueError("act_quant_layer: with swiglu_limit, x must be a gemm_fp8_tile node's output in slots")
+            self._dtypes("act_quant_layer", input=(input, float32), output=(output, uint8))
+            assert input.num_dims == 2 and output.num_dims == 2 and output.dim(0) == T and K == 2 * I
+            assert I % 32 == 0 and KO % 256 == 0 and I <= KO, "whole 32-column groups of h; K: whole warps of 8 columns"
+            assert math.isfinite(swiglu_limit) and swiglu_limit > 0
+            at_most_parts(p, 10)   # tasks/act_quant.cuh: at most 10 K parts
+            self._add_node("act_quant", (T, 1, 1), block_dim, [input, output], [(0, -1, -1), (0, -1, -1)],
+                           [KO, I, float_bits(swiglu_limit)], out_buffer=lambda n: (zq_bytes(T, KO), -1, False), counters=1,
+                           cost_inputs=[0], dry=True)
+            return
+        if poll:   # (x written by engram_rows' multicast stores: polled, no wait on a node)
+            assert p is None or p.name == "engram_rows", "act_quant_layer: poll with x a graph tensor or engram_rows' output"
+            p = None
+        if p is None:       # tasks/act_quant.cuh reads x by pointer and waits for no node
+            self._dtypes("act_quant_layer", input=(input, bfloat16), output=(output, uint8))
+            buf_slots = [self._tensor_slot(input)]
+        elif p.name == "gemm_fp8_tile" and p.params[0] == COMBINE["slots"]:
+            self._dtypes("act_quant_layer", input=(input, float32), output=(output, uint8))
+            assert K % 2048 == 0   # tasks/act_quant.cuh act_quant_parts_task: 8 columns per thread, whole passes of 2048
+            buf_slots = []
+            at_most_parts(p, 10)   # tasks/act_quant.cuh: at most 10 K parts
+        else:
+            raise ValueError(f"act_quant_layer: x must be a graph input or a gemm_fp8_tile node's output in slots; it comes "
+                             f"from {p.name}")
+        assert input.num_dims == 2 and output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, K)
+        assert K % 512 == 0   # tasks/act_quant.cuh: 16 columns per thread, 2 per 32-column group, whole warps
+        if p is None:         # (token, column slice): slices of whole warps' 512 columns; default one per token
+            grid, maps, changeable = (T, 1, 1), [(0, 1, -1), (0, 1, -1)], {1: (512, 1, None)}
+        else:                 # (token, column slice): a task polls only its columns' K parts; slices of whole passes of 2048
+            grid, maps, changeable = (T, K // 2048, 1), [(0, 1, -1), (0, 1, -1)], {1: (2048, 1, None)}
+        self._add_node("act_quant", grid, block_dim, [input, output], maps, [K] + ([0, 0, 1] if poll else []),
+                       changeable_grid_dims=changeable,
+                       out_buffer=lambda n: (zq_bytes(T, K), -1, False), counters=1, buf_slots=buf_slots,
+                       cost_inputs=[0] if p is not None else [],   # adds the GEMM's K parts
+                       dry=p is not None)   # K parts: its first task on an SM runs once dry while the parts are on their way
+
+    def gemm_fp8_tile_layer(
+        self,
+        input: DTensor,           # x_q [T, K] e4m3 bytes (uint8): an act_quant or q_norm node's output (x_q, then its scale chunks)
+        weight: DTensor,          # [N, K] e4m3 bytes (uint8)
+        weight_scales: DTensor,   # [N / 128, K / 128, 512] uint8: per 128 x 128 tile its scale chunk (w8_scale_chunks)
+        output: DTensor,          # [T, N] fp32 ("add": int64 fixed point; its buffer holds what `combine` says, as gemm_tile_layer's)
+        combine: str = "slots",   # how the K parts are combined (core.cuh Combine), as gemm_tile_layer's
+        groups: int = 1,          # G > 1: x_q [T, G K]; group g's N / G weight rows times x_q's columns [g K, (g + 1) K) (wo_a)
+        weights_after: DTensor = None,   # a node's output: the weight loads wait until that node finished a task (timing only)
+        block_dim: tuple = (256, 1, 1),
+        tap: DTensor = None,      # fused act_quant: a graph tensor that gets x_q in act_quant's layout (for the checks)
+    ):
+        """Task (x, y) = weight rows [128 x, 128 x + 128) times K part y: DeepSeek-V4.1's fp8_gemm (e4m3 x e4m3, a weight scale per
+        32 x 32 block and an activation scale per token and 32 columns, applied by the MMA; fp32 accumulation). Default grid: K in
+        1 part; the compiler may change grid y (K parts) in whole 256-column pieces
+        (a ring stage holds 2 K tiles of 128), at least 2 per task ("store": one K part, no options). 128-row tasks only (the
+        block-scaled MMA has M = 128). The weight, its scale chunks, x_q and x_q's scale chunks reach the task through tensor maps
+        (map slots in Maps::m, each box 2 K tiles), the output through the node's buffer slot. Grouped (G > 1, wo_a: model.py
+        L788-789, einsum "bsgd,grd->bsgr" over o's G groups of heads): a task of group g's rows reads x_q from column g K on.
+        weights_after: the loads of
+        the weights wait until that tensor's node finished a task, so that the launch's first microseconds of HBM go to the
+        nodes on the way to x_q; a timing hint, not a dependency. Fused act_quant (input fp32: a gemm_fp8_tile node's K parts
+        in slots, wo_a's before wo_b): no act_quant node between the GEMMs; each task adds the parts of its own K slice
+        (polled) and quantizes them as act_quant does, into its shared memory. params = [mode, K, N, G] (+ [W] with W = that
+        node's counter + 1; + [W, 1] fused)."""
+        assert input.num_dims == 2 and weight.num_dims == 2 and weight.dim(1) * groups == input.dim(1)
+        assert output.num_dims == 2 and output.dim(1) == weight.dim(0)
+        mode, N, K, T = COMBINE[combine], weight.dim(0), weight.dim(1), self._tokens(input.dim(0))
+        KA = groups * K   # x_q's width
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        # fused act_quant: x is a gemm_fp8_tile node's K parts in slots (fp32, wo_a's before wo_b): each task adds and
+        # quantizes its own K slice of x (tasks/gemm_fp8_tile.cuh fp8_fused_act) instead of an act_quant node
+        fused = p is not None and p.name == "gemm_fp8_tile" and p.params[0] == COMBINE["slots"]
+        self._dtypes("gemm_fp8_tile_layer", input=(input, float32 if fused else uint8), weight=(weight, uint8),
+                     weight_scales=(weight_scales, uint8), output=(output, int64 if combine == "add" else float32))
+        assert N % 128 == 0 and K % 256 == 0 and K >= 512, "128-row tasks; K in stages of 2 tiles of 128, at least 2 per task"
+        assert groups >= 1 and N % (128 * groups) == 0, "groups of whole 128-row blocks"
+        assert weight_scales.num_dims == 3 and (weight_scales.dim(0), weight_scales.dim(1), weight_scales.dim(2)) == \
+            (N // 128, K // 128, SF_CHUNK)
+        # the same output layout; the width: act_quant's and q_norm's params[0], sparse_attn's H D (tasks/gemm_fp8_tile.cuh);
+        # fused: the GEMM's N
+        width = {"act_quant": lambda: p.params[0], "q_norm": lambda: p.params[0],
+                 "sparse_attn": lambda: p.params[0] * p.params[1], "gemm_fp8_tile": lambda: p.params[2]}
+        if p is None or p.name not in width or (p.name == "gemm_fp8_tile" and not fused) or width[p.name]() != KA:
+            raise ValueError(f"gemm_fp8_tile_layer: x_q must be an act_quant, q_norm or sparse_attn node's output of width {KA}, "
+                             f"or a gemm_fp8_tile node's K parts in slots; it comes from {p.name if p else 'the graph inputs'}")
+        assert tap is None or (fused and tap.num_dims == 1 and tap.dim(0) == zq_bytes(T, KA)), \
+            "tap: fused act_quant only, act_quant's layout (x_q, then its scale chunks)"
+        if fused:
+            assert groups == 1, "fused act_quant: one group"
+            at_most_parts(p, 4)   # x's K parts held in registers (tasks/gemm_fp8_tile.cuh fp8_fused_act)
+            # no one reader re-arms x's parts now (every task of a K slice polls them): the launch's resets fill them
+            nbytes = lambda n, N=p.params[2]: (n.grid[1] * T * N * 4, 0xFF, False)
+            p.info["out_buffer"] = nbytes
+            self._bufs[p.info["buf"]]["fill"] = nbytes
+        if combine == "slots":     # [K parts][T][N] fp32, 0xFF (the reader polls the slots and re-arms them)
+            out_buffer = lambda n: (n.grid[1] * T * N * 4, 0xFF, True)
+        elif combine == "add":     # [T][N] int64 fixed point, 0 before each launch
+            out_buffer = lambda n: (T * N * 8, 0, False)
+        else:                      # [T][N] fp32, every value written each launch
+            out_buffer = lambda n: (T * N * 4, -1, False)
+        assert combine != "add" or N // 128 <= 32, "one counter per 128-row block, at most 32"
+        map_slots = [self._map("w8kt", ("t", weight), (K, N, 2)), self._map("sf", ("t", weight_scales), ((N // 128) * (K // 128), 2))]
+        if not fused:
+            map_slots += [self._map("act8kt", ("t", input), (KA, T, 2)), self._map("sf", ("b", p.info["buf"], T * KA), (KA // 128, 2))]
+        # the scales: grid x cuts their row blocks; grid y not (its unit of 256 columns does not cut K / 128 chunks), and as a
+        # graph input they have no producer to wait for. x_q: a task waits for all of its producer's tasks (its counter), so
+        # that it depends on all of them (x_q whole); fused: on the K parts of its own K slice (polled)
+        whole = not fused
+        wafter = 0
+        if weights_after is not None:
+            nodes = graph_nodes(self)
+            pa = producer_of(weights_after, nodes)
+            assert pa is not None and pa.info["counter"] >= 0, "weights_after: a node's output, the node with a counter"
+            # the wait is no dependency the compiler sees: that node must be an ancestor (every plan the deadlock check
+            # accepts then runs its tasks before this node's)
+            seen, todo = set(), [input]
+            while todo:
+                q = producer_of(todo.pop(), nodes)
+                if q is not None and q.graph_idx not in seen:
+                    seen.add(q.graph_idx)
+                    todo += q.inputs
+            assert pa.graph_idx in seen, "weights_after: a node this GEMM depends on"
+            wafter = pa.info["counter"] + 1
+        params = [mode, K, N, groups] + ([wafter, 1] if fused else [wafter] if wafter else [])
+        self._add_node("gemm_fp8_tile", (N // 128, 1, 1), block_dim, [input, weight, weight_scales, output],
+                       [(-1, -1, -1) if whole else (-1, 1, -1), (0, 1, -1), (0, -1, -1), (1, -1, -1)], params,
+                       # fused: at most RING_STAGES / 2 stages per task (two jobs' x_q in the ring at once)
+                       changeable_grid_dims={1: (256, 2, RING_STAGES // 2 if fused else None)} if combine != "store" else {},
+                       out_buffer=out_buffer,
+                       counters={"slots": 0, "add": N // 128, "store": 1}[combine], map_slots=map_slots,
+                       buf_slots=[self._tensor_slot(tap)] if tap is not None else [],   # fused: row block 0 writes the tap
+                       cost_inputs=[0] if fused else [],   # fused: adds x's K parts
+                       dry=fused)   # fused: `warm` (not the node's first task on the SM) lets a task copy the previous one's x_q
+
+    def q_norm_layer(
+        self,
+        input: DTensor,     # wq_a's output [T, K] fp32: a gemm_fp8_tile node's K parts in slots
+        gamma: DTensor,     # q_norm's weight [K] bf16
+        output: DTensor,    # qr_q [T, K] e4m3 bytes (uint8)
+        eps: float = 1e-20,   # norm_eps
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's q_norm and the act_quant of its output (wq_b's linear quantizes qr): wq_a's K parts
+        added (polled), rounded to bf16, RMSNorm (gamma, eps), act_quant's formula per 32 columns; into the node's buffer as
+        act_quant's (qr_q, then its scale chunks), read by the wq_b GEMMs; the node's counter counts the tasks. params = [K, eps
+        (fp32 bits)]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "gemm_fp8_tile" or p.params[0] != COMBINE["slots"]:
+            raise ValueError(f"q_norm_layer: the input must be a gemm_fp8_tile node's output in slots; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        at_most_parts(p, 10)   # tasks/q_norm.cuh: at most 10 K parts
+        T, K = self._tokens(input.dim(0)), input.dim(1)
+        self._dtypes("q_norm_layer", input=(input, float32), gamma=(gamma, bfloat16), output=(output, uint8))
+        assert gamma.num_dims == 1 and gamma.dim(0) == K and (output.dim(0), output.dim(1)) == (T, K)
+        assert K % 256 == 0 and K <= 2048   # tasks/q_norm.cuh: 8 columns per thread, 256 per warp, at most 8 warps
+        self._add_node("q_norm", (T, 1, 1), block_dim, [input, gamma, output], [(0, -1, -1), (-1, -1, -1), (0, -1, -1)],
+                       [K, float_bits(eps)], out_buffer=lambda n: (zq_bytes(T, K), -1, False), counters=1,
+                       buf_slots=[self._tensor_slot(gamma)], cost_inputs=[0],   # adds wq_a's K parts
+                       dry=True)   # its first task on an SM runs once dry while wq_a's parts are on their way
+
+    def kv_post_layer(
+        self,
+        input: DTensor,       # wkv's output [T, D] fp32: a gemm_fp8_tile node's K parts in slots
+        gamma: DTensor,       # kv_norm's weight [D] bf16
+        positions: DTensor,   # [T] int32: each token's position
+        freqs: DTensor,       # [rows, RD / 2, 2] fp32: this layer's RoPE table (cos, sin per pair), freqs_cis as real
+        output: DTensor,      # the window cache [T, W, D + D / 32] uint8: per row D e4m3 bytes, then D / 32 e8m0 scales. Its
+                              # rows are read as one list, so a serving layer rebinds it to the framework's pool
+        window_loc: DTensor = None,   # [T] int32: each token's row of that list (a graph tensor, set before the launch)
+        eps: float = 1e-20,   # norm_eps
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's window K (model.py _window_kv): wkv's K parts added (polled), rounded to bf16,
+        RMSNorm (gamma, eps) -> bf16, RoPE at the token's position p on the last RD columns -> bf16, act_quant's formula per 32
+        columns into row window_loc[t] of the window cache (the official keeps the bf16 dequantization of the same bytes). The
+        cache is a graph tensor kept across launches, written by pointer (only that row). The node's counter t counts token t's
+        task. params = [D, W, RD, eps (fp32 bits)]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "gemm_fp8_tile" or p.params[0] != COMBINE["slots"]:
+            raise ValueError(f"kv_post_layer: the input must be a gemm_fp8_tile node's output in slots; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        at_most_parts(p, 10)   # tasks/kv_post.cuh: at most 10 K parts
+        T, D = self._tokens(input.dim(0)), input.dim(1)
+        self._dtypes("kv_post_layer", input=(input, float32), gamma=(gamma, bfloat16), positions=(positions, int32),
+                     freqs=(freqs, float32), output=(output, uint8), window_loc=(window_loc, int32))
+        W, RD = output.dim(1), 2 * freqs.dim(1)
+        assert D == 512 and RD == 64   # tasks/kv_post.cuh: 8 columns per thread (threads 0..63); RoPE on threads 56..63
+        assert gamma.num_dims == 1 and gamma.dim(0) == D
+        assert positions.num_dims == 1 and positions.dim(0) == T and freqs.num_dims == 3 and freqs.dim(2) == 2
+        assert output.num_dims == 3 and (output.dim(0), output.dim(2)) == (T, D + D // 32) and W >= 1
+        assert window_loc.num_dims == 1 and window_loc.dim(0) == T
+        self._add_node("kv_post", (T, 1, 1), block_dim, [input, gamma, positions, freqs, output],
+                       [(0, -1, -1), (-1, -1, -1), (0, -1, -1), (-1, -1, -1), (0, -1, -1)], [D, W, RD, float_bits(eps)],
+                       counters=T, buf_slots=[self._tensor_slot(gamma), self._tensor_slot(positions), self._tensor_slot(freqs),
+                                              self._tensor_slot(output), self._tensor_slot(window_loc)], cost_inputs=[0])   # adds wkv's K parts
+
+    def sparse_attn_layer(
+        self,
+        q: DTensor,             # q [T, H * D] fp32: wq_b's output in slots (a gemm_fp8_tile node's 1 or 2 K parts); its bf16
+                                # rounding and RoPE are done here
+        window_cache: DTensor,  # [T, W, D + D / 32] uint8: a kv_post node's output (the graph tensor it writes)
+        positions: DTensor,     # [T] int32: each token's position
+        freqs: DTensor,         # [rows, RD / 2, 2] fp32: this layer's RoPE table (cos, sin per pair), freqs_cis as real
+        attn_sink: DTensor,     # [H] fp32
+        output: DTensor,        # o_q [T, H * D] e4m3 bytes (uint8)
+        window_rows: DTensor = None,      # [T, W] int32: the rows of window_cache (as one list) of positions p, p - 1, ..: a
+                                          # graph tensor, set before the launch
+        compress_cache: DTensor = None,   # [T, CAP, 288] uint8: the group's compressed KV, per row 512 e2m1 (low nibble
+                                          # first) then 32 e4m3 scales (one per 16); a graph tensor read by pointer
+        compress_pages: DTensor = None,   # [T, CAP / 128] int32: position j at row pages[t][j / 128] * 128 + j % 128 of compress_cache
+        compress_idx: DTensor = None,     # [T, NC] int32: the compressed rows each token attends to after its window, in the
+                                          # list's order (the indexer's: ascending), -1 padded; a graph tensor
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task (t, g): token t, heads [16 g, 16 g + 16): DeepSeek-V4.1's attention in a decode step: sparse_attn over the
+        window, then (compress_cache and compress_idx, the compressed layers) the NC = 512 compressed rows of compress_idx (the
+        official's list, model.py L775-779: window, then the compressed ids; blocks of 64, arithmetic as kernel.py's),
+        o / (sum + exp(sink - max)), the inverse RoPE at the token's position, act_quant's formula per 32 columns (model.py
+        L781-787); into the node's buffer as act_quant's (o_q, then its scale chunks), read by wo_a. The node's counter counts
+        the tasks. params = [H, D, W, RD, softmax scale D^-0.5 (fp32 bits)] (+ [NC, CAP] with compressed KV). The compressed
+        inputs are graph tensors read by pointer, not the node's inputs: they must be ready before the launch (a Reuse layer's
+        group state). When no node writes them (a Reuse layer) and H >= 64, each compressed row is dequantized once per token: the
+        token's tasks split the pairs, into a scratch buffer, while q is on its way (sparse_attn.cuh sa_bf16k). With compressed KV
+        and H < 64 (fewer tasks per token than pairs: TP2, TP4) the grid is (T, H / 16, 1 + NC / 128): task (t, g, s) pair s of the
+        list alone, then the group's tasks exchange their partials and each combines a share (sparse_attn.cuh, split)."""
+        from .compiler import graph_nodes, producer_of
+        pq, pkv = producer_of(q, graph_nodes(self)), producer_of(window_cache, graph_nodes(self))
+        if pq is None or pq.name != "gemm_fp8_tile" or pq.params[0] != COMBINE["slots"]:
+            raise ValueError(f"sparse_attn_layer: q must be a gemm_fp8_tile node's output in slots; it comes from "
+                             f"{pq.name if pq else 'the graph inputs'}")
+        if pkv is None or pkv.name != "kv_post":
+            raise ValueError(f"sparse_attn_layer: the window cache must be a kv_post node's output; it comes from "
+                             f"{pkv.name if pkv else 'the graph inputs'}")
+        at_most_parts(pq, 2)   # tasks/sparse_attn.cuh: q from at most 2 K parts
+        T, N, H = self._tokens(q.dim(0)), q.dim(1), attn_sink.dim(0)
+        self._dtypes("sparse_attn_layer", q=(q, float32), window_cache=(window_cache, uint8),
+                     positions=(positions, int32),
+                     freqs=(freqs, float32), attn_sink=(attn_sink, float32), output=(output, uint8))
+        D, W, RD = N // H, window_cache.dim(1), 2 * freqs.dim(1)
+        assert q.num_dims == 2 and N == H * D and H % 16 == 0 and attn_sink.num_dims == 1
+        assert D == 512 and W == 128 and RD == 64   # tasks/sparse_attn.cuh: 8 warps of 64 columns, of 16 window positions
+        assert window_cache.num_dims == 3 and (window_cache.dim(0), window_cache.dim(2)) == (T, D + D // 32)
+        assert window_rows.num_dims == 2 and (window_rows.dim(0), window_rows.dim(1)) == (T, W)
+        self._dtypes("sparse_attn_layer", window_rows=(window_rows, int32))
+        assert positions.num_dims == 1 and positions.dim(0) == T and freqs.num_dims == 3 and freqs.dim(2) == 2
+        assert output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, N)
+        extra, slots, ctensors = [], [], []
+        counters, concurrent, splits = 1, None, 1
+        if compress_cache is not None or compress_idx is not None:
+            assert compress_cache is not None and compress_idx is not None, "the compressed cache and its ids together"
+            self._dtypes("sparse_attn_layer", compress_cache=(compress_cache, uint8), compress_idx=(compress_idx, int32))
+            NC, CAP = compress_idx.dim(1), compress_cache.dim(1)
+            assert compress_cache.num_dims == 3 and (compress_cache.dim(0), compress_cache.dim(2)) == (T, D // 2 + D // 16)
+            assert compress_idx.num_dims == 2 and compress_idx.dim(0) == T and NC % 128 == 0 and 0 < NC <= 512
+            assert compress_pages is not None and (compress_pages.dim(0), compress_pages.dim(1)) == (T, CAP // 128)
+            self._dtypes("sparse_attn_layer", compress_pages=(compress_pages, int32))
+            extra, slots = [NC, CAP], [self._tensor_slot(compress_cache), self._tensor_slot(compress_idx),
+                                       self._tensor_slot(compress_pages)]
+            ctensors = [compress_cache, compress_idx]   # inputs: a node that writes them this launch is waited for
+            nodes = graph_nodes(self)
+            if producer_of(compress_cache, nodes) is None and producer_of(compress_idx, nodes) is None and H // 16 >= NC // 128:
+                # a Reuse layer (both ready at the launch) with a task per pair or more (sparse_attn.cuh sa_bf16k, the same
+                # test; H 64): the compressed K dequantized once per token while q is on its way, by the token's tasks (pair
+                # c by task (t, c)), into a bf16 buffer [T][NC][520] the pairs copy from; a counter per (token, pair) says it
+                # is there. The token's tasks run at the same time. Fewer tasks (H 32, 16) keep the dequant in the pair loop
+                # (2 or 4 pairs in a task's prologue would outlast its wait)
+                slots.append(self._scratch("sparse_attn_kbf16", T * NC * 520 * 2))
+                counters, concurrent = 1 + T * (NC // 128), 1
+            elif H // 16 < NC // 128:
+                # a task per pair (the window's, then NC / 128 compressed): its block maxima to the others first (into
+                # sparse_attn_ml, 0xFF before each launch: polled), then its O (but its own share) and block sums into the
+                # partials (fp32: O [T][H / 16][splits][16][D], 0xFF: polled by the share's one reader, which re-arms it;
+                # maxima and sums [..][16][4]), and each combines its share of the columns. They run at the same time
+                # (concurrent_along_axis 2)
+                splits = 1 + NC // 128
+                slots.append(self._scratch("sparse_attn_part", T * H * splits * D * 4, reset=0xFF, by_reader=True))
+                slots.append(self._scratch("sparse_attn_ml", T * H * splits * 4 * 4, reset=0xFF))
+                counters, concurrent = 1, 2
+        self._add_node("sparse_attn", (T, H // 16, splits), block_dim, [q, window_cache, positions, freqs, attn_sink] + ctensors + [output],
+                       [(0, 1, -1), (0, -1, -1), (0, -1, -1), (-1, -1, -1), (-1, -1, -1)]
+                       + [(0, -1, -1)] * len(ctensors) + [(0, 1, -1)],
+                       [H, D, W, RD, float_bits(D ** -0.5)] + extra,
+                       out_buffer=lambda n: (zq_bytes(T, N), -1, False), counters=counters,
+                       concurrent_along_axis=concurrent,
+                       buf_slots=[self._tensor_slot(window_cache), self._tensor_slot(positions), self._tensor_slot(freqs),
+                                  self._tensor_slot(attn_sink), self._tensor_slot(window_rows)] + slots,
+                       dry=os.environ.get("SA_DRY", "1") != "0")   # its first task on an SM runs S .. the tail once on stand-ins while its inputs are on their way (SA_DRY=0, measurement: no dry pass)
+
+    def sum_store_layer(
+        self,
+        input: DTensor,     # wo_b's output [T, N] fp32: a gemm_fp8_tile node's K parts in slots
+        output: DTensor,    # y [T, N] bf16: the layer's output (a graph tensor); None with `sent`: only the sending half, the
+                            # buffer's reader (hc_post_combine) adds the GPUs' sums
+        sent: DTensor = None,     # num_gpus > 1: [num_gpus x T, N] bf16, the exchange buffer the GPUs' sums go through
+        block_dim: tuple = (256, 1, 1),
+        routed: DTensor = None,   # DeepSeek-V4.1's MoE: an expert node's routed rows [T x RK, N] fp32, added first
+    ):
+        """Task x: columns [128 x, 128 x + 128) (default; the compiler may give a task 1..8 such blocks): DeepSeek-V4.1's
+        attention output (model.py L790, x = wo_b(o)): wo_b's K parts added in part order (polled) -> bf16 -> y, written by
+        pointer. The node's counter counts the tasks. params = [N].
+        num_gpus > 1 (attention TP, each GPU's y a partial sum): the all-reduce is in the task. It first sends this GPU's sums of
+        its columns (bf16) to every GPU, into the node's buffer in the exchange region, then adds the GPUs' sums in GPU order
+        (fp32) -> bf16 -> y: the official RowParallelLinear's rounding points (fp8_gemm's bf16 output, the parts added in fp32).
+        The node's outputs are then that buffer's tensor and y (still written by pointer): a node that reads y waits for the
+        all-reduce. Every GPU must run the same plan.
+        routed (the MoE: model.py MoE.forward): the routed rows of an expert node (moe_experts, swiglu_moe_experts: its buffer
+        written by plain stores, its counter counting its tasks), row t RK + k the token's k-th expert in ascending id. A task
+        waits for all the expert node's tasks, then adds a token's RK rows in order, then the input's K parts (the shared
+        expert's). params = [N, RK]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "gemm_fp8_tile" or p.params[0] != COMBINE["slots"]:
+            raise ValueError(f"sum_store_layer: the input must be a gemm_fp8_tile node's output in slots; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        at_most_parts(p, 16)   # tasks/sum_store.cuh: at most 16 K parts
+        T, N, GPUS = self._tokens(input.dim(0)), input.dim(1), self.num_gpus
+        self._dtypes("sum_store_layer", input=(input, float32))
+        assert input.num_dims == 2 and N % 128 == 0
+        if output is not None:
+            self._dtypes("sum_store_layer", output=(output, bfloat16))
+            assert output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, N)
+        elif GPUS == 1 or sent is None:
+            raise ValueError("sum_store_layer: output None (only the sending half) needs num_gpus > 1 and `sent`")
+        rk = 0
+        if routed is not None:
+            q = producer_of(routed, graph_nodes(self))
+            if q is None or q.name not in ("moe_experts", "swiglu_moe_experts"):
+                raise ValueError("sum_store_layer: routed must be an expert node's output (moe_experts, swiglu_moe_experts)")
+            self._dtypes("sum_store_layer", routed=(routed, float32))
+            assert routed.num_dims == 2 and routed.dim(1) == N and routed.dim(0) % T == 0
+            rk = routed.dim(0) // T
+        tp = {}
+        if GPUS > 1:
+            if sent is None:
+                raise ValueError("sum_store_layer: with num_gpus > 1, `sent` (the exchange buffer's tensor, [num_gpus x T, N])")
+            self._dtypes("sum_store_layer", sent=(sent, bfloat16))
+            assert sent.num_dims == 2 and (sent.dim(0), sent.dim(1)) == (GPUS * T, N)
+            tp = dict(out_buffer=lambda n: (GPUS * T * N * 2, 0xFF, True), exchange=True)   # re-armed by its reader (the task)
+        outputs = [t for t in ([sent, output] if GPUS > 1 else [output]) if t is not None]   # y an output: its readers wait
+        tensors = [input] + ([routed] if rk else []) + outputs
+        self._add_node("sum_store", (N // 128, 1, 1), block_dim, tensors,
+                       [(1, -1, -1)] * len(tensors), [N] + ([rk] if rk else []),
+                       changeable_grid_dims={0: (128, 1, 8)}, counters=1,
+                       buf_slots=[-1 if output is None else self._tensor_slot(output)],
+                       cost_inputs=[0],   # adds wo_b's K parts
+                       dry=True,          # its first task on an SM runs once dry while wo_b's parts are on their way
+                       **tp)
+
+    def indexer_q_layer(
+        self,
+        input: DTensor,       # the indexer wq_b's output [T, H * HD] fp32: a gemm_fp8_tile node's K parts in slots
+        positions: DTensor,   # [T] int32: each token's position
+        freqs: DTensor,       # [rows, RD / 2, 2] fp32: the layer's RoPE table (cos, sin per pair), freqs_cis as real
+        output: DTensor,      # q_idx [T, H * HD] bf16: the fp4 query's values (the node's buffer)
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's indexer query (model.py Indexer.forward): the indexer wq_b's K parts added
+        (polled), bf16, RoPE at p on each head's last RD columns, bf16, fp4_act_quant per 32 columns (E8M0); the dequantized
+        values as bf16 into the node's buffer. The node's counter t counts token t's task. params = [H, HD, RD]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "gemm_fp8_tile" or p.params[0] != COMBINE["slots"]:
+            raise ValueError(f"indexer_q_layer: the input must be a gemm_fp8_tile node's output in slots; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        at_most_parts(p, 4)   # tasks/indexer_q.cuh: at most 4 K parts
+        T, N = self._tokens(input.dim(0)), input.dim(1)
+        self._dtypes("indexer_q_layer", input=(input, float32), positions=(positions, int32), freqs=(freqs, float32),
+                     output=(output, bfloat16))
+        HD, RD = 128, 2 * freqs.dim(1)
+        assert N == 32 * HD and RD == 64   # tasks/indexer_q.cuh: 16 columns per thread
+        assert output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, N)
+        self._add_node("indexer_q", (T, 1, 1), block_dim, [input, positions, freqs, output],
+                       [(0, -1, -1), (0, -1, -1), (-1, -1, -1), (0, -1, -1)], [N // HD, HD, RD],
+                       out_buffer=lambda n: (T * N * 2, -1, False), counters=T,
+                       buf_slots=[self._tensor_slot(positions), self._tensor_slot(freqs)], cost_inputs=[0])
+
+    def index_k_post_layer(
+        self,
+        input: DTensor,       # wk's output [T, HD] fp32: a gemm_tile node's K parts in slots (wk times the latent)
+        gamma: DTensor,       # k_norm's weight [HD] bf16
+        positions: DTensor,   # [T] int32: each token's position
+        freqs: DTensor,       # [rows, RD / 2, 2] fp32: the layer's RoPE table
+        output: DTensor,      # the index K cache [T, CAP, HD / 2 + HD / 32] uint8: per position HD e2m1 (low nibble first),
+                              # then HD / 32 e8m0 scales
+        ratio: int,           # the layer's compress ratio R: a token writes row p / R when (p + 1) % R == 0
+        pages: DTensor = None,   # [T, CAP / 128] int32: the cache's page table (tasks/indexer_common.cuh)
+        eps: float = 1e-20,   # norm_eps
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's index keys (model.py Indexer.forward, a layer that compresses its own KV): when
+        token t's group completed, wk's K parts added (polled), bf16, RMSNorm (gamma, eps) -> bf16, RoPE at p + 1 - R on the
+        last RD columns -> bf16, fp4_act_quant per 32 columns (E8M0) into row p / R of token t's index K cache (a graph tensor
+        kept across launches, written by pointer). The node's counter t counts token t's task. params = [HD, RD, R, CAP,
+        eps (fp32 bits)]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "gemm_tile" or p.params[0] != COMBINE["slots"]:
+            raise ValueError(f"index_k_post_layer: the input must be a gemm_tile node's output in slots; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        at_most_parts(p, 8)   # tasks/index_k_post.cuh: at most 8 K parts
+        T, HD = self._tokens(input.dim(0)), input.dim(1)
+        self._dtypes("index_k_post_layer", input=(input, float32), gamma=(gamma, bfloat16), positions=(positions, int32),
+                     freqs=(freqs, float32), output=(output, uint8))
+        RD, CAP = 2 * freqs.dim(1), output.dim(1)
+        assert HD == 128 and RD == 64 and ratio >= 1   # tasks/index_k_post.cuh: 4 columns per lane of warp 0
+        assert gamma.num_dims == 1 and gamma.dim(0) == HD
+        assert output.num_dims == 3 and (output.dim(0), output.dim(2)) == (T, HD // 2 + HD // 32)
+        self._add_node("index_k_post", (T, 1, 1), block_dim, [input, gamma, positions, freqs, output],
+                       [(0, -1, -1), (-1, -1, -1), (0, -1, -1), (-1, -1, -1), (0, -1, -1)],
+                       [HD, RD, ratio, CAP, float_bits(eps)], counters=T,
+                       buf_slots=[self._tensor_slot(gamma), self._tensor_slot(positions), self._tensor_slot(freqs),
+                                  self._tensor_slot(output), self._tensor_slot(pages)], cost_inputs=[0])
+
+    def indexer_score_layer(
+        self,
+        q: DTensor,           # q_idx [T, H * HD] bf16: an indexer_q node's output
+        weights: DTensor,     # weights_proj's output [T, NW] fp32 (NW >= H, the first H used): a gemm_tile node's K parts in
+                              # slots (weights_proj's [H, dim] weight padded to whole 128-row blocks)
+        index_k: DTensor,     # the index K cache [T, CAP, HD / 2 + HD / 32] uint8: an index_k_post node's output, or (a
+                              # Reindex layer) a graph input
+        positions: DTensor,   # [T] int32: each token's position
+        output: DTensor,      # scores [T, CAP] bf16 (the node's buffer): positions < (p + 1) / R written
+        ratio: int,           # the layer's compress ratio R: token t scores positions 0 .. (p + 1) / R - 1
+        candidates: DTensor = None,   # [T, CAP / 8] uint8, a byte per block of 8 positions (0 = out): a Reindex layer's
+                                      # mask from L20 (a graph input); positions outside score -inf
+        pages: DTensor = None,   # [T, CAP / 128] int32: the index K cache's page table (tasks/indexer_common.cuh)
+        chunks: int = None,   # token t's tasks (default CAP / 256): chunk c = positions [CH c, CH c + CH), CH = 256 x
+                              # ceil(CAP / 256 / chunks)
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task (t, c): token t, chunk c of its positions: DeepSeek-V4.1's indexer scores (model.py Indexer.forward):
+        bf16(sum over heads of bf16(relu(bf16(q_h . k)) x w_h)), w_h = bf16(weights_proj) x 2^-6. The node's counter t counts
+        token t's tasks. params = [H, HD, CAP, R, CAND]."""
+        from .compiler import graph_nodes, producer_of
+        nodes = graph_nodes(self)
+        pq, pw = producer_of(q, nodes), producer_of(weights, nodes)
+        if pq is None or pq.name != "indexer_q":
+            raise ValueError(f"indexer_score_layer: q must be an indexer_q node's output; it comes from "
+                             f"{pq.name if pq else 'the graph inputs'}")
+        if pw is None or pw.name != "gemm_tile" or pw.params[0] != COMBINE["slots"]:
+            raise ValueError(f"indexer_score_layer: the weights must be a gemm_tile node's output in slots; they come from "
+                             f"{pw.name if pw else 'the graph inputs'}")
+        at_most_parts(pw, 8)   # tasks/indexer_score.cuh: at most 8 K parts
+        T, HD = self._tokens(q.dim(0)), 128
+        H, CAP = q.dim(1) // HD, index_k.dim(1)
+        self._dtypes("indexer_score_layer", q=(q, bfloat16), weights=(weights, float32), index_k=(index_k, uint8),
+                     positions=(positions, int32), output=(output, bfloat16))
+        assert H == 32 and weights.num_dims == 2 and weights.dim(1) >= H and CAP % 256 == 0 and ratio >= 1
+        assert index_k.num_dims == 3 and (index_k.dim(0), index_k.dim(2)) == (T, HD // 2 + HD // 32)
+        assert output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, CAP)
+        cand = [] if candidates is None else [candidates]
+        if candidates is not None:
+            self._dtypes("indexer_score_layer", candidates=(candidates, uint8))
+            assert candidates.num_dims == 2 and (candidates.dim(0), candidates.dim(1)) == (T, CAP // 8)
+        # the output's map: token t's row (a task writes its chunk of it; chunks need not divide CAP)
+        self._add_node("indexer_score", (T, chunks or CAP // 256, 1), block_dim,
+                       [q, weights, index_k, positions] + cand + [output],
+                       [(0, -1, -1), (0, -1, -1), (0, -1, -1), (0, -1, -1)] + [(0, -1, -1)] * len(cand) + [(0, -1, -1)],
+                       [H, HD, CAP, ratio, int(candidates is not None)],
+                       out_buffer=lambda n: (T * CAP * 2, -1, False), counters=T,
+                       buf_slots=[self._tensor_slot(index_k), self._tensor_slot(positions), self._tensor_slot(pages)]
+                       + [self._tensor_slot(c) for c in cand])
+
+    def indexer_topk_layer(
+        self,
+        scores: DTensor,      # [T, CAP] bf16: an indexer_score node's output
+        positions: DTensor,   # [T] int32: each token's position
+        output: DTensor,      # compress_idx [T, KTOP] int32 (a graph tensor): the selected positions in order (without the
+                              # window's offset; sparse_attn_layer's compress_idx), -1 after
+        ratio: int,           # the layer's compress ratio R
+        candidates_out: DTensor = None,   # L20 (the candidate source): [T, CAP / 8] uint8 graph tensor, the candidate blocks
+                                          # of 8 (1 = kept) for the Reindex layers, written by pointer
+        top_blocks: int = 2048,           # candidate_topk_blocks
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's indexer top-k (model.py Indexer.forward, select_candidate_blocks): the
+        min(KTOP, (p + 1) / R) best positions of token t's scores in position order (ties at the last: the lowest positions),
+        -1 after; with candidates_out also L20's candidate blocks. The node's counter t counts token t's task. params = [CAP,
+        KTOP, R, CSRC, TOPB]."""
+        from .compiler import graph_nodes, producer_of
+        ps = producer_of(scores, graph_nodes(self))
+        if ps is None or ps.name != "indexer_score":
+            raise ValueError(f"indexer_topk_layer: the scores must be an indexer_score node's output; they come from "
+                             f"{ps.name if ps else 'the graph inputs'}")
+        T, CAP, KTOP = self._tokens(scores.dim(0)), scores.dim(1), output.dim(1)
+        self._dtypes("indexer_topk_layer", scores=(scores, bfloat16), positions=(positions, int32), output=(output, int32))
+        assert output.num_dims == 2 and output.dim(0) == T and 0 < KTOP <= CAP and CAP % 8 == 0
+        slots = [self._tensor_slot(positions), self._tensor_slot(output)]
+        if candidates_out is not None:
+            self._dtypes("indexer_topk_layer", candidates_out=(candidates_out, uint8))
+            assert candidates_out.num_dims == 2 and (candidates_out.dim(0), candidates_out.dim(1)) == (T, CAP // 8)
+            slots.append(self._tensor_slot(candidates_out))
+        self._add_node("indexer_topk", (T, 1, 1), block_dim, [scores, positions, output],
+                       [(0, -1, -1), (0, -1, -1), (0, -1, -1)],
+                       [CAP, KTOP, ratio, int(candidates_out is not None), top_blocks], counters=T, buf_slots=slots,
+                       dry=True)   # its first task on an SM runs the select and the compaction once on stand-ins first
+
+    def compressor_layer(
+        self,
+        input: DTensor,       # the compressor's GEMM output [T, NW] fp32: a gemm_tile node's K parts in slots, x times wkv
+                              # (NW = D, ratio 1) or [wkv; wgate] (NW = 2 D, ratio 2)
+        gamma: DTensor,       # the compressor's norm weight [D] bf16
+        positions: DTensor,   # [T] int32: each token's position
+        output: DTensor,      # the latent [T, D] bf16 (the node's buffer): rows of tokens whose group completed
+        ratio: int,           # the compress ratio R (1 or 2)
+        req_slots: DTensor = None,   # R = 2: [T] int64, each token's row in the state (a graph tensor, set before the launch)
+        state: DTensor = None,   # R = 2: the pooling state [slots, R, 2, D] fp32 (per slot and ring row kv | score; a graph tensor kept
+                                 # across launches, read and written by pointer)
+        eps: float = 1e-20,   # norm_eps
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's compressor (model.py Compressor.forward, decode). R = 1: wkv's K parts added ->
+        bf16 -> RMSNorm -> latent. R = 2: the K parts added (fp32) into slot p % 2 of the state; when (p + 1) % 2 == 0 the
+        softmax over the 2 slots per column, the weighted sum -> bf16 -> RMSNorm -> latent. The node's counter counts its
+        tasks (wk's gemm_tile and ckv_post wait for T). params = [D, R, eps (fp32 bits)]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "gemm_tile" or p.params[0] != COMBINE["slots"]:
+            raise ValueError(f"compressor_layer: the input must be a gemm_tile node's output in slots; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        at_most_parts(p, 8)   # tasks/compressor.cuh: at most 8 K parts
+        T, D = self._tokens(input.dim(0)), output.dim(1)
+        self._dtypes("compressor_layer", input=(input, float32), gamma=(gamma, bfloat16), positions=(positions, int32),
+                     output=(output, bfloat16))
+        assert D == 512 and ratio in (1, 2) and input.dim(1) == (D if ratio == 1 else 2 * D)
+        assert gamma.num_dims == 1 and gamma.dim(0) == D and output.num_dims == 2 and output.dim(0) == T
+        slots = [self._tensor_slot(gamma), self._tensor_slot(positions)]
+        if ratio > 1:
+            assert state is not None, "compressor_layer: ratio 2 keeps a state"
+            self._dtypes("compressor_layer", state=(state, float32))
+            assert state.num_dims == 4 and (state.dim(1), state.dim(2), state.dim(3)) == (ratio, 2, D)
+            assert req_slots is not None and req_slots.num_dims == 1 and req_slots.dim(0) == T
+            self._dtypes("compressor_layer", req_slots=(req_slots, int64))
+            slots += [self._tensor_slot(state), self._tensor_slot(req_slots)]
+        self._add_node("compressor", (T, 1, 1), block_dim, [input, gamma, positions, output],
+                       [(0, -1, -1), (-1, -1, -1), (0, -1, -1), (0, -1, -1)], [D, ratio, float_bits(eps)],
+                       out_buffer=lambda n: (T * D * 2, -1, False), counters=1, buf_slots=slots, cost_inputs=[0])
+
+    def ckv_post_layer(
+        self,
+        input: DTensor,       # the latent [T, D] bf16: a compressor node's output
+        positions: DTensor,   # [T] int32: each token's position
+        freqs: DTensor,       # [rows, RD / 2, 2] fp32: the layer's RoPE table
+        output: DTensor,      # the compressed KV cache [T, CAP, D / 2 + D / 16] uint8 (a graph tensor): per row D e2m1 (low
+                              # nibble first), then D / 16 e4m3 scales
+        ratio: int,           # the compress ratio R: a token writes position p / R when (p + 1) % R == 0
+        pages: DTensor = None,   # [T, CAP / 128] int32: position j at row pages[t][j / 128] * 128 + j % 128 of the cache
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task t = token t: DeepSeek-V4.1's compressed KV write (model.py Attention._compress_kv): when token t's group
+        completed, the latent's RoPE at p + 1 - R on the last RD columns -> bf16 -> fp4 per 16 columns with an E4M3 scale into
+        row p / R of token t's compressed KV cache (written by pointer). The node's counter t counts token t's task (sparse_attn
+        waits for it). params = [D, RD, R, CAP]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(input, graph_nodes(self))
+        if p is None or p.name != "compressor":
+            raise ValueError(f"ckv_post_layer: the input must be a compressor node's output; it comes from "
+                             f"{p.name if p else 'the graph inputs'}")
+        T, D = self._tokens(input.dim(0)), input.dim(1)
+        self._dtypes("ckv_post_layer", input=(input, bfloat16), positions=(positions, int32), freqs=(freqs, float32),
+                     output=(output, uint8))
+        RD, CAP = 2 * freqs.dim(1), output.dim(1)
+        assert D == 512 and RD == 64 and ratio == p.params[1]
+        assert output.num_dims == 3 and (output.dim(0), output.dim(2)) == (T, D // 2 + D // 16)
+        # the latent whole: a task waits for all of the compressor's tasks (its counter)
+        assert CAP % 128 == 0 and pages is not None and pages.num_dims == 2 and (pages.dim(0), pages.dim(1)) == (T, CAP // 128)
+        self._dtypes("ckv_post_layer", pages=(pages, int32))
+        self._add_node("ckv_post", (T, 1, 1), block_dim, [input, positions, freqs, output],
+                       [(-1, -1, -1), (0, -1, -1), (-1, -1, -1), (0, -1, -1)], [D, RD, ratio, CAP], counters=T,
+                       buf_slots=[self._tensor_slot(positions), self._tensor_slot(freqs), self._tensor_slot(output),
+                                  self._tensor_slot(pages)])
 
     def situ_and_mul_layer(
         self,
@@ -711,6 +1350,71 @@ class StaticMegakernel(PersistentKernel):
                        out_buffer=lambda n: (T * K * L * 4, -1, False),
                        counters=32 * 2 + NSLOT + pairc, buf_slots=bufs, map_slots=maps)
 
+    def swiglu_moe_experts_layer(
+        self,
+        x_q: DTensor, pairs: DTensor,        # x_q uint8 (act_quant's output of x), the routing pairs int64 (topk_route's)
+        w13: DTensor, w13_scales: DTensor,   # MXFP4 weights and their scales, uint8, in pieces (below)
+        w2: DTensor, w2_scales: DTensor,
+        output: DTensor,    # R [T x K, L] fp32: this GPU's routed rows, one per (token, routed expert k)
+        swiglu_limit: float,   # the SwiGLU clamp (model.py Expert: up to [-L, L], gate to <= L)
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Declare DeepSeek-V4.1's routed experts (tasks/swiglu_moe_experts.cuh): moe_experts' queue, table and roles, with
+        h = bf16(silu(gate) up) after gate and up are rounded to bf16 and clamped, act_quant's formula for h_q, W2 through the
+        weight ring, and R's row = the routing weight x W2's result (SGLang's and vLLM's order; the official model.py applies the
+        weight to h before W2). One task per SM.
+        Sizes: E experts and K per token (pairs; topk_route's DeepSeek-V4 gate, which sorts a token's pairs by expert id: R's row
+        (t, k) is the token's k-th expert in ascending id), L = x_q's width, I = this GPU's expert intermediate (a multiple of
+        64), IRP = I padded to whole 128 tiles (W2's K; h_q's columns [I, IRP) stay 0: zeroed scratch no task writes).
+        Weights (uint8), 128 x 128 MXFP4 pieces (8 KB: [128 rows][64 B]) with a 512-B scale chunk each, in piece order:
+          w13 [E, 2 I, L / 2]: per expert I / 64 items of 64 gate rows then the same 64 up rows, each in L / 128 K pieces;
+          w13_scales [E, 2 I, L / 32] the chunks in the same order;
+          w2 [E, L, IRP / 2]: per expert L / 128 output tiles, each in IRP / 128 K pieces (columns [I, IRP) zero);
+          w2_scales [E, L, IRP / 32].
+        params = [I, L's fp32 bits]."""
+        from .compiler import graph_nodes, producer_of
+        T, K, L = self._tokens(pairs.dim(0)), pairs.dim(1), x_q.dim(1)
+        E, I = w13.dim(0), w13.dim(1) // 2
+        IRP = -(-I // 128) * 128
+        NSLOT, KT_L, KT2 = T * K, L // 128, IRP // 128
+        self._dtypes("swiglu_moe_experts_layer", x_q=(x_q, uint8), pairs=(pairs, int64), w13=(w13, uint8),
+                     w13_scales=(w13_scales, uint8), w2=(w2, uint8), w2_scales=(w2_scales, uint8), output=(output, float32))
+        dims = lambda t: tuple(t.dim(i) for i in range(t.num_dims))
+        assert I % 64 == 0 and L % 128 == 0 and KT2 >= 3, "whole 64-feature items; W2 in at least 2 ring stages"
+        assert dims(w13) == (E, 2 * I, L // 2) and dims(w13_scales) == (E, 2 * I, L // 32)
+        assert dims(w2) == (E, L, IRP // 2) and dims(w2_scales) == (E, L, IRP // 32)
+        assert dims(output) == (T * K, L)
+        assert math.isfinite(swiglu_limit) and swiglu_limit > 0
+        nodes = graph_nodes(self)
+        if any(n.name in ("moe_experts", "scaled_moe_experts", "swiglu_moe_experts") for n in nodes):
+            # the expert phase switch runs once per kernel (KernelLocals::ring_relaid): a second expert node would skip it
+            raise ValueError("swiglu_moe_experts_layer: the graph already has an expert node; one expert node per graph")
+        xq = producer_of(x_q, nodes)
+        if xq is None or xq.name != "act_quant" or list(xq.params) != [L]:
+            raise ValueError("swiglu_moe_experts_layer: x_q must be an act_quant node's output of x (a graph input)")
+        route = producer_of(pairs, nodes)
+        if route is None or route.name != "topk_route" or len(route.params) not in (7, 8) or \
+                list(route.params[:2]) != [E, K] or route.params[6] != 1:   # (8: + idle rows on row 0's experts)
+            raise ValueError(f"swiglu_moe_experts_layer: the pairs must be a topk_route node's with the DeepSeek-V4 gate "
+                             f"(score_func 'sqrtsoftplus') over the {E} experts of w13")
+        hq = self._scratch("swiglu_moe_experts.h_q", NSLOT * T * IRP)              # zeroed once: columns [I, IRP) stay 0
+        hsf = self._scratch("swiglu_moe_experts.h_q_scales", NSLOT * KT2 * SF_CHUNK)   # the chunks' unused bytes stay 0
+        maps = []
+        for weight, scales in ((w13, w13_scales), (w2, w2_scales)):
+            pieces = weight.dim(0) * weight.dim(1) * weight.dim(2) // 8192
+            maps += [self._map("wblk", ("t", weight), (pieces, 1)), self._map("wblk", ("t", weight), (pieces, 2)),
+                     self._map("sf", ("t", scales), (pieces, 1)), self._map("sf", ("t", scales), (pieces, 2))]
+        maps += [self._map("act8", ("t", x_q), (L, T)), self._map("act8kt", ("t", x_q), (L, T, 2)),
+                 self._map("sf", ("b", xq.info["buf"], T * L), (KT_L, KT_L)),
+                 self._map("act8kt", ("b", hq, 0), (IRP, NSLOT * T, 2)), self._map("sf", ("b", hsf, 0), (NSLOT * KT2, 1)),
+                 self._map("act8", ("b", hq, 0), (IRP, NSLOT * T)), self._map("sf", ("b", hsf, 0), (NSLOT * KT2, 2))]
+        tensors = [x_q, pairs, w13, w2, output]
+        self._add_node("swiglu_moe_experts", (self._num_sms(), 1, 1), block_dim, tensors, [(-1, -1, -1)] * len(tensors),
+                       [I, float_bits(swiglu_limit)], one_task_per_sm=True,
+                       out_buffer=(lambda n: (T * K * L * 4, 0xFF, True)) if self.moe_rows_poll else   # (C12: polled, re-armed)
+                       (lambda n: (T * K * L * 4, -1, False)), counters=32 * 2 + NSLOT, buf_slots=[hq, hsf],
+                       map_slots=maps)
+
     # ---- after moe_experts (tasks/allreduce_send.cuh, sum_rmsnorm.cuh, sum_gpus.cuh, sum_send.cuh, residual_add.cuh). The
     # graph tensors between them (the sent partial sums, sum_rmsnorm's Rn, sum_gpus's Ssum, latent_up's K parts, sum_send's o)
     # stand for the buffers the bodies use; their input maps give the dependencies.
@@ -721,6 +1425,9 @@ class StaticMegakernel(PersistentKernel):
         output: DTensor,        # what is sent: [T, W] bf16 (its buffer: [num_gpus][T][W] bf16 in the exchange region)
         num_tasks: int = None,  # slices of the partial sum; default: one per task of the producer (as its grid is now)
         block_dim: tuple = (256, 1, 1),
+        dest_mc: DTensor = None,  # (11-20, DSV41_ENGRAM=2) with output a graph tensor [num_gpus T, W] bf16 (its local copy):
+                                  # the rows go there instead of into the exchange region, through dest_mc (a graph tensor
+                                  # bound to its multicast address); one set, re-armed by its reader in another kernel
     ):
         """Task x: slice x of this GPU's partial sum (bf16) to every GPU, into this GPU's slot of the node's output (in the exchange
         region), once the input's producer is done (all its tasks, counted in its counter). params = [W, G, FX]. When the producer is
@@ -733,10 +1440,16 @@ class StaticMegakernel(PersistentKernel):
         # (polled: rows of this GPU only, the same layout with one GPU)
         slots_src = (p is not None and p.name == "gemm_tile" and p.params[0] == COMBINE["slots"] and
                      (p.params[3] == 0 or self.num_gpus == 1))
+        # (11-20, DSv4.1's Engram wkv) a gemm_fp8_tile node's K parts in slots (one group, no fused input, no weights_after):
+        # the same [K parts][T][N] fp32 layout, polled, added in order and re-armed the same way; params[3] = 2 says so
+        fp8_slots = (p is not None and p.name == "gemm_fp8_tile" and p.params[0] == COMBINE["slots"] and len(p.params) == 4
+                     and p.params[3] == 1)
+        slots_src = slots_src or fp8_slots
         if p is None or p.info["buf"] < 0 or (p.info["counter"] < 0 and not slots_src):
             raise ValueError(f"allreduce_send_layer: the input must be a node's output buffer whose node counts its tasks, or a "
                              f"gemm_tile node's output in slots; it comes from {p.name if p else 'the graph inputs'}")
-        T, W, GPUS = self._tokens(output.dim(0)), output.dim(1), self.num_gpus
+        GPUS = self.num_gpus
+        T, W = self._tokens(output.dim(0) // (GPUS if dest_mc is not None else 1)), output.dim(1)
         fx = input.dtype == int64   # a COMBINE_ADD GEMM's sums (its K parts): a task per 128-column block, after its parts
         if fx:
             if p.name not in ("gemm_tile", "scaled_gemm_tile") or p.params[0] != 1:
@@ -754,8 +1467,15 @@ class StaticMegakernel(PersistentKernel):
             readers = [n for n in graph_nodes(self) if any(t.guid == zq.guid for t in n.inputs)]
             if len(readers) == 1:
                 rearm = producer_of(zq, graph_nodes(self)).info["buf"]
+        if dest_mc is not None:   # into a graph tensor (tasks/allreduce_send.cuh TO_T): params[4] = 1
+            assert slots_src and not fx and output.dim(0) == GPUS * T, "allreduce_send into a tensor: a GEMM's K parts in slots"
+            self._dtypes("allreduce_send_layer", dest_mc=(dest_mc, bfloat16))
+            self._add_node("allreduce_send", (num_tasks or p.grid[0] * p.grid[1] * p.grid[2], 1, 1), block_dim, [input, output],
+                           [(-1, -1, -1)] * 2, [W, 1, 0, 2 if fp8_slots else 0, 1],
+                           buf_slots=[-1, self._tensor_slot(dest_mc), self._tensor_slot(output)], cost_inputs=[0])
+            return
         self._add_node("allreduce_send", (num_tasks or p.grid[0] * p.grid[1] * p.grid[2], 1, 1), block_dim, [input, output],
-                       [(-1, -1, -1)] * 2, [W, input.dim(0) // T, int(fx)],
+                       [(-1, -1, -1)] * 2, [W, input.dim(0) // T, int(fx)] + ([2] if fp8_slots else []),
                        out_buffer=lambda n: (GPUS * T * W * 2, 0xFF, True), exchange=True, buf_slots=[rearm],
                        cost_inputs=[0] if slots_src else [])   # slots: adds the GEMM's K parts
 
@@ -1301,6 +2021,227 @@ class StaticMegakernel(PersistentKernel):
                        out_buffer=lambda n: (n.grid[0] * T * HC_MIX_STRIDE * 4, 0xFF, False), counters=1,
                        buf_slots=[self._tensor_slot(residual), self._tensor_slot(output), self._tensor_slot(h_post),
                                   self._tensor_slot(h_res), self._tensor_slot(fn)])
+
+    # ---- DeepSeek-V4.1: mHC with the coefficients of a sublayer computed beside it (model.py Block: its input was collapsed with
+    # the previous sublayer's pre): hc_mix -> hc_coef at the start, the body, the sending half of the all-reduce (sum_store) ->
+    # hc_post_combine at the end (the sums land, the post, the next sublayer's input).
+    def hc_mix_layer(
+        self,
+        residual: DTensor,      # [T, HC H] bf16: the sublayer's input streams (a graph tensor)
+        fn: DTensor,            # [NMIX, HC H] fp32: this sublayer's hc_*_fn
+        mix: DTensor,           # [T, HC_MIX_STRIDE] fp32 (a stand-in: the buffer holds [H / 32][T][HC_MIX_STRIDE])
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task s = columns [32 s, 32 s + 32) of every stream and token: their partial mixes with fn (hc_coef adds them).
+        params = [HC, H, NMIX]."""
+        T, NMIX = self._tokens(residual.dim(0)), fn.dim(0)
+        HC, H = 4, residual.dim(1) // 4
+        assert NMIX == HC * (HC + 2) and fn.dim(1) == HC * H and H % 32 == 0
+        self._dtypes("hc_mix_layer", residual=(residual, bfloat16), fn=(fn, float32), mix=(mix, float32))
+        self._add_node("hc_mix", (H // 32, 1, 1), block_dim, [residual, fn, mix], [(-1, -1, -1)] * 3, [HC, H, NMIX],
+                       out_buffer=lambda n: (n.grid[0] * T * HC_MIX_STRIDE * 4, 0xFF, False),
+                       buf_slots=[self._tensor_slot(residual), self._tensor_slot(fn)])
+
+    def hc_coef_layer(
+        self,
+        mix: DTensor,           # a gemm_tile node's K parts: [T, 128], rows 0 .. 23 (fn's bf16 part) and 24 .. 47 (the rest)
+        residual: DTensor,      # [T, HC H] bf16: the sublayer's input streams (their sum of squares)
+        hc_small: DTensor,      # fp32 [>= NMIX + 3]: hc_*_base [NMIX], then hc_*_scale [3]
+        h_pre: DTensor,         # [T, HC] fp32: pre, a graph tensor (the framework's state when it runs the next boundary)
+        output: DTensor,        # [T, 32] fp32: the coefficients (its buffer): pre [HC], post [HC], comb [HC HC], 0s
+        rms_eps: float = 1e-20, hc_eps: float = 1e-6, post_mult: float = 2.0, sinkhorn_iters: int = 20,
+        block_dim: tuple = (256, 1, 1),
+        h_post: DTensor = None, # [T, HC] fp32, with h_comb [T, HC HC] fp32: post and comb for a framework that runs the post itself
+        h_comb: DTensor = None,
+    ):
+        """Task t: token t's pre, post and comb from the mixes (model.py hc_mixes, kernel.py hc_split_sinkhorn). Its counter
+        counts its T tasks. params = [rms_eps, hc_eps, post_mult (fp32 bits), Sinkhorn iterations]."""
+        from .compiler import graph_nodes, producer_of
+        p = producer_of(mix, graph_nodes(self))
+        if p is None or p.name != "gemm_tile":
+            raise ValueError("hc_coef_layer: mix must be a gemm_tile node's output")
+        HC, NMIX = 4, 24
+        T = self._tokens(output.dim(0))
+        assert hc_small.dim(0) >= NMIX + 3 and output.dim(1) == 32 and (h_pre.dim(0), h_pre.dim(1)) == (T, HC)
+        self._dtypes("hc_coef_layer", mix=(mix, float32), hc_small=(hc_small, float32), h_pre=(h_pre, float32),
+                     output=(output, float32))
+        self._add_node("hc_coef", (T, 1, 1), block_dim, [mix, output], [(0, -1, -1), (0, -1, -1)],
+                       [float_bits(rms_eps), float_bits(hc_eps), float_bits(post_mult), sinkhorn_iters],
+                       out_buffer=lambda n: (T * 32 * 4, -1, False), counters=1, cost_inputs=[0],
+                       buf_slots=[self._tensor_slot(hc_small), self._tensor_slot(h_pre), self._tensor_slot(residual),
+                                  -1 if h_post is None else self._tensor_slot(h_post),
+                                  -1 if h_comb is None else self._tensor_slot(h_comb)])
+
+    def hc_post_combine_layer(
+        self,
+        sent: DTensor,          # [num_gpus x T, H] bf16: the exchange buffer of the node that sent the partial sums
+        residual: DTensor,      # [T, HC H] bf16: the sublayer's input streams
+        coef: DTensor,          # an hc_coef node's coefficients
+        output: DTensor,        # [T, HC H] bf16: the new streams (a graph tensor)
+        x: DTensor = None,      # [T, H] bf16: the next sublayer's input (a graph tensor); None: the post only (the framework
+                                # collapses the streams: Engram rewrites them first, or the head reads them)
+        gamma: DTensor = None,  # [H] bf16: the next sublayer's RMSNorm weight
+        norm_eps: float = 1e-20,
+        parts: int = 8,         # tasks per token, each H / parts columns
+        block_dim: tuple = (256, 1, 1),
+    ):
+        """Task (q, t): columns of token t: the sums over the GPUs, R', and with x the next sublayer's input (tasks of a token
+        exchange their sums of squares, so they run at the same time). Its counter counts its tasks. params = [H, HC, NORM,
+        norm_eps (fp32 bits)]."""
+        from .compiler import graph_nodes, producer_of
+        nodes = graph_nodes(self)
+        s, c = producer_of(sent, nodes), producer_of(coef, nodes)
+        if s is None or s.name != "sum_store" or c is None or c.name != "hc_coef":
+            raise ValueError("hc_post_combine_layer: sent from a sum_store node, coef from an hc_coef node")
+        H, GPUS = sent.dim(1), self.num_gpus
+        T, HC = sent.dim(0) // GPUS, residual.dim(1) // H
+        norm = x is not None
+        assert (gamma is not None) == norm and output.dim(1) == HC * H
+        self._dtypes("hc_post_combine_layer", sent=(sent, bfloat16), residual=(residual, bfloat16), coef=(coef, float32),
+                     output=(output, bfloat16))
+        slots = [self._tensor_slot(residual), self._tensor_slot(output)]
+        if norm:
+            self._dtypes("hc_post_combine_layer", x=(x, bfloat16), gamma=(gamma, bfloat16))
+            slots += [self._tensor_slot(gamma), self._tensor_slot(x), self._scratch("hc_ssq", T * parts * 4, reset=0xFF)]
+        self._add_node("hc_post_combine", (parts, T, 1), block_dim, [sent, residual, coef, output],
+                       [(1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)], [H, HC, int(norm), float_bits(norm_eps)],
+                       counters=1, concurrent_along_axis=0 if norm else None, buf_slots=slots,
+                       dry=os.environ.get("HC_DRY", "0") != "0")   # its first task on an SM runs once dry (the MoE gains, the attention loses)
+
+    def engram_gate_layer(
+        self,
+        kv: DTensor,            # [T, W] bf16: an allreduce_send node's output (its buffer [num_gpus][T][W]: GPU r's W columns)
+        streams: DTensor,       # R' [T, HC H] bf16: a node's output (the mHC post's new streams)
+        weight: DTensor,        # [HC, H] fp32: q_weight x k_weight (a graph tensor)
+        output: DTensor,        # R'' [T, HC H] bf16 (a graph tensor)
+        eps: float = 1e-20,
+        clamp: float = 1e-6,
+        block_dim: tuple = (256, 1, 1),
+        pre: DTensor = None,    # (11-20, kv a graph tensor) with gamma and x: the next sublayer's input from R'' as the post
+        gamma: DTensor = None,  # computes it (pre [T, HC] fp32: the next sublayer's coefficients, gamma [H] bf16, x [T, H]
+        x: DTensor = None,      # bf16; tasks/engram_gate.cuh NX)
+        norm_eps: float = 1e-20,
+    ):
+        """DeepSeek-V4.1's Engram gate (tasks/engram_gate.cuh), task (x, y) = copy x of token y: its stream in R' and the
+        token's gathered row of kv (one key of H per copy, then the value) -> R'' = h + gate value. After all the producer's
+        tasks (its counter) and kv's vectors from every GPU (polled, re-armed). params = [H, HC, eps, clamp (fp32 bits)]."""
+        from .compiler import graph_nodes, producer_of
+        nodes = graph_nodes(self)
+        s, p = producer_of(kv, nodes), producer_of(streams, nodes)
+        ten = s is None   # (11-20, DSV41_ENGRAM=2) kv a graph tensor [GPUs T, W] another kernel gathered (one set)
+        if (s is not None and s.name != "allreduce_send") or p is None or p.info["counter"] < 0:
+            raise ValueError("engram_gate_layer: kv from an allreduce_send node or a graph tensor, R' from a node that counts "
+                             "its tasks")
+        GPUS, W = self.num_gpus, kv.dim(1)
+        T, HC, H = self._tokens(kv.dim(0) // (GPUS if ten else 1)), weight.dim(0), weight.dim(1)
+        assert x is None or (ten and pre is not None and gamma is not None), "the next input: kv a tensor, pre and gamma"
+        assert streams.dim(1) == HC * H and output.dim(1) == HC * H and (HC + 1) * H == GPUS * W and H % 8 == 0
+        self._dtypes("engram_gate_layer", kv=(kv, bfloat16), streams=(streams, bfloat16), weight=(weight, float32),
+                     output=(output, bfloat16))
+        self._add_node("engram_gate", (HC, T, 1), block_dim, [kv, streams, weight, output],
+                       [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (1, 0, -1)],
+                       [H, HC, float_bits(eps), float_bits(clamp)] + ([1, W] if ten else []) +
+                       ([1, float_bits(norm_eps)] if x is not None else []),
+                       buf_slots=[self._tensor_slot(streams), self._tensor_slot(weight), self._tensor_slot(output)] +
+                       ([self._tensor_slot(kv)] if ten else []) +
+                       ([self._tensor_slot(pre), self._tensor_slot(gamma), self._tensor_slot(x)] if x is not None else []),
+                       counters=T if ten else 0, concurrent_along_axis=0 if ten else None,   # (ten: a token's HC tasks at once)
+                       dry=True)   # its first task on an SM runs once dry (its code warm by the real pass)
+
+    def engram_rows_layer(
+        self,
+        ids: DTensor,           # [T, C] int64 (a graph tensor): the layer's hash ids; rows ids_stride apart in memory
+        weight: DTensor,        # [rows, DIM] uint8: this GPU's rows of the table (fp8 e4m3), rows [starts[r], starts[r + 1])
+        scale: DTensor,         # [rows, DIM / BS] uint8: their e8m0 scales
+        output: DTensor,        # [T, C DIM] bf16: this GPU's copy of a symmetric buffer (0xFF before; its reader re-arms it)
+        output_mc: DTensor,     # bound to output's multicast address
+        starts: DTensor,        # [GPUS + 1] int64: each GPU's first row, then the table's size
+        ids_stride: int,
+        block: int = 32,
+        block_dim: tuple = (256, 1, 1),
+        peer: int = 0,          # P > 0 (SGLang's PEER_READ layout): weight / scale = w_bias / s_bias [P] int64, starts [P];
+                                # every row read from its owner's shard in place, output this GPU's buffer only
+    ):
+        """(11-20, DSV41_EG_ROWS=1) DeepSeek-V4.1's Engram table lookup (tasks/engram_rows.cuh): task t = token t's C rows;
+        each row this GPU holds dequantized as SGLang's engram_gather into every GPU's copy of output (multicast). Its reader:
+        an act_quant_layer(poll=True). params = [C, DIM, BS, ids_stride]."""
+        T, C = self._tokens(ids.dim(0)), ids.dim(1)
+        DIM = output.dim(1) // C
+        if peer:
+            assert peer & (peer - 1) == 0 and weight.dim(0) == scale.dim(0) == starts.dim(0) == peer
+            self._dtypes("engram_rows_layer", weight=(weight, int64), scale=(scale, int64))
+        else:
+            assert starts.num_dims == 1 and starts.dim(0) == self.num_gpus + 1 and weight.dim(1) == DIM
+            assert scale.dim(1) * block == DIM
+            self._dtypes("engram_rows_layer", weight=(weight, uint8), scale=(scale, uint8))
+        assert output.dim(0) == T and output.dim(1) == C * DIM and ids_stride >= C
+        self._dtypes("engram_rows_layer", ids=(ids, int64), output=(output, bfloat16), starts=(starts, int64))
+        self._add_node("engram_rows", (T, 1, 1), block_dim, [ids, weight, scale, output],
+                       [(0, -1, -1), (-1, -1, -1), (-1, -1, -1), (0, -1, -1)],
+                       [C, DIM, block, ids_stride] + ([1, peer] if peer else []),
+                       buf_slots=[self._tensor_slot(ids), self._tensor_slot(weight), self._tensor_slot(scale),
+                                  self._tensor_slot(output), self._tensor_slot(output_mc), self._tensor_slot(starts)])
+
+    def gather_f32_layer(
+        self,
+        input: DTensor,         # [T, W] bf16: an allreduce_send node's output (its buffer [num_gpus][T][W]: GPU r's row)
+        output: DTensor,        # [T, num_gpus N] fp32 (a graph tensor): GPU r's first N columns at [r N, r N + N)
+        parts: int = 16,        # tasks per token
+        block_dim: tuple = (256, 1, 1),
+        ids: DTensor = None,    # [T] int32 (a graph tensor): also each token's torch.argmax of its row (DSV41_HEAD_ARGMAX)
+    ):
+        """(11-20, the DeepSeek-V4.1 LM head) task (x, y): part x of token y's gathered row: the GPUs' rows as sent (polled per
+        16 B, re-armed), as fp32 into the output. params = [N] (+ [1] with ids: the parts' (value, index) in the node's buffer
+        [T][parts] u64, a counter a token, the last part's task reduces them)."""
+        from .compiler import graph_nodes, producer_of
+        s = producer_of(input, graph_nodes(self))
+        if s is None or s.name != "allreduce_send":
+            raise ValueError("gather_f32_layer: rows sent by an allreduce_send node")
+        T, W, GPUS = self._tokens(input.dim(0)), input.dim(1), self.num_gpus
+        N = output.dim(1) // GPUS
+        assert output.dim(1) == GPUS * N and N <= W and N % 8 == 0 and output.dim(0) == T
+        assert (GPUS * N // 8 + parts - 1) // parts <= 4 * 256, "tasks/gather_f32.cuh: at most 4 vectors a thread"
+        self._dtypes("gather_f32_layer", input=(input, bfloat16), output=(output, float32))
+        if ids is None:
+            self._add_node("gather_f32", (parts, T, 1), block_dim, [input, output], [(-1, -1, -1), (1, 0, -1)], [N],
+                           buf_slots=[self._tensor_slot(output)])
+            return
+        assert ids.num_dims == 1 and ids.dim(0) == T, "gather_f32_layer: ids [T] int32"
+        self._dtypes("gather_f32_layer", ids=(ids, int32))
+        # the node's own output: the parts (its buffer, named logits_am: not a graph tensor's name), then the two graph tensors
+        am = self.new_tensor(dims=(T, parts), dtype=int64, name="logits_am")
+        self._add_node("gather_f32", (parts, T, 1), block_dim, [input, am, output, ids],
+                       [(-1, -1, -1), (1, 0, -1), (1, 0, -1), (-1, 0, -1)], [N, 1],
+                       buf_slots=[self._tensor_slot(output), self._tensor_slot(ids)], counters=T,
+                       out_buffer=lambda n: (T * parts * 8, -1, False))
+
+    def dsv41_mhc_nodes(self, a, w: dict, sent: DTensor):
+        """The mHC nodes of a DeepSeek-V4.1 sublayer whose tensors w holds them (the sublayer's sum_store only sends): a(name) =
+        the graph tensor. streams, hc_fn, hc_small, h_pre, streams_out; gamma_next and x_out when the next sublayer's input is
+        computed here. The buffer slots are then exactly the graph's."""
+        T = w["streams"].shape[0]
+        self.max_bufs = 64   # (until the slots are known, below)
+        mix = self.new_tensor(dims=(T, 128), dtype=float32, name="hc_mix")
+        self.gemm_tile_layer(input=a("streams"), weight=a("hc_fn_w"), output=mix)     # the mixes, fn as bf16 rows hi | lo
+        coef = self.new_tensor(dims=(T, 32), dtype=float32, name="hc_coef")
+        self.hc_coef_layer(mix=mix, residual=a("streams"), hc_small=a("hc_small"), h_pre=a("h_pre"), output=coef)
+        norm = "gamma_next" in w
+        self.hc_post_combine_layer(sent=sent, residual=a("streams"), coef=coef, output=a("streams_out"),
+                                   x=a("x_out") if norm else None, gamma=a("gamma_next") if norm else None,
+                                   parts=int(os.environ.get("HC_PARTS", 4)))
+        self.max_bufs = len(self._bufs)
+
+    def dsv41_mhc_stats_nodes(self, a, w: dict):
+        """Only mHC's coefficients beside the sublayer (the framework runs the all-reduce and the post): the mixes (a gemm_tile of
+        the streams with hc_fn_w) -> hc_coef -> the graph tensors h_pre, h_post, h_comb."""
+        T = w["streams"].shape[0]
+        self.max_bufs = 64   # (until the slots are known, below)
+        mix = self.new_tensor(dims=(T, 128), dtype=float32, name="hc_mix")
+        self.gemm_tile_layer(input=a("streams"), weight=a("hc_fn_w"), output=mix)
+        coef = self.new_tensor(dims=(T, 32), dtype=float32, name="hc_coef")
+        self.hc_coef_layer(mix=mix, residual=a("streams"), hc_small=a("hc_small"), h_pre=a("h_pre"), output=coef,
+                           h_post=a("h_post"), h_comb=a("h_comb"))
+        self.max_bufs = len(self._bufs)
 
     # ---- GLM-5.3-Flash KDA (tasks/kda_decode.cuh): a KDA sublayer is in_proj (a gemm_tile in slots) -> kda_decode ->
     # o_proj -> allreduce_send -> hc_post_mix -> hc_pre (the next sublayer's input).

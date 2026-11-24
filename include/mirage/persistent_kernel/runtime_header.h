@@ -296,7 +296,59 @@ enum TaskType {
   // mHC's post step of a TP sublayer and the first half of the next
   // sublayer's pre step in one task (tasks/hc_post_mix.cuh).
   TASK_HC_POST_MIX_SM100 = 530,
-  TASK_STATIC_TASK_END = 549, // end placeholder, not a real task
+  // DeepSeek-V4.1 attention: one token's FP8 act_quant, 32-column groups with
+  // power-of-2 scales (tasks/act_quant.cuh)
+  TASK_ACT_QUANT_SM100 = 531,
+  // DeepSeek-V4.1 block-FP8 GEMM tile: e4m3 weights with a scale per 32 x 32
+  // block, act_quant's, q_norm's or sparse_attn's output; grouped for wo_a
+  // (tasks/gemm_fp8_tile.cuh)
+  TASK_GEMM_FP8_TILE_SM100 = 532,
+  // DeepSeek-V4.1 q_norm: wq_a's K parts added, RMSNorm, act_quant
+  // (tasks/q_norm.cuh)
+  TASK_Q_NORM_SM100 = 533,
+  // DeepSeek-V4.1 window K: wkv's K parts added, RMSNorm, RoPE, act_quant into
+  // the window cache (tasks/kv_post.cuh)
+  TASK_KV_POST_SM100 = 534,
+  // DeepSeek-V4.1 sparse attention: the window and the compressed list (a task
+  // per 128 keys at TP2 / TP4), the inverse RoPE, act_quant
+  // (tasks/sparse_attn.cuh)
+  TASK_SPARSE_ATTN_SM100 = 535,
+  // DeepSeek-V4.1 attention output: wo_b's K parts added -> bf16 -> y
+  // (tasks/sum_store.cuh)
+  TASK_SUM_STORE_SM100 = 536,
+  // DeepSeek-V4.1 indexer query: wq_b's K parts, RoPE, fp4
+  // (tasks/indexer_q.cuh)
+  TASK_INDEXER_Q_SM100 = 537,
+  // DeepSeek-V4.1 index keys: wk's K parts, k_norm, RoPE, fp4 into the index K
+  // cache (tasks/index_k_post.cuh)
+  TASK_INDEX_K_POST_SM100 = 538,
+  // DeepSeek-V4.1 indexer scores per compressed position
+  // (tasks/indexer_score.cuh)
+  TASK_INDEXER_SCORE_SM100 = 539,
+  // DeepSeek-V4.1 indexer top-k (and L20's candidate blocks)
+  // (tasks/indexer_topk.cuh)
+  TASK_INDEXER_TOPK_SM100 = 540,
+  // DeepSeek-V4.1 compressor: wkv (and wgate) K parts, the pooling state,
+  // RMSNorm -> the latent (tasks/compressor.cuh)
+  TASK_COMPRESSOR_SM100 = 541,
+  // DeepSeek-V4.1 compressed KV write: the latent's RoPE, fp4 with E4M3
+  // scales into the compressed KV cache (tasks/ckv_post.cuh)
+  TASK_CKV_POST_SM100 = 542,
+  // DeepSeek-V4.1 routed experts: MXFP4 weights, SwiGLU with clamps, W2
+  // through the weight ring (tasks/swiglu_moe_experts.cuh)
+  TASK_SWIGLU_MOE_EXPERTS_SM100 = 543,
+  // DeepSeek-V4.1's mHC, its coefficients computed beside the sublayer and its
+  // end in the kernel (tasks/hc_mix.cuh, hc_coef.cuh, hc_post_combine.cuh).
+  TASK_HC_MIX_SM100 = 544,
+  TASK_HC_COEF_SM100 = 545,
+  TASK_HC_POST_COMBINE_SM100 = 546,
+  // DeepSeek-V4.1's Engram gate after the post (tasks/engram_gate.cuh)
+  TASK_ENGRAM_GATE_SM100 = 547,
+  // the LM head's all-gather into fp32 logits (tasks/gather_f32.cuh)
+  TASK_GATHER_F32_SM100 = 548,
+  // DeepSeek-V4.1's Engram table lookup in the kernel (tasks/engram_rows.cuh)
+  TASK_ENGRAM_ROWS_SM100 = 549,
+  TASK_STATIC_TASK_END = 550, // end placeholder, not a real task
 };
 
 enum EventType {

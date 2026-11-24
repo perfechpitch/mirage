@@ -208,7 +208,12 @@ template <class SELF,
           class MAP_SLOTS,
           class ACT,
           class... IN>
-__device__ __forceinline__ void run_gemm_tile(Maps const &maps,
+#ifdef GT_RUN_NOINLINE // measurement only: the task's dispatch as a function of its own
+__device__ __noinline__ void run_gemm_tile(
+#else
+__device__ __forceinline__ void run_gemm_tile(
+#endif
+        Maps const &maps,
                                               G const &g,
                                               KernelLocals &L,
                                               StaticTask const &tk) {
@@ -298,14 +303,40 @@ __device__ __forceinline__ void run_gemm_tile(Maps const &maps,
       static_assert(ACT::counter >= 0,
                     "the activation's producer counts its tasks");
       __syncthreads();
+#ifdef GEMM_RELAID_PREFILL
+      // (11-20, default off) after moe_experts re-laid the ring: its barriers
+      // made fresh now, before the wait (moe_experts' async work has ended
+      // with its task), so that the weights prefill here too (the LM head's
+      // GEMM behind the last MoE layer's experts streams its weights while
+      // the post computes its input)
+      bool const relaid_now = L.ring_relaid;
+      if (L.ring_relaid) {
+        if (threadIdx.x == 0) {
+          ring_reinit(true);
+        }
+        L.gl = L.gi0 = L.gi1 = 0;
+        L.wt = 0;
+        L.ring_relaid = false;
+        __syncthreads();
+      }
+#endif
       // the weights first (not after moe_experts re-laid the ring: its
       // barriers are made fresh after the wait)
       npre = L.ring_relaid ? 0 : prefill_stages(j.nst);
+#if defined(GEMM_RELAID_PREFILL) && defined(GEMM_RELAID_PREFILL_N)
+      if (relaid_now && npre > GEMM_RELAID_PREFILL_N) { // (a smaller burst
+        npre = GEMM_RELAID_PREFILL_N; // of HBM reads beside the post)
+      }
+#endif
       if (threadIdx.x == 0) {
         if (npre) {
           prefill_weights<ROWS>(j, L.base, L.gl, npre);
         }
         cnt_wait(cnt_now(g) + ACT::counter, ACT::x * ACT::y * ACT::z);
+#ifdef GEMM_ACT_PROXY_FENCE // (11-20, default off) the activation's generic
+        // stores (another task's) before this thread's TMA reads of them
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+#endif
 #ifdef STATIC_TIMING_BUILD
         if (npre && L.stage_stamps) {
           L.stage_stamps[0] = gtime(); // the activation ready (no load stamp)

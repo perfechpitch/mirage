@@ -109,7 +109,26 @@ static_assert(!AR_TWOSHOT || (T == 64 && GPUS == 4),
 #error                                                                         \
     "STATIC_NO_START_BARRIER is a serving mode: it needs STATIC_RESET_IN_KERNEL"
 #endif
-static_assert(GPUS == 1, "STATIC_NO_START_BARRIER: one GPU");
+#endif
+#ifdef STATIC_X_FLAG
+#ifndef STATIC_NO_START_BARRIER
+#error "STATIC_X_FLAG (H1) is a serving mode: it needs STATIC_NO_START_BARRIER"
+#endif
+constexpr int XFLAG_N = 32; // the post's tasks (hc_post_combine: 4 parts x T)
+// static_host_rebind (host.cuh): "@xflag_out" this kernel's post words
+// ([XFLAG_N] uint32, zeroed, owned by the caller), "@xflag_in" the kernel
+// before's (0: the classic wait at the start). G starts zeroed (GpuState())
+#define STATIC_X_FLAG_REBIND(gg, name, p)                                      \
+  if ((name) == "@xflag_out") {                                                \
+    (gg).xflag_out = reinterpret_cast<uint32_t *>(p);                          \
+    return true;                                                               \
+  }                                                                            \
+  if ((name) == "@xflag_in") {                                                 \
+    (gg).xflag_in = reinterpret_cast<uint32_t const *>(p);                     \
+    return true;                                                               \
+  }
+#else
+#define STATIC_X_FLAG_REBIND(gg, name, p)
 #endif
 
 // ---- the layer state (the kernel's parameter g) ----
@@ -140,6 +159,16 @@ struct G {
 #endif
   unsigned char *mc, *rv; // the exchange region: multicast address (GPUS > 1),
                           // this GPU's copy (2 sets)
+#ifdef STATIC_X_FLAG
+  // H1 (docs/h1_design.md): x with its own flag instead of the wait for the
+  // kernel before's grid. xflag_out: [XFLAG_N] this kernel's post tasks each
+  // store this launch's number there after x and the streams (release); never
+  // reset. xflag_in: the kernel before's xflag_out (its post writes this
+  // kernel's x), or nullptr: the classic path (the wait at the start). Both
+  // bound by the host (static_host_rebind "@xflag_out" / "@xflag_in")
+  uint32_t *xflag_out;
+  uint32_t const *xflag_in;
+#endif
   long long *stamps; // [NSM][NSTAMP] time stamps (globaltimer ns) read by the
                      // host (config.cuh STAMP_*)
   long long *start_barrier; // [1] written by every SM once the start barrier is
@@ -151,65 +180,40 @@ struct G {
 #endif
 };
 
+// STATIC_NO_START_BARRIER: the kernel's second G (the host's copy of g with
+// every two-set buffer and the counters at their second set); the generated
+// kernel picks one, gp, once, so the tasks' addresses stay kernel parameters
+#ifdef STATIC_NO_START_BARRIER
+#define STATIC_G1_PARAM static_mk::G g_par1,
+#define STATIC_G1_ARG(x) , static_host::g1_of(x)
+#else
+#define STATIC_G1_PARAM
+#define STATIC_G1_ARG(x)
+#endif
+
 // the exchange region's set of this launch: its launch number's parity, set at
 // the kernel's start
 __shared__ unsigned dbuf_par;
+#ifdef STATIC_X_FLAG
+// H1, in shared memory (no register live across the task loop): this launch's
+// number (the value the post stores), and the CTA's state: bit 0
+// griddepcontrol.wait done (deferred to the first task that is not pre-wait
+// safe, at the latest kernel_end), bit 1 x's flag seen (later polls return at
+// once). Thread 0 changes the state between two barriers: every thread reads
+// the same value at every check
+__shared__ unsigned x_gen_s, x_state_s;
+#endif
 __device__ __forceinline__ size_t rg_set() {
   return (size_t)dbuf_par * EXCHANGE_SET;
 }
-#ifdef STATIC_NO_START_BARRIER
-// this launch's set: per buffer slot its offset, and the counters it uses (set
-// at the kernel's start from the launch number's parity)
-__shared__ unsigned long long par_off[MAX_BUFS];
-__shared__ uint32_t *cnt_cur;
-#ifndef STATIC_RESET_SMS_N
-#define STATIC_RESET_SMS_N 0
-#define STATIC_RESET_SMS_MASK0 0ull
-#define STATIC_RESET_SMS_MASK1 0ull
-#define STATIC_RESET_SMS_MASK2 0ull
-#define STATIC_RESET_SMS_MASK3 0ull
-#endif
-// the SMs that reset the next launch's set right after the start (their first
-// task waits for other tasks anyway: static_schedule.reset_sms); none: every SM
-// at its end
-constexpr int RESET_SMS_N = STATIC_RESET_SMS_N;
-// sm's index among the reset SMs, or -1 (the mask's 64-bit words as
-// immediates: no memory access)
-__device__ __forceinline__ int reset_sm_rank(int sm) {
-  constexpr unsigned long long M0 = STATIC_RESET_SMS_MASK0,
-                               M1 = STATIC_RESET_SMS_MASK1,
-                               M2 = STATIC_RESET_SMS_MASK2,
-                               M3 = STATIC_RESET_SMS_MASK3;
-  int const w = sm >> 6, b = sm & 63;
-  unsigned long long const word = w == 0 ? M0 : w == 1 ? M1 : w == 2 ? M2 : M3;
-  if (!((word >> b) & 1ull)) {
-    return -1;
-  }
-  int r = __popcll(word & ((1ull << b) - 1ull));
-  r += w > 0 ? __popcll(M0) : 0;
-  r += w > 1 ? __popcll(M1) : 0;
-  r += w > 2 ? __popcll(M2) : 0;
-  return r;
-}
-#endif
-// buffer `slot` (G::buf) as a P pointer (STATIC_NO_START_BARRIER: in this
-// launch's set)
+// buffer `slot` (G::buf) as a P pointer
 template <class P>
 __device__ __forceinline__ P *buf_at(G const &g, int slot) {
-#ifdef STATIC_NO_START_BARRIER
-  return reinterpret_cast<P *>(reinterpret_cast<char *>(g.buf[slot]) +
-                               par_off[slot]);
-#else
   return reinterpret_cast<P *>(g.buf[slot]);
-#endif
 }
-// the nodes' counters (STATIC_NO_START_BARRIER: this launch's set)
+// the nodes' counters
 __device__ __forceinline__ uint32_t *cnt_now(G const &g) {
-#ifdef STATIC_NO_START_BARRIER
-  return cnt_cur;
-#else
   return g.cnt;
-#endif
 }
 // a multicast store into this launch's set of every GPU's exchange region (off:
 // an offset in the set)
@@ -291,6 +295,16 @@ __host__ __device__ constexpr int param_or() {
     return PARAMS::v[I];
   } else {
     return DEF;
+  }
+}
+
+// params[I] of a node, 0 when it has fewer
+template <class PARAMS, int I>
+__host__ __device__ constexpr int param_or0() {
+  if constexpr (sizeof(PARAMS::v) / sizeof(int) > I + 1) {
+    return PARAMS::v[I];
+  } else {
+    return 0;
   }
 }
 
@@ -462,6 +476,7 @@ struct KernelLocals {
   bool ring_relaid; // a task re-laid the ring's shared memory (moe_experts'
                     // phase switch): a GEMM after it starts with fresh ring
                     // barriers
+
 #ifdef STATIC_TIMING_BUILD
   unsigned long long *stage_stamps =
       nullptr; // this list entry's 2 GEMM stage stamps (set by the generated
@@ -501,9 +516,10 @@ __device__ __forceinline__ bool pf_batch(PrefetchList const &pl,
 
 #ifdef STATIC_NO_START_BARRIER
 // share idx of n of the resets of the set the next launch uses: no task of this
-// launch touches it, the previous launch (which used it) is over
-// (griddepcontrol.wait), and the next launch's tasks start after this grid's
-// end. 16-B stores, not waited for
+// launch touches it, the previous launch (which used it) is over because the
+// layer runs once per step (not by griddepcontrol.wait: this runs before it, so
+// a PDL chain must not launch one layer twice in a row), and the next launch's
+// tasks start after this grid's end. 16-B stores, not waited for
 __device__ __forceinline__ void reset_next_set(G const &g, int idx, int n) {
   unsigned const other = dbuf_par ^ 1u;
   for (int i = 0; i < g.resets.cnt; i++) {
@@ -530,11 +546,11 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
   int const sm_id = L.sm_id;
   cta_prologue(L.sm);
 #ifdef STATIC_NO_START_BARRIER
-  // serving with no start barrier (one GPU): every buffer the start would reset
-  // has two sets (and so do the counters); launch n uses set n % 2, the other
-  // was reset at the end of launch n - 1 (kernel_end), which this launch's
-  // tasks follow (griddepcontrol.wait below), and no task of launch n touches
-  // it. The launch number: this SM's own word. PDL as below
+  // serving with no start barrier: every buffer the start would reset has two
+  // sets (and so do the counters); launch n uses set n % 2, the other was reset
+  // at the start of launch n - 1, which this launch's tasks follow
+  // (griddepcontrol.wait below), and no task of launch n touches it. The launch
+  // number: this SM's own word. PDL as below
   __shared__ unsigned gen_s;
   long long t_start = 0;
   if (threadIdx.x == 0) {
@@ -547,17 +563,20 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
     *gw = gen;
     gen_s = gen;
     dbuf_par = gen & 1u;
-    cnt_cur = g.cnt + (size_t)(gen & 1u) * NCNT;
+#ifdef STATIC_X_FLAG
+    x_gen_s = gen;
+#endif
   }
   if (threadIdx.x < NSTAMP) {
     g.stamps[sm_id * NSTAMP + threadIdx.x] = 0;
   }
   __syncthreads();
-  for (int i = threadIdx.x; i < MAX_BUFS; i += blockDim.x) {
-    par_off[i] = (gen_s & 1u) ? g.par_bytes[i] : 0ull; // read by the tasks
-                                                       // after tmem_alloc_512's
-                                                       // __syncthreads
-  }
+
+  // the next launch's buffer set, spread over the CTAs, before the wait for the
+  // previous kernel (#811 STATIC_RESET_PARITY): this layer's launch before used
+  // that set and has ended (one launch per step); the tasks read this launch's
+  // set through the generated kernel's gp (the second G, a kernel parameter)
+  reset_next_set(g, sm_id, gridDim.x);
   if (threadIdx.x == 0) {
     g.stamps[sm_id * NSTAMP + STAMP_START] = t_start;
     *g.start_barrier = gtime();
@@ -670,6 +689,18 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
 #endif
   L.tb = tmem_alloc_512(); // its __syncthreads also publishes rt
 #ifdef STATIC_RESET_IN_KERNEL
+#ifdef STATIC_X_FLAG
+  // H1: with x's flag bound, no wait here: the generated loop waits before the
+  // CTA's first task that is not pre-wait safe (x_grid_wait), kernel_end at
+  // the latest, so every CTA waits before it exits (the chain stays whole)
+  if (threadIdx.x == 0) {
+    x_state_s = g.xflag_in == nullptr ? 1u : 0u;
+    if (g.xflag_in == nullptr) {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+  }
+  __syncthreads();
+#else
   if (threadIdx.x == 0) {
     asm volatile("griddepcontrol.wait;" ::
                      : "memory"); // PDL: from here on the previous kernel's
@@ -677,14 +708,6 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
   }
   __syncthreads();
 #endif
-#ifdef STATIC_NO_START_BARRIER
-  if constexpr (RESET_SMS_N > 0) { // the next launch's resets on the SMs whose
-                                   // first task waits anyway
-    int const rank = reset_sm_rank(sm_id);
-    if (rank >= 0) {
-      reset_next_set(g, rank, RESET_SMS_N);
-    }
-  }
 #endif
   L.gl = 0;
   L.gi0 = 0;
@@ -693,16 +716,72 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
   L.ring_relaid = false;
 }
 
-// after the task loop (STATIC_NO_START_BARRIER with no reset SMs: first this
-// SM's share of the next launch's resets, reset_next_set)
-__device__ __forceinline__ void kernel_end(G const &g, KernelLocals &L) {
-  __syncthreads();
-#ifdef STATIC_NO_START_BARRIER
-  if constexpr (RESET_SMS_N == 0) {
-    reset_next_set(g, L.sm_id, gridDim.x);
+// after the task loop
+#ifdef STATIC_X_FLAG
+// H1: the wait for the kernel before's grid, once per CTA: before its first
+// task that is not pre-wait safe (generated), and in kernel_end
+__device__ __forceinline__ void x_grid_wait(KernelLocals &) {
+  if (!(x_state_s & 1u)) {
+    if (threadIdx.x == 0) {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    __syncthreads(); // every thread has read the old state
+    if (threadIdx.x == 0) {
+      x_state_s |= 1u;
+    }
+    __syncthreads(); // the new one for every later check
+  }
+}
+// H1: before a task that reads x: every post task of the kernel before has
+// stored this launch's number into its word (after x: release; here acquire
+// by threads 0 .. XFLAG_N - 1, then the barrier). Only that number passes: an
+// older one is the last step's (wait); the kernels of a chain launch the same
+// number of times, else this waits for ever (never a stale x). After the grid
+// wait x is visible anyway. The proxy fence: x may be read by TMA (gemm_tile)
+__device__ __forceinline__ void x_flag_poll(G const &g, KernelLocals &) {
+  if (!(x_state_s & 3u)) { // (bit 0 is set whenever xflag_in is nullptr)
+    unsigned const want = x_gen_s;
+    if (threadIdx.x < XFLAG_N) {
+#ifdef STATIC_X_FLAG_DEBUG
+      long long const t0 = gtime();
+#endif
+      while (cnt_ld(g.xflag_in + threadIdx.x) != want) {
+#ifdef STATIC_X_FLAG_DEBUG
+        if (gtime() - t0 > 2000000000ll) {
+          printf("x_flag_poll: CTA %d word %d holds %u, launch %u: no x\n",
+                 (int)blockIdx.x,
+                 (int)threadIdx.x,
+                 cnt_ld(g.xflag_in + threadIdx.x),
+                 want);
+          __trap();
+        }
+#endif
+      }
+    }
+    __syncthreads();
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    if (threadIdx.x == 0) {
+      x_state_s |= 2u;
+    }
     __syncthreads();
   }
+}
+// H1, the post: this task's columns of x and the streams stored (the caller's
+// barrier before): its word := this launch's number (release, gpu scope)
+__device__ __forceinline__ void x_flag_store(G const &g, int task) {
+  if (g.xflag_out != nullptr) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(g.xflag_out + task),
+                 "r"(x_gen_s)
+                 : "memory");
+  }
+}
 #endif
+
+__device__ __forceinline__ void kernel_end(G const &g, KernelLocals &L) {
+#ifdef STATIC_X_FLAG
+  x_grid_wait(L); // H1: every CTA waits before it exits
+#endif
+  __syncthreads();
   if (threadIdx.x == 0) {
     g.stamps[L.sm_id * NSTAMP + STAMP_END] = gtime();
   }
@@ -710,3 +789,21 @@ __device__ __forceinline__ void kernel_end(G const &g, KernelLocals &L) {
 }
 
 } // namespace static_mk
+
+// (11-20, host only, default off: host.cuh static_host_rebind; at the end of
+// this file, so that no line of the default build moves) a module shared by
+// several layers: each layer's own per-SM stamps and start-barrier word, for
+// in-situ samples ("@stamps", "@start_barrier")
+#ifdef STATIC_STAMP_REBIND
+#define STATIC_STAMP_REBIND_(gg, name, p)                                      \
+  if ((name) == "@stamps") {                                                   \
+    (gg).stamps = reinterpret_cast<long long *>(p);                            \
+    return true;                                                               \
+  }                                                                            \
+  if ((name) == "@start_barrier") {                                            \
+    (gg).start_barrier = reinterpret_cast<long long *>(p);                     \
+    return true;                                                               \
+  }
+#else
+#define STATIC_STAMP_REBIND_(gg, name, p)
+#endif

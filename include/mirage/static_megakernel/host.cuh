@@ -16,8 +16,8 @@
 //       tensor name) or b:<buffer slot>+<byte offset>.
 //     kind and dims: bf16 <rows> <K> <box rows> | wblk <pieces> <box pieces> |
 //       wblk8 <pieces> <box pieces> | sf <chunks> <box chunks> |
-//       act8 <K bytes> <rows> |
-//       act8kt <K bytes> <rows> <K tiles>
+//       act8 <K bytes> <rows> | act8kt <K bytes> <rows> <K tiles> |
+//       w8kt <K bytes> <rows> <K tiles>
 // The node output buffers are allocated first, then the scratch buffers, then
 // the counters and the time stamps. Keep this order: the buffers' addresses
 // decide where they fall in L2, and a different order makes the layer slower.
@@ -68,6 +68,9 @@ struct BufReset {
 };
 struct GpuState {
   G g;       // the kernel's parameter g (by value)
+#ifdef STATIC_NO_START_BARRIER
+  G g1; // the kernel's second G (g1_of)
+#endif
   Maps maps; // the kernel's parameter maps (__grid_constant__)
   std::vector<BufReset>
       resets; // every buffer filled before each launch (static_host_reset)
@@ -145,14 +148,19 @@ static void
                                 CU_TENSOR_MAP_L2_PROMOTION_NONE,
                                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 }
-// e4m3 [rows, Kb] as {128, rows, Kb / 128}; box {128, TW, nkt}: nkt K tiles of
-// TW rows (the tokens of a step: the MMA's N; T < 8: the rows past the tensor's
-// T are outside it and read as 0)
-static void map_act8_kt(
-    CUtensorMap *m, void *base, uint64_t Kb, uint64_t rows, uint32_t nkt) {
+// e4m3 [rows, Kb] as {128, rows, Kb / 128}; box {128, box_rows, nkt}: nkt K
+// tiles of box_rows rows (act8kt: TW rows, the width of a step's GEMM; T < 8:
+// the rows past the tensor's T are outside it and read as 0; w8kt: 128 rows of
+// an e4m3 weight)
+static void map_act8_kt(CUtensorMap *m,
+                        void *base,
+                        uint64_t Kb,
+                        uint64_t rows,
+                        uint32_t nkt,
+                        uint32_t box_rows = (uint32_t)TW) {
   cuuint64_t gd[3] = {128, rows, Kb / 128};
   cuuint64_t gs[2] = {Kb, 128};
-  cuuint32_t bd[3] = {128, (cuuint32_t)TW, nkt}, es[3] = {1, 1, 1};
+  cuuint32_t bd[3] = {128, box_rows, nkt}, es[3] = {1, 1, 1};
   MKS_CU(cuTensorMapEncodeTiled(m,
                                 CU_TENSOR_MAP_DATA_TYPE_UINT8,
                                 3,
@@ -245,9 +253,23 @@ static void mc_alloc(size_t need, unsigned char *&mcVA, unsigned char *recv[]) {
 template <typename P>
 static P *dmalloc(GpuState &s, size_t bytes) {
   void *p;
+#ifdef STATIC_BUF_STAGGER // measurement only: the i-th buffer of a GPU starts
+                          // (STATIC_BUF_BASE + i STATIC_BUF_STAGGER) mod 4096
+                          // bytes into its allocation (multiples of 256), so
+                          // that the buffers' addresses differ modulo 4 KiB
+#ifndef STATIC_BUF_BASE
+#define STATIC_BUF_BASE 0
+#endif
+  MKS_CK(cudaMalloc(&p, bytes + 4096));
+  s.owned.push_back(p);
+  size_t const off =
+      ((size_t)(STATIC_BUF_BASE) + (s.owned.size() - 1) * (size_t)(STATIC_BUF_STAGGER)) % 4096;
+  return static_cast<P *>(static_cast<void *>(static_cast<unsigned char *>(p) + off));
+#else
   MKS_CK(cudaMalloc(&p, bytes));
   s.owned.push_back(p);
   return static_cast<P *>(p);
+#endif
 }
 
 // the args "<prefix><slot>" (slot < n), split at spaces; a missing slot is an
@@ -289,6 +311,21 @@ static std::vector<std::vector<std::string>>
 // zero-filled, unless `given` has the tensor), graph tensors (from `given`; a
 // host that sets them later may leave them out: nullptr), exchange buffers;
 // their resets into s.resets
+#ifdef STATIC_NO_START_BARRIER
+// g with every two-set buffer and the counters at their second set, from the
+// current g (a rebound buffer has one set)
+static G const &g1_of(GpuState &s) {
+  s.g1 = s.g;
+  for (int i = 0; i < MAX_BUFS; i++) {
+    if (s.g.par_bytes[i] != 0) {
+      s.g1.buf[i] = (char *)s.g.buf[i] + s.g.par_bytes[i];
+    }
+  }
+  s.g1.cnt = s.g.cnt + NCNT;
+  return s.g1;
+}
+#endif
+
 static void build_bufs(GpuState &s,
                        std::map<std::string, void *> const &given,
                        std::map<std::string, std::string> const &args) {
@@ -444,6 +481,8 @@ static void build_map(Maps &maps,
     map_act8(&maps.m[i], p, u(2), u(3));
   } else if (kind == "act8kt" && m.size() == 5) {
     map_act8_kt(&maps.m[i], p, u(2), u(3), (uint32_t)u(4));
+  } else if (kind == "w8kt" && m.size() == 5) {
+    map_act8_kt(&maps.m[i], p, u(2), u(3), (uint32_t)u(4), 128);
   } else {
     fprintf(stderr,
             "static_host: map.%d: bad declaration (%s, %zu fields)\n",
@@ -791,7 +830,7 @@ static void
 static bool static_host_rebind(int r, std::string const &name, void *p) {
   using namespace static_host;
   GpuState &s = g_gpus[r];
-  bool found = false;
+  bool found = false; STATIC_X_FLAG_REBIND(s.g, name, p) STATIC_STAMP_REBIND_(s.g, name, p) // H1, stamps (core.cuh)
   auto const bufs = slot_args(s.args, "buf.", MAX_BUFS);
   for (int i = 0; i < MAX_BUFS; i++) {
     if (!bufs[i].empty() && bufs[i][0] == "tensor" && bufs[i][1] == name) {

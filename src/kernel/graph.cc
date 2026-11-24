@@ -1147,6 +1147,97 @@ void Graph::register_task_for_op(KNOperator const *op,
     int variant_id = task_register->register_hc_post_mix_sm100_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(4, 2, TASK_HC_POST_MIX_SM100, variant_id);
+  } else if (name == "hc_mix") {
+    int variant_id =
+        task_register->register_hc_mix_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_HC_MIX_SM100, variant_id);
+  } else if (name == "hc_coef") {
+    int variant_id =
+        task_register->register_hc_coef_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_HC_COEF_SM100, variant_id);
+  } else if (name == "hc_post_combine") {
+    int variant_id = task_register->register_hc_post_combine_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_HC_POST_COMBINE_SM100, variant_id);
+  } else if (name == "engram_gate") {
+    int variant_id = task_register->register_engram_gate_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(3, 1, TASK_ENGRAM_GATE_SM100, variant_id);
+  } else if (name == "engram_rows") {
+    int variant_id =
+        task_register->register_engram_rows_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(3, 1, TASK_ENGRAM_ROWS_SM100, variant_id);
+  } else if (name == "gather_f32") {
+    int variant_id =
+        task_register->register_gather_f32_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, params.size() == 2 ? 3 : 1, TASK_GATHER_F32_SM100,
+                                      variant_id);   // (params [N, 1]: the parts, the logits, the ids)
+  } else if (name == "act_quant") {
+    int variant_id = task_register->register_act_quant_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_ACT_QUANT_SM100, variant_id);
+  } else if (name == "gemm_fp8_tile") {
+    int variant_id = task_register->register_gemm_fp8_tile_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(3, 1, TASK_GEMM_FP8_TILE_SM100, variant_id);
+  } else if (name == "q_norm") {
+    int variant_id =
+        task_register->register_q_norm_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(2, 1, TASK_Q_NORM_SM100, variant_id);
+  } else if (name == "kv_post") {
+    int variant_id =
+        task_register->register_kv_post_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(4, 1, TASK_KV_POST_SM100, variant_id);
+  } else if (name == "sparse_attn") {
+    int variant_id = task_register->register_sparse_attn_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        params.size() == 7 ? 7 : 5, 1, TASK_SPARSE_ATTN_SM100, variant_id);
+  } else if (name == "sum_store") {
+    int variant_id = task_register->register_sum_store_sm100_task(
+        customized->bgraph, params);
+    // inputs: params.size() (2: the routed rows); outputs: y, or with num_gpus
+    // > 1 the exchange buffer, then y
+    int const num_inputs = (int)params.size();
+    task_config[op] =
+        std::make_tuple(num_inputs,
+                        (int)customized->bgraph.operators.size() - num_inputs,
+                        TASK_SUM_STORE_SM100,
+                        variant_id);
+  } else if (name == "indexer_q") {
+    int variant_id = task_register->register_indexer_q_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(3, 1, TASK_INDEXER_Q_SM100, variant_id);
+  } else if (name == "index_k_post") {
+    int variant_id = task_register->register_index_k_post_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_INDEX_K_POST_SM100, variant_id);
+  } else if (name == "indexer_score") {
+    int variant_id = task_register->register_indexer_score_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        params[4] ? 5 : 4, 1, TASK_INDEXER_SCORE_SM100, variant_id);
+  } else if (name == "indexer_topk") {
+    int variant_id = task_register->register_indexer_topk_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_INDEXER_TOPK_SM100, variant_id);
+  } else if (name == "compressor") {
+    int variant_id = task_register->register_compressor_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(3, 1, TASK_COMPRESSOR_SM100, variant_id);
+  } else if (name == "ckv_post") {
+    int variant_id =
+        task_register->register_ckv_post_sm100_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(3, 1, TASK_CKV_POST_SM100, variant_id);
+  } else if (name == "swiglu_moe_experts") {
+    int variant_id = task_register->register_swiglu_moe_experts_sm100_task(
+        customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(4, 1, TASK_SWIGLU_MOE_EXPERTS_SM100, variant_id);
   }
 
   else {
