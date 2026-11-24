@@ -109,8 +109,8 @@ struct Slots : ExpertSlots<HQ_,
 // weight scales at TM_W13_SF = 256), x_q's first scale chunk at TM_ZQ (T = 8:
 // 72, between the accumulators and the weight scales; T > 8: past the h_q
 // scales)
-constexpr int TM_HQ = T == 64 ? TM_W13_SF + 4 * 2 * SMAX : 272;
-constexpr int TM_ZQ = T == 8 ? 72 : TM_HQ + 4 * 2 * SMAX;
+constexpr int TM_HQ = TW == 64 ? TM_W13_SF + 4 * 2 * SMAX : 272;
+constexpr int TM_ZQ = TW == 8 ? 72 : TM_HQ + 4 * 2 * SMAX;
 
 template <class RES>
 struct Smem {
@@ -118,11 +118,11 @@ struct Smem {
                                                     // once at the phase switch
       OFF_HSF = RING_BYTES,                        // SMAX x 2 h_q scale chunks
       OFF_ACC = OFF_HSF + SMAX * 2 * SF_CHUNK;     // a W13 item's accumulator
-  static constexpr int BYTES = OFF_ACC + 128 * T * 4;
+  static constexpr int BYTES = OFF_ACC + 128 * TW * 4;
   static_assert(RES::KT_LAT * SF_CHUNK <= OFF_WSF,
                 "the x_q scale chunks in the ring area");
-  static_assert(T == 8 ? 72 + 4 * RES::KT_LAT <= 232 && 272 + 4 * 2 * SMAX <= 512
-                       : 2 * ACC_STAGES * T <= TM_W13_SF &&
+  static_assert(TW == 8 ? 72 + 4 * RES::KT_LAT <= 232 && 272 + 4 * 2 * SMAX <= 512
+                        : 2 * ACC_STAGES * TW <= TM_W13_SF &&
                              TM_W13_SF + 4 * 2 * SMAX <= TM_HQ &&
                              TM_ZQ + 4 * RES::KT_LAT <= 512,
                 "swiglu_moe_experts: the TMEM columns of the scales");
@@ -157,7 +157,7 @@ __device__ __forceinline__ void load_w2_job(Maps const &maps,
       uint32_t const full = rt.full0 + 8 * st, dst = base + st * FSTAGE,
                      sf_dst = base + OFF_WSF + st * 2 * SF_CHUNK,
                      hsf_dst = base + Smem<RES>::OFF_HSF + st * 2 * SF_CHUNK;
-      mbar_expect(full, na * (8192 + SF_CHUNK + T * 128 + SF_CHUNK));
+      mbar_expect(full, na * (8192 + SF_CHUNK + TW * 128 + SF_CHUNK));
       if (na == 2) {
         tma3(&maps.m[RES::W2X2], full, dst, 0, 0, p0 + 2 * s, EVICT_FIRST);
         tma3(&maps.m[RES::W2SFX2], full, sf_dst, 0, 0, p0 + 2 * s, EVICT_FIRST);
@@ -215,7 +215,8 @@ template <class RES>
 __device__ __forceinline__ void
     issue_w2_job(uint32_t base, uint32_t tb, int iss, int &g, int a) {
   constexpr int KT2 = RES::KT2, NST = RES::NST2;
-  uint32_t const acc = tb + T * a + ACC_STAGES * T * iss; // (T = 8: 8 a + 32 iss)
+  uint32_t const acc =
+      tb + TW * a + ACC_STAGES * TW * iss; // (TW = 8: 8 a + 32 iss)
   bool first = true;
   for (int s = 0; s < NST; s++, g++) {
     bool const mine = (s & 1) == iss;
@@ -238,7 +239,8 @@ __device__ __forceinline__ void
         cp_sf(sfb, base + Smem<RES>::OFF_HSF + (st * 2 + at) * SF_CHUNK);
       }
       uint64_t const dw = mkdesc(base + st * FSTAGE + at * 16384);
-      uint64_t const db = mkdesc(base + st * FSTAGE + W_STAGE + at * (T * 128));
+      uint64_t const db =
+          mkdesc(base + st * FSTAGE + W_STAGE + at * (TW * 128));
       if (one) {
         mma_mx(acc, dw, db, idesc_mx(0), first ? 0u : 1u, sfa, sfb);
         mma_mx(acc, dw + 2, db + 2, idesc_mx(1), 1u, sfa, sfb);
@@ -469,7 +471,7 @@ __device__ __forceinline__ void run_dynamic(G const &g,
                     par = (ACC_STAGES == 4 ? (wtt >> 2) : acc_round(wtt)) & 1,
                     w = e.a + item, slot = w / OT2, ot = w - slot * OT2,
                     nt = ntok_s[slot];
-          float v[T];
+          float v[TW];
           int const row = drain_acc(tb, a, par, v); // both issuers' halves
           for (int i = 0; i < nt; i++) {
             int const e_ = start_s[slot] + i; // the slot's i-th routing entry
@@ -488,10 +490,10 @@ __device__ __forceinline__ void run_dynamic(G const &g,
         int const slot = e.a, mt = e.b,
                   a = ACC_STAGES == 4 ? (wtt0 & 3) : acc_slot(wtt0),
                   par = (ACC_STAGES == 4 ? (wtt0 >> 2) : acc_round(wtt0)) & 1;
-        float v[T];
+        float v[TW];
         int const row = drain_acc(tb, a, par, v);
-        for (int t = 0; t < T; t++) {
-          acc_s[row * T + t] = v[t];
+        for (int t = 0; t < TW; t++) { // TW columns; past T the MMA's pad, zero
+          acc_s[row * TW + t] = t < T ? v[t] : 0.f;
         }
         asm volatile("bar.sync 1, 128;" ::: "memory");
         if (row < 64) { // a warp's 32 lanes: one 32-feature group of h
@@ -501,9 +503,9 @@ __device__ __forceinline__ void run_dynamic(G const &g,
             float h[8], am[8];
 #pragma unroll
             for (int t = 0; t < 8; t++) {
-              float const gt = fminf(bf16r(acc_s[row * T + t0 + t]), lim);
+              float const gt = fminf(bf16r(acc_s[row * TW + t0 + t]), lim);
               float const up = fminf(
-                  fmaxf(bf16r(acc_s[(64 + row) * T + t0 + t]), -lim), lim);
+                  fmaxf(bf16r(acc_s[(64 + row) * TW + t0 + t]), -lim), lim);
               h[t] = bf16r(gt / (1.0f + expf(-gt)) * up);
               am[t] = fabsf(h[t]);
             }
@@ -516,6 +518,9 @@ __device__ __forceinline__ void run_dynamic(G const &g,
 #pragma unroll
             for (int t = 0; t < 8; t++) {
               int const ex = xq_exponent(am[t]), tt = t0 + t;
+              if (tt >= T) { // T < 8: the group's pad rows (nothing to write)
+                continue;
+              }
               buf_at<uint8_t>(g, RES::HQ)[((size_t)slot * T + tt) * IRP + f] =
                   cvt_e4m3_nv(h[t] *
                               __uint_as_float((uint32_t)(127 - ex) << 23));
@@ -528,7 +533,7 @@ __device__ __forceinline__ void run_dynamic(G const &g,
               }
             }
           };
-          if constexpr (T == 8) {
+          if constexpr (TW == 8) {
             quant8(0);
           } else {
 #pragma unroll 1

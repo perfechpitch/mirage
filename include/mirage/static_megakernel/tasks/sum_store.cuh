@@ -47,9 +47,9 @@ __device__ __forceinline__ void sum_store_task(G const &g,
                                                uint32_t *done_cnt,
                                                int x,
                                                bool warm STAGE_STAMP_PARAM) {
-  static_assert(T % 8 == 0 && NC % 128 == 0 && N % NC == 0,
-                "sum_store: a warp per token (T / 8 in turn), whole 128-column "
-                "blocks");
+  static_assert(TW % 8 == 0 && NC % 128 == 0 && N % NC == 0,
+                "sum_store: a warp per token (T < 8: the first T), whole "
+                "128-column blocks");
   int const l = threadIdx.x & 31;
   constexpr size_t XR = (size_t)T * N * 2; // one GPU's slot (bf16)
 #pragma unroll 1
@@ -65,8 +65,8 @@ __device__ __forceinline__ void sum_store_task(G const &g,
       }
     }
 #endif
-    for (int ti = 0; ti < T / 8; ti++) { // (T = 8: once, t = the warp)
-    int const t = (threadIdx.x >> 5) + 8 * ti;
+    // a warp a token (T >= 8: T / 8 rounds of 8 warps; T < 8: the first T)
+    for (int t = threadIdx.x >> 5; t < T; t += 8) {
     for (int c = x * NC + 4 * l; c < (x + 1) * NC; c += 128) {
       float4 v[P];
       bool ok[P];
@@ -198,8 +198,7 @@ __device__ __forceinline__ void sum_store_task(G const &g,
   }
   if constexpr (GPUS > 1 && !SEND_ONLY) { // every GPU's sums of these columns,
                                           // in GPU order
-    for (int ti = 0; ti < T / 8; ti++) {
-    int const t = (threadIdx.x >> 5) + 8 * ti;
+    for (int t = threadIdx.x >> 5; t < T; t += 8) {
     for (int c = x * NC + 4 * l; c < (x + 1) * NC; c += 128) {
       // the pair's 16 B (both lanes load them; each takes its half)
       unsigned char const *row =

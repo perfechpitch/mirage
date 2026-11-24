@@ -418,11 +418,18 @@ def build(ws: list, variant: str, ratio: int, csrc: bool, heads: int, out: str, 
 
 
 def random_inputs(w: dict, variant: str, ratio: int, pos: int, seed: int = 1):
-    """x random, every token at position pos, the caches and state filled with valid random values (no NaN encodings)."""
-    gen = torch.Generator().manual_seed(seed)
+    """x random, every token at position pos, the caches and state filled with valid random values (no NaN encodings).
+
+    Every tensor draws from a generator of its own and is filled in row order, so row t gets the same values at every T
+    (the T = 1 check: --save-y). One shared generator would not do: it advances by a T-dependent count, and every later
+    tensor -- window_cache's scales, cmp_state -- would then start from another state at another T."""
     dev = w["x"].device
-    rnd = lambda *shape: torch.randint(0, 256, shape, generator=gen, dtype=torch.uint8).to(dev)
-    w["x"].copy_(torch.randn(T, HID, generator=gen).bfloat16())
+    calls = [0]
+    def gen():   # the n-th tensor's generator
+        calls[0] += 1
+        return torch.Generator().manual_seed(seed + 1 + calls[0])
+    rnd = lambda *shape: torch.randint(0, 256, shape, generator=gen(), dtype=torch.uint8).to(dev)
+    w["x"].copy_(torch.randn(T, HID, generator=torch.Generator().manual_seed(seed)).bfloat16())
     w["positions"].fill_(pos)
     window_tables(w)
     e4m3 = rnd(T, W, D) & 0xFE                       # e4m3 bytes, never 0x7F / 0xFF (NaN)
@@ -437,12 +444,12 @@ def random_inputs(w: dict, variant: str, ratio: int, pos: int, seed: int = 1):
     if "candidates" in w:
         w["candidates"].fill_(1)
     if "cmp_state" in w:
-        w["cmp_state"].copy_(torch.randn(*w["cmp_state"].shape, generator=gen))
+        w["cmp_state"].copy_(torch.randn(*w["cmp_state"].shape, generator=gen()))
     if variant == "reuse":   # the source layer's top-k: 512 distinct positions below n, in order
         idx = torch.full((T, NC), -1, dtype=torch.int32)
         for t in range(T):
             k = min(NC, n)
-            idx[t, :k] = torch.randperm(n, generator=gen)[:k].sort().values.int()
+            idx[t, :k] = torch.randperm(n, generator=gen())[:k].sort().values.int()
         w["compress_idx"].copy_(idx)
 
 
@@ -693,7 +700,7 @@ def main():
     h.launch(timeout_s=60)   # the same inputs each launch: every later launch writes the same cache rows again
     y0 = w["y"].cpu()
     if args.save_y:
-        y0.to(torch.bfloat16).contiguous().view(T, HID).numpy().tofile(args.save_y)
+        y0.to(torch.bfloat16).contiguous().view(T, HID).view(torch.int16).numpy().tofile(args.save_y)
         print(f"y [T={T}, {HID}] written to {args.save_y}", flush=True)
     if multi:   # the all-reduce's result: the same bits on every GPU
         diff = [g for g, wg in enumerate(ws) if not torch.equal(wg["y"].cpu().view(torch.int16), y0.view(torch.int16))]

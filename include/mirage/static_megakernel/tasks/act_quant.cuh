@@ -70,13 +70,14 @@ __device__ __forceinline__ uint32_t xq_scale_word(int ex) {
 // the 4-byte word t / 32 of line t % 32 (the chunk's layout: row r's scales at
 // byte 16 (r % 32) + 4 (r / 32)), the tasks of t < 32 also zero words 2, 3
 constexpr int XQ_LINES = T >= 32 ? 1 : 32 / T;
-static_assert((T == 8 || T == 16 || T == 32 || T == 64) &&
+static_assert((T == 1 || T == 2 || T == 4 || T == 8 || T == 16 ||
+                  T == 32 || T == 64) &&
                   SF_CHUNK == 32 * 16,
               "xq_scale_line: the T tasks (one per token) write the chunk's "
-              "32 lines of 16 B");
+              "lines of 16 B (T < 8: rows t .. TW - 1 zero, TW = 8)");
 __device__ __forceinline__ void xq_scale_line(
     unsigned char *out, int K, int kb, int t, int j, uint32_t s4) {
-  if constexpr (T <= 32) {
+  if constexpr (TW <= 32) {
     *reinterpret_cast<uint4 *>(out + xq_scales_at(K) + (size_t)kb * SF_CHUNK +
                                (t + T * j) * 16) =
         make_uint4(j == 0 ? s4 : 0u, 0u, 0u, 0u);

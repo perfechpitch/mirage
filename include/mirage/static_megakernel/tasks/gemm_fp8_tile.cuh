@@ -38,13 +38,13 @@ namespace static_mk {
 constexpr int OFF_XSF = RING_BYTES; // SMAX x 2 activation scale chunks
 constexpr int FP8_SMEM = OFF_XSF + SMAX * 2 * SF_CHUNK;
 constexpr uint32_t FP8_STAGE_TX =
-    2 * (16384 + SF_CHUNK + T * 128 + SF_CHUNK); // the bytes of one stage
+    2 * (16384 + SF_CHUNK + TW * 128 + SF_CHUNK); // the bytes of one stage
 constexpr uint32_t FP8_W_TX =
     2 * (16384 + SF_CHUNK); // a stage's weight bytes alone (x_q made in the
                             // task: fused act_quant, fp8_fused_act)
 constexpr int TM_WSF = TM_W13_SF, TM_XSF = TM_WSF + 4 * 2 * SMAX; // (T = 64: 256)
 static_assert(TM_XSF == TM_WSF + 4 * 2 * SMAX && TM_XSF + 4 * 2 * SMAX <= 512 &&
-                  2 * ACC_STAGES * T <= TM_WSF,
+                  2 * ACC_STAGES * TW <= TM_WSF,
               "gemm_fp8_tile: the TMEM columns of the scales, past the "
               "accumulators");
 
@@ -57,7 +57,7 @@ __device__ __forceinline__ uint32_t idesc_mx8(uint32_t sf) {
 struct Fp8Job {
   CUtensorMap const *wmap; // the weight: box {128 B, 128 rows, 2 K tiles}
   CUtensorMap const *wsf;  // its scale chunks [N / 128][K / 128], box 2
-  CUtensorMap const *amap; // x_q: box {128 B, T rows, 2 K tiles}
+  CUtensorMap const *amap; // x_q: box {128 B, TW rows, 2 K tiles}
   CUtensorMap const *asf;  // x_q's scale chunks [K / 128], box 2
   // weight row block, first K tile, stages, K / 128 (the weight's scale chunks
   // per row block), x_q's K tile of the weight's K tile 0 (the row block's
@@ -201,7 +201,8 @@ __device__ __forceinline__ int issue_fp8_job(Fp8Job const &j,
                                              int iss,
                                              int g,
                                              int a STAGE_STAMP_PARAM) {
-  uint32_t const acc = tb + T * a + ACC_STAGES * T * iss; // (T = 8: 8 a + 32 iss)
+  uint32_t const acc =
+      tb + TW * a + ACC_STAGES * TW * iss; // (TW = 8: 8 a + 32 iss)
   bool first = true;
   for (int s = 0; s < j.nst; s++, g++) {
     int const st = g % SMAX;
@@ -219,7 +220,8 @@ __device__ __forceinline__ int issue_fp8_job(Fp8Job const &j,
       cp_sf(sfa, base + OFF_WSF + c * SF_CHUNK);
       cp_sf(sfb, base + OFF_XSF + c * SF_CHUNK);
       uint64_t const dw = mkdesc(base + st * FSTAGE + at * 16384),
-                     dx = mkdesc(base + st * FSTAGE + W_STAGE + at * (T * 128));
+                     dx =
+                         mkdesc(base + st * FSTAGE + W_STAGE + at * (TW * 128));
       for (int k = 0; k < 4; k++) {
         mma_mx(acc,
                dw + 2 * k,
@@ -291,7 +293,7 @@ __device__ __noinline__ int
                                               : nullptr));
     }
   } else if (warp >= 2 && warp <= 5) {
-    float v[T];
+    float v[TW];
     int const row = drain_acc<128>(tb, a, par, v);
 #ifdef STATIC_TIMING_BUILD
     if (FP8_STAMP == 3 && threadIdx.x == 64 && stamp) {
@@ -347,12 +349,16 @@ __device__ __noinline__ int
 template <int P, int KA>
 __device__ __noinline__ void
     fp8_fused_act(float const *part, int c0, int nst, uint32_t base, int g0) {
-  static_assert(T % 8 == 0 && KA % 256 == 0,
-                "fused act_quant: 8 tokens a round, 256 threads, whole stages");
+  static_assert(TW % 8 == 0 && KA % 256 == 0,
+                "fused act_quant: 8-column units, 256 threads, whole stages");
   int const i = threadIdx.x, g8 = 32 * nst; // 8-column units of a token
 #pragma unroll 1
-  for (int r = 0; r < nst * (T / 8); r++) {
-    int const u = 256 * r + i, t = u / g8, cg = u - t * g8, kk = cg >> 4,
+  // One unit (a token's 8 columns) a thread: 32 nst units a token, T tokens.
+  // T >= 8 fills the CTA (nst T / 8 rounds); T < 8 the first 32 nst T threads
+  // work and the rest leave -- always whole warps, so the group's shuffle
+  // below (__shfl_xor_sync over 4 threads) is safe
+  for (int u = i; u < 32 * nst * T; u += 256) {
+    int const t = u / g8, cg = u - t * g8, kk = cg >> 4,
               jl = cg & 15, st = (g0 + (kk >> 1)) % SMAX;
     float const *const src = part + (size_t)t * KA + c0 + 8 * cg;
     float4 v[P][2];
@@ -407,16 +413,17 @@ __device__ __noinline__ void
     uint32_t const s4 = xq_scale_word<16>(ex); // 16 threads: a K tile
     // K tile kk of the job: stage kk / 2 (ring slot st), tile kk % 2; the
     // 16-B chunk (cg % 16) / 2 of row t, its 8-B half cg % 2
-    uint32_t const tile = base + st * FSTAGE + W_STAGE + (kk & 1) * (T * 128);
+    uint32_t const tile =
+        base + st * FSTAGE + W_STAGE + (kk & 1) * (TW * 128);
     asm volatile(
         "st.shared.v2.b32 [%0], {%1, %2};" ::"r"(
-            tile + t * 128 + ((((cg >> 1) & 7) ^ (T == 8 ? t : (t & 7))) << 4) +
+            tile + t * 128 + ((((cg >> 1) & 7) ^ (TW == 8 ? t : (t & 7))) << 4) +
             8 * (cg & 1)),
         "r"(q0),
         "r"(q1)
         : "memory");
     uint32_t const chunk = base + OFF_XSF + (2 * st + (kk & 1)) * SF_CHUNK;
-    if constexpr (T <= 32) {
+    if constexpr (TW <= 32) {
       if (jl < XQ_LINES) { // line t + T jl of the scale chunk (xq_scale_line)
         asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(
                          chunk + (t + T * jl) * 16),
@@ -426,7 +433,7 @@ __device__ __noinline__ void
                      "r"(0u)
                      : "memory");
       }
-    } else if (jl == 0) { // T = 64: word t / 32 of line t % 32 (xq_scale_line)
+    } else if (jl == 0) { // TW = 64: word t / 32 of line t % 32 (xq_scale_line)
       asm volatile("st.shared.b32 [%0], %1;" ::"r"(chunk + (t % 32) * 16 +
                                                     4 * (t / 32)),
                    "r"(s4)
@@ -450,10 +457,10 @@ __device__ __noinline__ void
 // this job's loader fills slots g0 .. g0 + nst - 1 only, and 2 nst <= SMAX
 __device__ __forceinline__ void
     fp8_fused_copy(uint32_t base, int gp, int g0, int nst) {
-  constexpr int TU = 16 * T, SU = TU + 64; // (T = 8: 128, 192)
+  constexpr int TU = 16 * TW, SU = TU + 64; // (TW = 8: 128, 192)
   for (int k = threadIdx.x; k < nst * SU; k += 256) {
     int const s = k / SU, r = k - s * SU, a = (gp + s) % SMAX,
-              b = (g0 + s) % SMAX; // per stage: 2 tiles (16 T x 16 B), then
+              b = (g0 + s) % SMAX; // per stage: 2 tiles (16 TW x 16 B), then
                                    // 2 scale chunks (64 x 16 B)
     uint32_t const src = r < TU ? base + a * FSTAGE + W_STAGE + 16 * r
                                 : base + OFF_XSF + 2 * a * SF_CHUNK +
@@ -672,9 +679,9 @@ __device__ __forceinline__ void run_gemm_fp8_tile(Maps const &maps,
                     st = ((int)g0 + (kk >> 1)) % SMAX, at = kk & 1,
                     kb = j.kt0 + kk; // 8 T 16-B chunks of the tile, 32 lines
           uint32_t const src =
-              r < TC ? L.base + st * FSTAGE + W_STAGE + at * (T * 128) +
+              r < TC ? L.base + st * FSTAGE + W_STAGE + at * (TW * 128) +
                            (r >> 3) * 128 +
-                           (((r & 7) ^ (T == 8 ? (r >> 3) : ((r >> 3) & 7)))
+                           (((r & 7) ^ (TW == 8 ? (r >> 3) : ((r >> 3) & 7)))
                             << 4)
                      : L.base + OFF_XSF + (2 * st + at) * SF_CHUNK +
                            16 * (r - TC);
