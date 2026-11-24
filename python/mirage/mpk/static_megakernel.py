@@ -833,7 +833,8 @@ class StaticMegakernel(PersistentKernel):
                      positions=(positions, int32),
                      freqs=(freqs, float32), attn_sink=(attn_sink, float32), output=(output, uint8))
         D, W, RD = N // H, window_cache.dim(1), 2 * freqs.dim(1)
-        assert q.num_dims == 2 and N == H * D and H % 16 == 0 and attn_sink.num_dims == 1
+        HL = min(H, 16)   # heads per task: the MMA tile's 16 rows, of which H may be 8 (TP8; sparse_attn.cuh SA_HL)
+        assert q.num_dims == 2 and N == H * D and H % HL == 0 and attn_sink.num_dims == 1
         assert D == 512 and W == 128 and RD == 64   # tasks/sparse_attn.cuh: 8 warps of 64 columns, of 16 window positions
         assert window_cache.num_dims == 3 and (window_cache.dim(0), window_cache.dim(2)) == (T, D + D // 32)
         assert window_rows.num_dims == 2 and (window_rows.dim(0), window_rows.dim(1)) == (T, W)
@@ -854,7 +855,7 @@ class StaticMegakernel(PersistentKernel):
                                        self._tensor_slot(compress_pages)]
             ctensors = [compress_cache, compress_idx]   # inputs: a node that writes them this launch is waited for
             nodes = graph_nodes(self)
-            if producer_of(compress_cache, nodes) is None and producer_of(compress_idx, nodes) is None and H // 16 >= NC // 128:
+            if producer_of(compress_cache, nodes) is None and producer_of(compress_idx, nodes) is None and H // HL >= NC // 128:
                 # a Reuse layer (both ready at the launch) with a task per pair or more (sparse_attn.cuh sa_bf16k, the same
                 # test; H 64): the compressed K dequantized once per token while q is on its way, by the token's tasks (pair
                 # c by task (t, c)), into a bf16 buffer [T][NC][520] the pairs copy from; a counter per (token, pair) says it
@@ -862,17 +863,19 @@ class StaticMegakernel(PersistentKernel):
                 # (2 or 4 pairs in a task's prologue would outlast its wait)
                 slots.append(self._scratch("sparse_attn_kbf16", T * NC * 520 * 2))
                 counters, concurrent = 1 + T * (NC // 128), 1
-            elif H // 16 < NC // 128:
+            elif H // HL < NC // 128:
                 # a task per pair (the window's, then NC / 128 compressed): its block maxima to the others first (into
                 # sparse_attn_ml, 0xFF before each launch: polled), then its O (but its own share) and block sums into the
                 # partials (fp32: O [T][H / 16][splits][16][D], 0xFF: polled by the share's one reader, which re-arms it;
                 # maxima and sums [..][16][4]), and each combines its share of the columns. They run at the same time
                 # (concurrent_along_axis 2)
                 splits = 1 + NC // 128
-                slots.append(self._scratch("sparse_attn_part", T * H * splits * D * 4, reset=0xFF, by_reader=True))
-                slots.append(self._scratch("sparse_attn_ml", T * H * splits * 4 * 4, reset=0xFF))
+                # (the tile's 16 rows a group, not HL: sparse_attn.cuh indexes [T][G][NS][16][..])
+                tiles = (H // HL) * 16
+                slots.append(self._scratch("sparse_attn_part", T * tiles * splits * D * 4, reset=0xFF, by_reader=True))
+                slots.append(self._scratch("sparse_attn_ml", T * tiles * splits * 4 * 4, reset=0xFF))
                 counters, concurrent = 1, 2
-        self._add_node("sparse_attn", (T, H // 16, splits), block_dim, [q, window_cache, positions, freqs, attn_sink] + ctensors + [output],
+        self._add_node("sparse_attn", (T, H // HL, splits), block_dim, [q, window_cache, positions, freqs, attn_sink] + ctensors + [output],
                        [(0, 1, -1), (0, -1, -1), (0, -1, -1), (-1, -1, -1), (-1, -1, -1)]
                        + [(0, -1, -1)] * len(ctensors) + [(0, 1, -1)],
                        [H, D, W, RD, float_bits(D ** -0.5)] + extra,

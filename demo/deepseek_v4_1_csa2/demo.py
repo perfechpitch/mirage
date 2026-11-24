@@ -228,7 +228,7 @@ def score_chunks(heads: int, cap: int, sms: int) -> int:
     """indexer_score's tasks a token: chunks of 256 x the fewest halves that fit its tasks in one round on the SMs without a
     sparse_attn task (H < 64: a task per pair) or an indexer_topk task. TP4 at 4096 positions: 2 halves, 9 chunks, 72 tasks on
     100 SMs, instead of 136 in 2 rounds; full_r2 there: 9 chunks of 256."""
-    ch, free = cap // 256, sms - T * heads // 16 * (1 + NC // 128 if heads < 64 else 1) - T
+    ch, free = cap // 256, sms - T * max(1, heads // 16) * (1 + NC // 128 if heads < 64 else 1) - T
     n = -(-ch // -(-T * ch // free)) if free > 0 else ch
     # T > 8 (11-21): fewer free SMs a token, so larger chunks: at most 2048 positions a task (8 halves; its index K in shared
     # memory: 68 B a position, 2048 -> 148 KB of the 227)
@@ -241,11 +241,16 @@ def hand_grids(heads: int, cap: int, cmp_rows: int = 0) -> dict:
     wkvp = int(os.environ.get("WKV_PARTS", 2))   # wkv's K parts (C7a WKV_PARTS=4, measurement 11-18)
     if not cmp_rows and os.environ.get("WKV_PARTS_NOCMP"):   # (C7c, 11-18) on the layers without a compressor only
         wkvp = int(os.environ["WKV_PARTS_NOCMP"])
+    # wo_a's K is heads D, wo_b's G OL (TP4: 8192 / 2048, TP8: 4096 / 1024): 512 columns a K part keeps 4 parts at TP4 and 2 at
+    # TP8, which is also the fused path's limit (RING_STAGES / 2 stages a task at T = 8)
+    wap = min(4, max(2, heads * D // 2048))
+    wbp = min(4, max(2, G * OL // 512))
     return {"x_q": (T, 2, 1), "wq_a_part": (QL // 128, 4, 1), "qr_q": (T, 1, 1), "wq_b_part": (heads * D // 128, 1, 1),
             "wkv_part": (D // 128, wkvp, 1),
-            "window_cache": (T, 1, 1), "o_q": (T, heads // 16, 1),
-            "wo_a_part": (G * OL // 128, max(2, 64 // (G * OL // 128)), 1), "oa_q": (T, G * OL // 2048, 1),
-            "wo_b_part": (HID // 128, 4, 1), "y": (HID // 128, 1, 1), "y_sent": (HID // 128, 1, 1), "cmp_part": (max(cmp_rows, 128) // 128, 4, 1), "latent": (T, 1, 1),
+            "window_cache": (T, 1, 1), "o_q": (T, max(1, heads // 16), 1),
+            "wo_a_part": (G * OL // 128, wap, 1),
+            "oa_q": (T, max(1, G * OL // 2048), 1),
+            "wo_b_part": (HID // 128, wbp, 1), "y": (HID // 128, 1, 1), "y_sent": (HID // 128, 1, 1), "cmp_part": (max(cmp_rows, 128) // 128, 4, 1), "latent": (T, 1, 1),
             "compress_cache": (T, 1, 1), "wk_part": (1, 1, 1), "index_k": (T, 1, 1), "iq_part": (4096 // 128, 1, 1),
             "q_idx": (T, 1, 1), "wp_part": (1, 4, 1), "compress_idx": (T, 1, 1)}
 
@@ -661,11 +666,12 @@ def main():
     if args.golden and any("STATIC_RESET_IN_KERNEL" in f for f in args.nvcc_flag):
         raise ValueError("--golden reads node buffers that a serving build's readers re-arm to 0xFF (sum_store re-arms wo_b's "
                          "K parts): use a host-reset build (no -DSTATIC_RESET_IN_KERNEL)")
-    if args.tp not in (1, 2, 4) or not 0 <= args.rank < args.tp:
-        raise ValueError(f"--tp {args.tp} --rank {args.rank}: tp 1, 2 or 4 (sparse_attn takes 16 heads a task)")
-    if not (args.gpus == 1 or (args.gpus == 4 and args.tp == 4)) or args.gpus > torch.cuda.device_count():
-        raise ValueError(f"--gpus {args.gpus} --tp {args.tp}: --gpus 1, or --gpus 4 with --tp 4 (the GPUs visible: "
-                         f"{torch.cuda.device_count()})")
+    if args.tp not in (1, 2, 4, 8) or not 0 <= args.rank < args.tp:
+        raise ValueError(f"--tp {args.tp} --rank {args.rank}: tp 1, 2, 4 or 8 (sparse_attn takes 16 heads a task, or 8 at "
+                         f"TP8: its tile's rows past the 8 are zeroed)")
+    if not (args.gpus == 1 or (args.gpus == args.tp and args.tp in (4, 8))) or args.gpus > torch.cuda.device_count():
+        raise ValueError(f"--gpus {args.gpus} --tp {args.tp}: --gpus 1, or --gpus equal to a --tp of 4 or 8 (the GPUs "
+                         f"visible: {torch.cuda.device_count()})")
     multi = args.gpus > 1
     snapshot = download_layer(args.checkpoint, args.layer, revision=args.revision)
     cfg = model_config(snapshot)

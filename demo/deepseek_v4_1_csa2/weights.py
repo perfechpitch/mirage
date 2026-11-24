@@ -98,8 +98,9 @@ def freqs_of(cfg: dict, layer: int, rows: int, device="cuda") -> torch.Tensor:
 
 def layer_tensors(read, cfg: dict, layer: int, tp: int = 1, rank: int = 0, rows: int = 32768, device="cuda") -> dict:
     """Return layer `layer`'s attention tensors for GPU `rank` of attention TP `tp`, with the RoPE table for positions
-    0 .. rows - 1. tp is 1, 2 or 4: sparse_attn needs at least 16 heads per GPU."""
-    assert tp in (1, 2, 4) and 0 <= rank < tp
+    0 .. rows - 1. tp is 1, 2, 4 or 8: 8 heads a GPU at TP8 (sparse_attn's MMA tile keeps 16 rows, the ones past the 8
+    zeroed: tasks/sparse_attn.cuh SA_HL)."""
+    assert tp in (1, 2, 4, 8) and 0 <= rank < tp
     p, var = f"layers.{layer}.attn.", variant_of(cfg, layer)
     H, G = HEADS // tp, GROUPS // tp
     q0, a0 = H * D * rank, G * OL * rank

@@ -195,7 +195,11 @@ def hand_plan(mpk: StaticMegakernel, sms: int) -> dict:
     nodes = compiler.graph_nodes(mpk)
     names = {n.graph_idx: compiler.tname(mpk, n.outputs[0]) for n in nodes}
     blocks = next(n.inputs[1].dim(0) for n in nodes if compiler.tname(mpk, n.outputs[0]) == "sgu_part") // 128
-    grid = {"logit_part": (E // 128, ROUTER_PARTS, 1), "pairs": (T, 1, 1), "x_q": (T, 1, 1), "sgu_part": (blocks, 36 // blocks, 1),
+    # sgu_part's y: whole K stages of 256, so a divisor of the K tiles; 36 columns a stage's share, at most (TP8's 5 row
+    # blocks: 36 // 5 = 7 is not one, 5 is)
+    kdiv = HID // 256
+    kg = max(d for d in range(1, kdiv + 1) if kdiv % d == 0 and d <= max(1, 36 // blocks))
+    grid = {"logit_part": (E // 128, ROUTER_PARTS, 1), "pairs": (T, 1, 1), "x_q": (T, 1, 1), "sgu_part": (blocks, kg, 1),
             "hs_q": (T, 1, 1), "sd_part": (HID // 128, 1, 1), "routed_rows": (sms, 1, 1), "y": (HID // 128, 1, 1),
             "y_sent": (HID // 128, 1, 1)}
     grid.update({names[n.graph_idx]: n.grid for n in nodes if n.name in ("hc_coef", "hc_post_combine")})

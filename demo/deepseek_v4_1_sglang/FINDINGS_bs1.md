@@ -17,7 +17,8 @@
 | **mHC 精度** | ✅ pre/post/comb ~1e-7，R'/x ~2e-5，4 卡逐位一致 |
 | **Engram 精度** | ✅ `ENGRAM=2` R'' relRMS **7.2e-7**；`ENGRAM=1` 7.5e-5 |
 | **LM head + argmax** | ✅ logits relRMS 1.2e-4，**argmax 100% 一致** |
-| 端到端 40 层 build | ✅ **314 个 layer module 全部 built + mapped**（209 GB/rank） |
+| **TP=8 支持** | ✅ **新增**：attention `SA_HL<H>` + MoE I 补到 320，4 个组件全部逐位校验通过，8 卡一致 |
+| 端到端 40 层 build | ✅ **314 个 layer module 全部 built + mapped**（209 GB/rank，TP4） |
 | 端到端 prefill | ✅ 通过（logits 产出） |
 | 端到端 decode | ⚠️ **第 1 步通过，第 2 步挂死**（见 §8.6） |
 | 端到端 token 精度 | ❌ 未验证（未跑到出 token） |
@@ -137,11 +138,114 @@ CMake 加 `100;103`；shared mem 227 KB；`MIRAGE_BK` / `MIRAGE_MMA_M` / `MIRAGE
 **TP=4 每卡权重需求 ≈ 118.8 GiB**（475.2 GiB 总量 ÷ 4，含 Engram 表；部分张量是复制的，实际略有出入）。GPU 3 只剩 63.7 GB，装不下 →
 **校验用 GPU 0,1,2,4**（不触碰他人进程）。
 
+权重总量按 checkpoint 实际 dtype 统计（`I8`=1、`F8_E8M0`=1、`BF16`=2）：
+
+| 组成 | 大小 |
+|---|---|
+| routed experts（384 × 40 层，MXFP4 + e8m0） | 268.95 GiB |
+| Engram 表（L1/L14） | 189.13 GiB |
+| 40 层 attention（wq_a/b、wo_a/b、wkv、compressor、indexer） | 4.78 GiB |
+| shared expert | 1.32 GiB |
+| embed + head + mTP/aligner | 10.76 GiB |
+| **合计** | **475.2 GiB** |
+
+于是 **TP=4 = 118.8 GiB/卡，TP=8 = 59.4 GiB/卡**。TP=8 时连当初 GPU 3 那 63.7 GiB 都勉强够。
+
 精度校验不受算力争用影响（只有计时失真），所以校验期间**不看性能数字**。
 
-### 5.2 为什么必须 TP=4（而不是官方默认的 TP=8）
+### 5.2 TP=4 与 TP=8 都支持了（TP=8 是新加的）
 
-`sparse_attn.cuh` 硬编码每任务 16 个 head：
+原来 `sparse_attn.cuh` 把每任务 16 个 head 写死（`SA_HPT = 16`，即 MMA 的 M），并有 `H % SA_HPT == 0`，
+所以 TP=8（H=8）编译不过。现在引入 `SA_HL<H> = min(H, 16)`：
+
+```cpp
+template <int H>
+constexpr int SA_HL = H < SA_HPT ? H : SA_HPT;   // 每任务真正有用的 head 数
+```
+
+**做法**：MMA tile 仍保持 16 行，但
+- tile 里 `[SA_HL, 16)` 这些行的 **q 加载为 0**（不读，避免读到下一个 token 的 q）
+- 这些行的 **输出丢弃**（不写 `o_q`、不写 scale chunk）
+- `sink[]` 对这些行退化成读 head `SA_HL-1`（保证不越界）
+- grid 从 `(T, H/16, ...)` 变为 `(T, H/HL, ...)`；split 的 partials 仍按 `[T][G][NS][16][D]` 分配（一个 tile 一组）
+
+代价几乎为零：bs=1 时 16 行 MMA 只跑到 ~0.3 TFLOP/s，浪费一半算力完全感觉不到；
+换来的是**所有 16 行的 tile / stride / buffer 布局一行都不用改**。
+
+MoE 侧：`2304 / 8 = 288` 不是 64 的倍数（`swiglu_moe_experts` 要求 `I % 64 == 0`，
+`gemm_fp8_tile` 的共享专家要求 `2 I % 128 == 0`）。所以 `local_inter(tp)` 把 I 补到 320：
+
+| TP | I | IP（补齐后） | W13 items |
+|---|---|---|---|
+| 1 | 2304 | 2304 | 36 |
+| 2 | 1152 | 1152 | 18 |
+| 4 | 576 | 576 | 9 |
+| **8** | **288** | **320** | **5** |
+
+补齐的行**权重为 0、scale 为 2^0**（e8m0 的 127），于是补出来的 gate/up 输出精确为 0，
+`silu(0) * 0 = 0`，fp32 累加器加它是个 no-op —— **逐位不变**。
+这和 SGLang 官方 `mxfp4_flashinfer_trtllm_moe.py::_pad_intermediate_size` 用 `(I+127)//128*128`
+是同一套做法，只是 mirage 的 item 粒度是 64 行，所以补到 320 比补到 384 省 13 个百分点的浪费。
+
+### 5.3 TP=8 的实测精度（`mhc_check.py --gpus 8`）
+
+| 层 | 指标 | TP8 |
+|---|---|---|
+| L3 attn | R' / x relRMS | **2.31e-05 / 1.94e-06** |
+| L3 MoE | R' relRMS | **3.45e-05** |
+| L0 Engram(=2) | R' / R'' relRMS | **2.44e-05 / 4.33e-06**，3 次 relaunch 稳定 |
+| L39 head | logits relRMS / **argmax 一致率** | **1.14e-04 / 1.000** |
+
+**8 张卡逐位一致**（每项都验了 `R' the same bits on the other GPUs: [True ×7]`）。
+L39 的 argmax 100% 一致 —— 这直接决定 TP=8 下贪心解码能否产出与官方相同的 token。
+
+TP=4 回归验证（同一份共享代码）：
+
+| 层 | 改动前（findings） | 改动后 |
+|---|---|---|
+| L3 attn R' | 1.72e-05 | **1.72e-05** |
+| L3 MoE R' | 2.62e-05 | **2.62e-05** |
+
+数字逐位相同 ⇒ **无回归**。
+
+### 5.3b 为什么 bs=1 要用 TP 而不是 DP+EP（量化依据）
+
+先分清两个场景：**bs=1 延迟**用 TP，**大 batch 吞吐**用 DP+EP。下面只算 bs=1。
+
+bs=1 解码一个 token、每层每卡必须从 HBM 读的字节（只读 top-6 命中的专家）：
+
+| 组件 | TP4 | **TP8** | DP+EP8（最慢那张卡） |
+|---|---|---|---|
+| attention | 30.6 MiB | **15.3** | 15.3 |
+| shared expert | 8.5 | **4.2** | 4.2 |
+| routed（6 专家） | 27.9 | **15.9** | **35.9**（摊到 2 个专家 × 全宽） |
+| router gate（每卡复制） | 3.8 | 3.8 | 3.8 |
+| **每层合计** | 67 | **37** | 57 |
+| **40 层 ÷ 7 TB/s** | 412 µs | **226 µs** | 346 µs |
+
+四条理由：
+
+1. **TP 完美均分，EP 不均。** TP 下 6 个专家**每个**都被切 8 份，人人平等；
+   EP 下 6 个专家散到 8 个 rank，必有 rank 摊到 2 个、有 rank 摊到 0 个 —— 延迟由**最慢的那张**决定，
+   期望 max ≈ 2，直接比 TP8 慢 2.4×。
+2. **通信形态。** TP 只要 1 次 all-reduce（10 KB 的 hidden，可走 NVLS multicast）；
+   EP 要 dispatch + combine 两次 all-to-all，且 bs=1 时没有任何 batch 可以摊薄。
+3. **DP 在并发 = 1 时无意义**（收益是把多个请求分给多卡）。
+4. **KV 在 TP 组内是复制的**（MLA，`num_key_value_heads = 1`），
+   所以 bs=1 下 DP attention 也拿不到"每卡 KV 变小"的好处。
+
+反过来，大 batch 时 DP+EP 明显更优：EP 是"少量专家 × 全宽"，每个专家上的 token 多了 GEMM 才有密度；
+而 TP 切 intermediate 会**引入 padding 浪费**（TP4: 576→640 浪费 11%，TP8: 288→320 浪费 11%）。
+这正是 SGLang 在我们日志里给的那条警告的含义：
+
+> flashinfer_mxfp4 MoE padded the local intermediate size from 576 to 640 ...
+> **benchmark it against a TP/EP configuration that avoids padding**
+
+这个 trade-off 在 bs=1 时翻转成 TP 占优。
+
+### 5.4 TP=4 的 head 数约束（历史记录）
+
+原 `sparse_attn.cuh` 硬编码每任务 16 个 head：
 
 ```cpp
 constexpr int SA_HPT = 16;      // heads per task: the MMA's M
@@ -149,16 +253,16 @@ constexpr int SA_HPT = 16;      // heads per task: the MMA's M
 
 并有断言 `H % SA_HPT == 0`。模型共 64 head：
 
-| TP | 每卡 head 数 H | 结果 |
+| TP | 每卡 head 数 H | 当时的结果 |
 |---|---|---|
 | 1 | 64 | ✅ |
 | 2 | 32 | ✅ |
-| **4** | **16** | ✅ **选它** |
-| 8 | 8 | ❌ `H % 16 != 0`，编译失败 |
+| **4** | **16** | ✅ **当时选它** |
+| 8 | 8 | ❌ 当时 `H % 16 != 0`，编译失败（现已支持，见 5.2） |
 
-MoE demo 同样要求 `tp ∈ (1, 2, 4)`（整 128 行 block）。官方 checkpoint 默认 TP=8，**mirage 侧走 TP=4**。
+官方 checkpoint 默认 TP=8，mirage 侧起初走 TP=4。
 
-### 5.3 Attention：5 个变体 × T=1/2/4 —— 全部逐位等于 T=8
+### 5.5 Attention：5 个变体 × T=1/2/4 —— 全部逐位等于 T=8
 
 覆盖 `swa`(L0)、`full_r2`(L2)、`full_r1`(L20)、`reuse`(L3)、`reindex`(L24)。
 
@@ -190,11 +294,11 @@ y after 5 launches: bit-identical to the first launch's on the 4 GPUs
 position 4096: median span 35.7 us over 5 launches
 ```
 
-### 5.4 MoE：T=1/2/4 —— 逐位等于 T=8 第 0 行
+### 5.6 MoE：T=1/2/4 —— 逐位等于 T=8 第 0 行
 
 L3：fp64 分块校验 relRMS **6.4e-8**；T=1/2/4 各行与 T=8 对应行逐位相同。
 
-### 5.5 mHC：attn L3 / MoE L3
+### 5.7 mHC：attn L3 / MoE L3
 
 ```
 mhc_check.py --kind attn --layer 3
@@ -208,7 +312,7 @@ mhc_check.py --kind moe --layer 3
   R' the same bits on the other GPUs: [True, True, True]
 ```
 
-### 5.6 Engram：两种模式都过
+### 5.8 Engram：两种模式都过
 
 ```
 mhc_check.py --kind moe --layer 0 --engram --no-norm     # DSV41_ENGRAM=1
@@ -225,7 +329,7 @@ mhc_check.py --kind moe --layer 0 --engram2 --no-norm    # DSV41_ENGRAM=2
 **`ENGRAM=2` 比 `=1` 准两个数量级**（7.2e-7 vs 7.5e-5）：kv 在 attention kernel 里以 fp32 累加算出，
 而复用 SGLang 的 gather 路径要经过 bf16 往返。这也是 `README_bs8.md` 推荐的配置。
 
-### 5.7 LM head + argmax：L39
+### 5.9 LM head + argmax：L39
 
 ```
 mhc_check.py --kind moe --layer 39 --head
@@ -450,11 +554,14 @@ head argmax: 0 batches from the kernel's ids, 1 by the sampler
    跑 8 token，与 `/tmp/ref_t8.json` 对照
    （官方 SGLang baseline，8 条同 prompt 贪心解码：`[5, 17209, 15, 23021, 55607, 83224, 271, 37460]`）。
    逐位相同之后才谈性能。
-2. **定位 decode 第 2 步挂死**：在最小配置下复现，用 `compute-sanitizer --tool synccheck`
+2. **TP=8 端到端**：层代码已验，还差把 `DSV41_STATIC_*` 那套装配层在 TP=8 下拼起来
+   （`dsv41_static_layer.py` 的 head / Engram 分片本来就按行切，理论无需改）。
+3. **定位 decode 第 2 步挂死**：在最小配置下复现，用 `compute-sanitizer --tool synccheck`
    或给 kernel 的 poll 循环加计数器 dump，找出等的是哪个 tick / 哪个 `SEND::counter`。
-3. **`DSV41_HEAD_ARGMAX` 未命中**：查 `_head_by_logits` / `_ok_rows` / `data_ptr` 的对齐条件。
-4. **性能特化**：按 T=1 → T=2 → T=4 → T=8 逐档，需要独占 GPU 才能计时。
-   `README_bs8.md` 标定全静态每卡需 ~213 GiB，GPU 1/4/5/6 满足。
-5. **`sparse_attn` 的 T=1 SM 利用率**：grid 是 `(T, H/16, ...)`，T=1 + TP4 时每个 KV 分片只有
-   1×1 = 1 个 SM。这是 bs=1 最大的剩余收益点（#838 的 `dsa_mla_merge` / T=1 absorb 融合是同类做法）。
-6. **可选**：写 `make_golden.py`（sglang venv + tilelang）产出官方 cases，补 attention 的绝对精度。
+4. **`DSV41_HEAD_ARGMAX` 未命中**：查 `_head_by_logits` / `_ok_rows` / `data_ptr` 的对齐条件。
+5. **性能特化**：按 T=1 → T=2 → T=4 → T=8 逐档，需要独占 GPU 才能计时。
+   TP=8 每卡只需 ~59.4 GiB，8 张卡全都够。
+6. **`sparse_attn` 的 T=1 SM 利用率**：grid 是 `(T, H/HL, ...)`，T=1 + TP4 时每个 KV 分片只有
+   1×1 = 1 个 SM；TP8 时 H/HL = 1，同样是 1 个 —— 这是 bs=1 最大的剩余收益点
+   （#838 的 `dsa_mla_merge` / T=1 absorb 融合是同类做法）。
+7. **可选**：写 `make_golden.py`（sglang venv + tilelang）产出官方 cases，补 attention 的绝对精度。

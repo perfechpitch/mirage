@@ -49,6 +49,13 @@ namespace static_mk {
 // shared memory (dynamic, from the base: in the ring area, where no GEMM load
 // is in flight between tasks)
 constexpr int SA_HPT = 16;      // heads per task: the MMA's M
+// the heads a task really has: H when TP8 leaves 8 (H < 16), else the tile's 16. The MMA's M stays 16 rows: the rows
+// [SA_HL, 16) are loaded as 0 (q) and their outputs are dropped, which costs nothing at bs = 1 (0.3 TFLOP/s of a 16-row
+// MMA is far below what the window's 128 keys need) and keeps every tile, stride and buffer this header's 16-row layouts.
+template <int H>
+constexpr int SA_HL = H < SA_HPT ? H : SA_HPT;
+static_assert(SA_HL<8> == 8 && SA_HL<16> == 16 && SA_HL<64> == 16 && SA_HL<8> % 8 == 0,
+              "sparse_attn: 8 heads (TP8) or a multiple of 16 (TP1/2/4)");
 constexpr int SA_QLD = 512 + 8; // bf16 row stride of q and K (1040 B: an
                                 // ldmatrix's 8 rows on distinct banks)
 constexpr int SA_PLD = 128 + 8; // P's bf16 row stride
@@ -144,7 +151,8 @@ __device__ __forceinline__ void sa_q_parts(float const *part,
                                            int p,
                                            bool real) {
   constexpr size_t N = (size_t)H * D;
-  float const *src = part + (size_t)t * N + (size_t)g * SA_HPT * D;
+  constexpr int HL = SA_HL<H>; // this task's heads (the tile has SA_HPT rows)
+  float const *src = part + (size_t)t * N + (size_t)g * HL * D;
   float4 v[QP][8];
   bool ok[QP];
 #pragma unroll
@@ -159,8 +167,12 @@ __device__ __forceinline__ void sa_q_parts(float const *part,
       if (!ok[pp]) {
 #pragma unroll
         for (int k = 0; k < 8; k++) {
-          v[pp][k] =
-              ldf4_poll(src + (size_t)pp * T * N + 4 * (threadIdx.x + 256 * k));
+          int const i = threadIdx.x + 256 * k; // (head i >> 7, columns 4 (i & 127))
+          if ((i >> 7) < HL) {
+            v[pp][k] = ldf4_poll(src + (size_t)pp * T * N + 4 * i);
+          } else { // a tile row past this task's heads: not read (it is the next token's q), 0 here
+            v[pp][k] = make_float4(0.f, 0.f, 0.f, 0.f);
+          }
         }
       }
     }
@@ -369,7 +381,7 @@ __device__ __forceinline__ void
 // 2 or 4 pairs in a task's prologue would outlast its wait for q.)
 template <int NC, bool CNODE, bool CCNODE, int H>
 __host__ __device__ constexpr bool sa_bf16k() {
-  return NC > 0 && !CNODE && !CCNODE && H / SA_HPT >= NC / 128;
+  return NC > 0 && !CNODE && !CCNODE && H / SA_HL<H> >= NC / 128;
 }
 
 // sa_bf16k: half hf of compressed pair c of token t's list (kbf rows 128 c +
@@ -445,10 +457,11 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
       NC % 128 == 0 && NC <= 512 && (NC == 0 || (CAP > 0 && CAP % SA_CPAGE == 0)),
       "sparse_attn: compressed top-k in whole pairs of 64-key blocks, "
       "at most 512 (the ids' smem)");
-  static_assert(D == 512 && W == 128 && RD == 64 && H % SA_HPT == 0,
+  static_assert(D == 512 && W == 128 && RD == 64 && H % SA_HL<H> == 0,
                 "sparse_attn: heads of 512 columns (8 warps of 64 in P V, the "
                 "RoPE columns warp 7's), a window of 128 (8 warps of 16 in S, "
-                "2 blocks of 64)");
+                "2 blocks of 64); H = 8 (TP8) is one task of 8 heads in the "
+                "MMA tile's first rows");
   constexpr int ROW = D + D / 32; // a cache row's bytes
   constexpr int N = H * D;        // o's width
   // a Reuse layer with a task per pair (sa_bf16k above): its compressed K
@@ -459,7 +472,7 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
   // split: task (t, g, s) pair s of the list; the combine's share, s's 128-
   // column blocks [b0, b1) of the group's 64
   constexpr bool SPLIT = NS > 1;
-  constexpr int G = H / SA_HPT, NB = SA_HPT * D / 128;
+  constexpr int HL = SA_HL<H>, G = H / HL, NB = SA_HPT * D / 128, NBL = HL * D / 128;
   static_assert(!SPLIT || (NC > 0 && NS == 1 + NP && !BF16K),
                 "sparse_attn: split, a task per pair of a compressed layer");
   static_assert(NS * SA_HPT * 2 * 4 <= 2 * 512 * 2,
@@ -504,7 +517,9 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
   if (tid < RD / 2) {
     fq = reinterpret_cast<float2 const *>(freqs)[(size_t)p * (RD / 2) + tid];
   }
-  float const snk = sink[g * SA_HPT + (tid >> 4)];
+  // the head's sink (softmax thread tid / 16); a tile row past this task's heads reads head HL - 1's (its output is
+  // dropped, and an in-range read keeps the load in the tensor)
+  float const snk = sink[g * SA_HL<H> + (tid >> 4 < SA_HL<H> ? tid >> 4 : SA_HL<H> - 1)];
   __syncthreads(); // the ring area: the previous task on this SM is done with
                    // it
   if (tid < RD / 2) {
@@ -611,7 +626,7 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
   // the flags
   if constexpr (BF16K) {
 #pragma unroll 1
-    for (int c = g; c < NP; c += H / SA_HPT) {
+    for (int c = g; c < NP; c += H / SA_HL<H>) {
       if (c != g) { // (pair g's: staged before the window's rounds)
         sa_stage_rows(ccache, ids, c, true, sm);
       }
@@ -1053,9 +1068,9 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
       amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
       int const ex = xq_exponent(amax);
       uint2 const qb = make_uint2(xq_pack4(x, ex), xq_pack4(x + 4, ex));
-      if (real && st) {
+      if (real && st && r < HL) { // (a tile row past this task's heads: its bytes are not this token's)
         *reinterpret_cast<uint2 *>(out + (size_t)t * N +
-                                   (size_t)(g * SA_HPT + r) * D + c) = qb;
+                                   (size_t)(g * HL + r) * D + c) = qb;
       }
       if (q4 == 0 && st) {
         es[r * 16 + gi] = (unsigned char)(ex + 127);
@@ -1317,14 +1332,15 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
     __syncthreads();
     if (real) {
       SA_MARK(5)
-      // the scale chunks of heads [16 g, 16 g + 16) (64; a split task its
-      // share's): a 16-B line each
+      // the scale chunks of heads [HL g, HL g + HL) (a tile row past them: its line is not this token's)
       if ((tid >> 2) < lnb && (XQ_LINES == 4 || (tid & 3) < XQ_LINES)) {
         int const lc = lb0 + (tid >> 2); // head lc / 4, its 128-column block
                                          // lc % 4
-        uint32_t const s4 = *reinterpret_cast<uint32_t const *>(
-            es + (lc >> 2) * 16 + (lc & 3) * 4);
-        xq_scale_line(out, N, g * (SA_HPT * D / 128) + lc, t, tid & 3, s4);
+        if (lc < NBL) {
+          uint32_t const s4 = *reinterpret_cast<uint32_t const *>(
+              es + (lc >> 2) * 16 + (lc & 3) * 4);
+          xq_scale_line(out, N, g * (HL * D / 128) + lc, t, tid & 3, s4);
+        }
       }
     } else {
       SA_DMARK(7)
@@ -1427,9 +1443,9 @@ __device__ __forceinline__ void run_sparse_attn(Maps const &,
                 RD = PARAMS::v[3], NC = param_or0<PARAMS, 5>(),
                 CAP = param_or0<PARAMS, 6>();
   constexpr int NS = SELF::z;
-  static_assert(SELF::x == T && SELF::y * SA_HPT == H &&
+  static_assert(SELF::x == T && SELF::y * SA_HL<H> == H &&
                     (NS == 1 || (NC > 0 && NS == 1 + NC / 128)),
-                "sparse_attn: grid (T, H / 16) or (T, H / 16, 1 + NC / 128)");
+                "sparse_attn: grid (T, H / HL) or (T, H / HL, 1 + NC / 128), HL = min(H, 16)");
   unsigned char const *ccache = nullptr;
   int const *cidx = nullptr, *cpages = nullptr;
   __nv_bfloat16 *kbf = nullptr;

@@ -79,10 +79,11 @@ def routed_tensors(read, layer: int, tp: int, ranks, device="cuda", experts: int
     """The routed experts of layer `layer` for each rank in `ranks` of MoE TP `tp` (the module comment): a dict per rank, on
     `device` (or on device[i] for rank i: a list)."""
     I = INTER // tp
-    IRP, MT, KT = -(-I // 128) * 128, I // 64, dim // 128
+    IP = -(-I // 64) * 64                   # the W13 items' rows (TP8's 288 -> 320; local_inter)
+    IRP, MT, KT = -(-I // 128) * 128, IP // 64, dim // 128
     devs = list(device) if isinstance(device, (list, tuple)) else [device] * len(ranks)
-    out = [{"w13": torch.empty(experts, 2 * I, dim // 2, dtype=torch.uint8, device=d),
-            "w13_scales": torch.empty(experts, 2 * I, dim // 32, dtype=torch.uint8, device=d),
+    out = [{"w13": torch.empty(experts, 2 * IP, dim // 2, dtype=torch.uint8, device=d),
+            "w13_scales": torch.empty(experts, 2 * IP, dim // 32, dtype=torch.uint8, device=d),
             "w2": torch.zeros(experts, dim, IRP // 2, dtype=torch.uint8, device=d),
             "w2_scales": torch.full((experts, dim, IRP // 32), 127, dtype=torch.uint8, device=d)} for d in devs]
     for e in range(experts):
@@ -92,10 +93,14 @@ def routed_tensors(read, layer: int, tp: int, ranks, device="cuda", experts: int
         for o, r, dv in zip(out, ranks, devs):
             w1, w3, w2, s1, s3, s2 = (v.to(dv) for v in (c1, c3, c2, d1, d3, d2))
             rows = slice(I * r, I * (r + 1))
-            item = lambda a, b, n: torch.cat([a[rows].view(MT, 64, n), b[rows].view(MT, 64, n)], 1)   # [MT, 128 rows, n]
+            # this rank's I rows, then IP - I zero rows (their scales 2^0): the items are 64 rows
+            def q64(a, fill):
+                return pad_rows(a[rows], IP, fill)
+            item = lambda a, b, n: torch.cat([q64(a, 0).view(MT, 64, n), q64(b, 0).view(MT, 64, n)], 1)   # [MT, 128 rows, n]
+            item_s = lambda a, b, n: torch.cat([q64(a, 127).view(MT, 64, n), q64(b, 127).view(MT, 64, n)], 1)
             o["w13"][e].view(MT, KT, 128, 64).copy_(item(w1, w3, dim // 2).view(MT, 128, KT, 64).transpose(1, 2))
             o["w13_scales"][e].view(MT, KT, 512).copy_(
-                piece_chunks(item(s1, s3, dim // 32).view(MT, 128, KT, 4).transpose(1, 2)))
+                piece_chunks(item_s(s1, s3, dim // 32).view(MT, 128, KT, 4).transpose(1, 2)))
             w2p = o["w2"][e].clone()
             w2p[:, :I // 2] = w2[:, I * r // 2:I * (r + 1) // 2]
             s2p = o["w2_scales"][e].clone()
@@ -119,20 +124,42 @@ def shared_down_k(inter: int) -> int:
     return max(512, -(-inter // 256) * 256)
 
 
+def local_inter(tp: int) -> tuple:
+    """(I, IP) of a GPU's shared and routed expert: I = 2304 / tp columns, IP = I padded to the tasks' 64-row items. TP8's
+    I = 288 is not a multiple of 64 (swiglu_moe_experts' I % 64, gemm_fp8_tile's 128 weight rows a task: 2 I % 128), so it is
+    padded to 320: the rows past I are zero and their scales 2^0 (e8m0 127), which makes the extra gate | up outputs 0 and
+    silu(0) * 0 = 0 exact -- an fp32 accumulator adds it as a no-op, so the sum is the unpadded one's bits."""
+    I = INTER // tp
+    return I, -(-I // 64) * 64
+
+
+def pad_rows(x: torch.Tensor, n: int, fill: int, dim: int = 0) -> torch.Tensor:
+    """`x` with `n` - x.shape[dim] more entries (int8 bytes) of `fill` at the end of axis `dim` (0 for a weight's rows, 1 for
+    w2's K columns). n <= the current size: x itself (never a shrink)."""
+    if n <= x.shape[dim]:
+        return x
+    shape = list(x.shape)
+    shape[dim] = n - shape[dim]
+    return torch.cat([x, torch.full(shape, fill, dtype=x.dtype, device=x.device)], dim)
+
+
 def layer_tensors(read, layer: int, tp: int = 4, rank: int = 0, device="cuda") -> dict:
     """Layer `layer`'s MoE tensors for GPU `rank` of MoE TP `tp` on `device`, by graph tensor name (the module comment). tp is
-    1, 2 or 4 (I a multiple of 64: whole 128-row blocks of gate | up)."""
-    assert tp in (1, 2, 4) and 0 <= rank < tp
-    p, I = f"layers.{layer}.ffn.", INTER // tp
-    KO, r = shared_down_k(I), slice(I * rank, I * (rank + 1))
+    1, 2, 4 or 8 (I a multiple of 64 after local_inter's padding: whole 128-row blocks of gate | up)."""
+    assert tp in (1, 2, 4, 8) and 0 <= rank < tp
+    p, (I, IP) = f"layers.{layer}.ffn.", local_inter(tp)
+    KO, r = shared_down_k(IP), slice(I * rank, I * (rank + 1))
     r32 = slice(r.start // 32, r.stop // 32)
     w = {"gate_weight": read(p + "gate.weight"), "gate_bias": read(p + "gate.bias")}
     assert w["gate_weight"].dtype == torch.bfloat16 and w["gate_bias"].dtype == torch.float32
     e = lambda name: read(p + "shared_experts." + name)
     b = lambda t: t.contiguous().view(torch.uint8)   # e4m3 / e8m0 as bytes
-    w["sgu_weight"] = torch.cat([b(e("w1.weight")[r]), b(e("w3.weight")[r])])
-    w["sgu_scales"] = w8_scale_chunks(torch.cat([b(e("w1.scale")[r32]), b(e("w3.scale")[r32])]))
+    w["sgu_weight"] = torch.cat([pad_rows(b(e("w1.weight")[r]), IP, 0), pad_rows(b(e("w3.weight")[r]), IP, 0)])
+    w["sgu_scales"] = w8_scale_chunks(torch.cat([pad_rows(b(e("w1.scale")[r32]), IP // 32, 127),
+                                                 pad_rows(b(e("w3.scale")[r32]), IP // 32, 127)]))
     w2, s2 = b(e("w2.weight")[:, r]), b(e("w2.scale")[:, r32])
-    w["sd_weight"] = torch.cat([w2, torch.zeros(w2.shape[0], KO - I, dtype=torch.uint8)], 1)
-    w["sd_scales"] = w8_scale_chunks(torch.cat([s2, torch.full((s2.shape[0], (KO - I) // 32), 127, dtype=torch.uint8)], 1))
+    # (as before: w2's columns, then zero columns up to KO; the scales one byte per 32 columns)
+    w["sd_weight"] = torch.cat([pad_rows(w2, IP, 0, 1), torch.zeros(w2.shape[0], KO - IP, dtype=torch.uint8)], 1)
+    w["sd_scales"] = w8_scale_chunks(torch.cat([pad_rows(s2, IP // 32, 127, 1),
+                                                torch.full((s2.shape[0], KO // 32 - IP // 32), 127, dtype=torch.uint8)], 1))
     return {k: v.contiguous().to(device) for k, v in w.items()}
