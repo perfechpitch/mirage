@@ -253,9 +253,14 @@ __device__ __forceinline__ void
                          int cy,
                          bool warm STAGE_STAMP_PARAM) {
   // timing build: stamp [0] the dry pass done, [1] thread 0's parts landed
-  static_assert(NC % 2048 == 0 && K % NC == 0,
-                "act_quant (K parts): whole passes of 2048 columns, 8 per "
-                "thread");
+  // TP8: a task may own fewer than 2048 columns (attention's wo_a output is
+  // G OL = 1024 there): the loop stride is 8 * 256 = 2048, so with NC < 2048
+  // the threads past NC / 8 idle, and the 32-column groups and 128-column
+  // blocks of the shuffle and the scale line stay whole as long as NC is a
+  // whole number of 128-column blocks.
+  static_assert(NC % 128 == 0 && (NC <= 2048 || NC % 2048 == 0) && K % NC == 0,
+                "act_quant (K parts): whole 128-column blocks, at most one "
+                "pass of 2048 columns, 8 per thread");
   int const l = threadIdx.x & 31;
 #pragma unroll 1
   for (int pass = warm ? 1 : 0; pass < 2; pass++) {

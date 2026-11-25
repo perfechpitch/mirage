@@ -607,23 +607,26 @@ class StaticMegakernel(PersistentKernel):
         if poll:   # (x written by engram_rows' multicast stores: polled, no wait on a node)
             assert p is None or p.name == "engram_rows", "act_quant_layer: poll with x a graph tensor or engram_rows' output"
             p = None
+        nc = 2048   # a task's columns (the parts path: whole 128-column blocks, at most one pass of 2048)
         if p is None:       # tasks/act_quant.cuh reads x by pointer and waits for no node
             self._dtypes("act_quant_layer", input=(input, bfloat16), output=(output, uint8))
             buf_slots = [self._tensor_slot(input)]
         elif p.name == "gemm_fp8_tile" and p.params[0] == COMBINE["slots"]:
             self._dtypes("act_quant_layer", input=(input, float32), output=(output, uint8))
-            assert K % 2048 == 0   # tasks/act_quant.cuh act_quant_parts_task: 8 columns per thread, whole passes of 2048
+            # the widest whole-128-block slice of K that divides it: 2048 normally, but attention's wo_a output is only
+            # G OL columns (TP4 2048, TP8 1024) and tasks/act_quant.cuh runs any NC of whole 128-column blocks
+            nc = next(n for n in (2048, 1024, 512, 256, 128) if K % n == 0)
             buf_slots = []
             at_most_parts(p, 10)   # tasks/act_quant.cuh: at most 10 K parts
         else:
             raise ValueError(f"act_quant_layer: x must be a graph input or a gemm_fp8_tile node's output in slots; it comes "
                              f"from {p.name}")
         assert input.num_dims == 2 and output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, K)
-        assert K % 512 == 0   # tasks/act_quant.cuh: 16 columns per thread, 2 per 32-column group, whole warps
+        assert p is not None or K % 512 == 0   # tasks/act_quant.cuh: 16 columns per thread, 2 per 32-column group, whole warps
         if p is None:         # (token, column slice): slices of whole warps' 512 columns; default one per token
             grid, maps, changeable = (T, 1, 1), [(0, 1, -1), (0, 1, -1)], {1: (512, 1, None)}
-        else:                 # (token, column slice): a task polls only its columns' K parts; slices of whole passes of 2048
-            grid, maps, changeable = (T, K // 2048, 1), [(0, 1, -1), (0, 1, -1)], {1: (2048, 1, None)}
+        else:                 # (token, column slice): a task polls only its columns' K parts; slices of whole 128-column blocks
+            grid, maps, changeable = (T, K // nc, 1), [(0, 1, -1), (0, 1, -1)], {1: (nc, 1, None)}
         self._add_node("act_quant", grid, block_dim, [input, output], maps, [K] + ([0, 0, 1] if poll else []),
                        changeable_grid_dims=changeable,
                        out_buffer=lambda n: (zq_bytes(T, K), -1, False), counters=1, buf_slots=buf_slots,
