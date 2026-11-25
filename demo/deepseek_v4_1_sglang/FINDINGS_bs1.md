@@ -18,11 +18,12 @@
 | **Engram 精度** | ✅ `ENGRAM=2` R'' relRMS **7.2e-7**；`ENGRAM=1` 7.5e-5 |
 | **LM head + argmax** | ✅ logits relRMS 1.2e-4，**argmax 100% 一致** |
 | **TP=8 支持** | ✅ **新增**：attention `SA_HL<H>` + MoE I 补到 320，4 个组件全部逐位校验通过，8 卡一致 |
-| 端到端 40 层 build | ✅ **314 个 layer module 全部 built + mapped**（209 GB/rank，TP4） |
+| 端到端 40 层 build | ✅ TP4 314 个 module 全部 built + mapped（209 GB/rank）；**TP8 40 attn + 40 MoE 也全部 built**（缓存命中，见 §8.8） |
 | 端到端 prefill | ✅ 通过（logits 产出） |
-| 端到端 decode | ⚠️ **第 1 步通过，第 2 步挂死**（见 §8.6） |
+| 端到端 decode | ❌ **首个真实 step 不返回**（TP4/TP8 都是；单层即复现，见 §8.6 / §8.8.3） |
+| CUDA graph 捕获 | ✅ 通过（但捕获只记录不执行，**不能**作为 decode 跑通的证据，见 §8.8.3） |
 | 端到端 token 精度 | ❌ 未验证（未跑到出 token） |
-| 性能 | 未测（无法独占 GPU，见 §5.1） |
+| 性能 | 未测（decode 未跑通；bench32k/TPOT 脚手架已就绪，见 §8.8.5） |
 
 ---
 
@@ -601,18 +602,146 @@ head argmax: 0 batches from the kernel's ids, 1 by the sampler
 后果是其他并发作业也受影响，所以这轮验证主动停止。后续跑之前应先看 `df -h /dev/shm`，
 并考虑给 exchange pool 换到别的暂存位置，或缩小 `DSV41_STATIC_ROWS` 的上限。
 
+### 8.8 TP=8：40 层装配打通，但首个真实 decode step 挂死（本轮结论）
+
+这一轮把 TP=8 的 40 层端到端**装配**走通了（此前只到层级别校验），并在过程中修掉一个
+TP=8 专属 bug；但 **decode 依然走不通**，且已经把根因从“装配/编译”收窄到“kernel 首次真实 launch”。
+
+#### 8.8.1 修掉的 bug：`act_quant` 的 2048 列假设（`50c56461`）
+
+attention 的 `wo_a` 输出宽度是 `G * OL`：**TP4 是 2048，TP8 只有 1024**。
+`act_quant_layer` 走“GEMM 的 K parts”那条分支时，一个任务固定 2048 列：
+
+```python
+assert K % 2048 == 0                          # 旧
+grid = (T, K // 2048, 1)                      # 旧：TP8 下变成 (T, 0, 1)
+```
+
+SWA 层不走 wo_b 的 fused 路径，于是 `(T, 0, 1)` 的 grid 直接触发断言，40 层 build 死在 L36 之前。
+kernel 侧 `act_quant_parts_task` 的循环步长本来就是 `8 * 256 = 2048`，
+所以一个任务只要占**整数个 128 列块**就成立（128 列 = 一个 warp 的 scale line 粒度，
+32 列 = 一个 shuffle 组），NC < 2048 时第 128 号以后的线程自然空转。
+
+改法：取 `K` 能整除的最大合法列数（2048/1024/512/256/128），
+kernel 的 `static_assert` 从 `NC % 2048 == 0` 放宽到“整数个 128 列块、至多一个 2048 的 pass”。
+手写 plan 里 `oa_q` 的 grid 本来就是 `max(1, G*OL // 2048)`，与改动一致。
+
+#### 8.8.2 显存：静态层自己持有一份权重副本
+
+`dsv41_static_layer.py` 的每层都通过 `reader(ckpt)` **从 checkpoint 重新读一遍权重**
+（`layer_tensors` / `mhc_tensors` / `engram_kv_tensors`，按它自己的布局：w13 补到 320、
+scales 按 128×128 tile 切块），不是复用 SGLang 已加载的 tensor。所以每卡是两份：
+
+| 项 | TP8 每卡 | 说明 |
+|---|---|---|
+| SGLang 权重 | 50.66 GB | 日志 `Load weight end ... mem usage=50.66 GB` |
+| 静态层副本 | ~38.4 GB | 307.2 GB model 权重 / 8；engram 203.1 GB 在 **CPU**，不进 HBM |
+| KV（mem-fraction 0.85） | ~177 GB | 挤掉了静态副本的空间 |
+
+用 safetensors header 逐 tensor 统计：**model 307.2 GB + engram 203.1 GB = 510.3 GB**，
+engram 走 `--engram-config '{"placement":"cpu"}'` 留在主机侧（rank 进程 host RSS 只有 14.8 GiB 可印证）。
+
+`MEMFRAC=0.85` 时静态层构建到 **L36 OOM**（只剩 0.6 GB）；
+`MEMFRAC=0.5` 下 40 层构建全程余量 90–180 GB，稳定通过。
+
+> 因此“静态层建好之后释放 SGLang 那份权重”是**不可行**的：
+> hook 只替换 decode 的 `MQALayer.forward` / `DeepseekV2MoE.forward`，
+> **prefill 仍然跑 SGLang 原生 kernel**（bench32k 正是 32K prefill 的场景）；
+> 且两份是不同布局，不能只改指针。
+
+#### 8.8.3 挂死：现象与证据链
+
+现象：40 层（或单层）装配成功、CUDA graph 捕获成功，**第一个真实 decode step 之后不再前进**，
+GPU 100% 占用、日志静止。
+
+| # | 实验 | 结果 | 判读 |
+|---|---|---|---|
+| 1 | 纯 SGLang（不加载 hook） | 8 token / 7.4 s，答案正常 | 环境、模型、mHC 路径本身没问题 |
+| 2 | 40 层全静态 `MHC=1 ENGRAM=2 HEAD=2` | 挂死 | — |
+| 3 | `MHC=0 ENGRAM=0 HEAD=0` | 挂死 | 与“mHC 由谁接管”无关 |
+| 4 | 仅 L0 静态（`ATTN=0 MOE=0`） | 挂死 | **不是 40 层累积，单层就复现** |
+| 5 | 预热过的 Triton 缓存（`hc_combine` 72 条 / `hc_mix_stats` 48 条） | 仍然挂 | **不是编译、不是缓存** |
+| 6 | 挂住时另起进程在 GPU0 跑 1024³ matmul | 1.5 s 正常返回 | **GPU 本身健康**，是本进程 context 被占 |
+| 7 | `py-spy dump`（8 个 rank） | 全部停在 `cuModuleLoadData` | 宿主被一个不返回的 kernel 阻塞 |
+
+采样栈（`py-spy`，`MHC` 开/关时分别命中不同 kernel）：
+
+```
+CompiledKernel._init_handles (triton/compiler/compiler.py:479)     ← cuModuleLoadData
+  CompiledKernel.launch_metadata
+    JITFunction.run
+      hc_combine_norm_mxfp8      ← 或 hc_mix_stats_sinkhorn（MHC=0 时）
+        _combine / mix_stats (deepseek_v4_mhc.py)
+          HcReadCall.read / HcUpdate.post (deepseek_v4_boundary.py)
+```
+
+**关键结论：栈顶是症候，不是病因。** 宿主卡在 `cuModuleLoadData`，
+是因为 context 里有一个永不返回的 kernel（静态 megakernel），
+下一次需要 context 独占的 CUDA 调用就永久阻塞。
+`cuModuleLoadData` 之所以出现在这里，是因为 `MHC` 那条 boundary 路径恰好是
+“静态 kernel launch 之后的第一处宿主 CUDA 调用”（`quantize and x.shape[0] <= 128`
+才走 `hc_combine_norm_mxfp8`，纯 SGLang 走的是另一个 kernel，所以从没触发过）。
+
+也正因为**捕获只记录、不执行**，CUDA graph 捕获阶段能打印
+`first static decode step (L0): in a CUDA graph capture` 却依然在真实执行时挂死 ——
+这条日志**不能**当作“decode 跑通”的证据。
+
+已排除项：`DSV41_STATIC_PDL` 默认就是 0；`MHC/ENGRAM/HEAD` 全关无效；
+`DSV41_STATIC_MAX_POS` 从 33024 退回默认 2047 无效；Triton 缓存预热无效。
+
+#### 8.8.4 下一步的定位手段（未执行）
+
+问题是“某个 poll / counter 永远不被满足”，与 §8.6 同一类。但 §8.6 归因于激进 flag，
+而这一次用的是**最小安全配置**、且单层就复现，所以必须换手段：
+
+1. **脱离 SGLang 的最小复现**：用 `mhc_check.py` 那套（单层、自己造输入、不经 SGLang）
+   调一次静态层，确认 kernel 本体能否返回。这是最快的一刀，能把 SGLang 完全排除。
+2. **逐节点裁剪**：单层里只留 `act_quant` + 一个 GEMM，再逐个加节点，找出第一个不返回的。
+3. **counter dump**：给 poll 循环加计数器打印（或 `compute-sanitizer --tool synccheck`），
+   看它等的是哪个 tick / 哪个 `SEND::counter`。
+4. 注意 `DSV41_STATIC_ROWS=1` 与 `T=8` 的组合：单层实验里 8 行 step 走的是 T=8 的 build，
+   活行只有 1，idle 行按 `rows_variant` 处理，这条路径本身也需要单独确认。
+
+#### 8.8.5 附带产物：bench32k / TPOT 的脚手架
+
+`bench/run_dsv41_tp8_bench32k.sh`（本轮新增）：起一个**长跑 SGLang 服务**，
+decode 走静态 megakernel，由 LCA bench32k client 打点。
+
+- **bench32k 指 32K 上下文**（`data/long-code-arena/bench32k/*.jsonl`，ISL 22k–33k），**不是 bs=32**。
+- **TPOT = `step_p50_ms`**（客户端 SSE 相邻 chunk 间隔；静态路径是纯 decode、无 DSPARK，
+  一个 step 就是一个 token，所以它直接就是 TPOT，不需要按 accept length 折算）。
+- 因为走纯 TP8（`--ep-size 1`），与 NVIDIA megakernel 那套 `tp8 = --tp 8 --ep-size 2` + DSPARK
+  不是同一口径，跨臂比较时要注明。
+- 该脚本目前**跑不出版本号内的 TPOT**：请求会死在第一个 decode step（见 8.8.3）。
+
+参考口径（NVIDIA megakernel + DSPARK，`bench32k` medium_context，n=20，osl=512）：
+`step_p50 3.006 ms`、`tps_user_p50 1445.9`、`ttft_p50 374.2 ms`。
+
+#### 8.8.6 运维教训
+
+- **不要用宽 `pkill -f` 清共享机器上的 GPU 进程**。`pkill -f "sglang::scheduler"`
+  会命中同账号下其他会话的 sglang。正确做法：先 `nvidia-smi --query-compute-apps=pid`
+  取 PID，再按**自己启动的 PID** 白名单 kill；kill 循环里应打印每一行再杀。
+- 启动前确认 `/dev/shm` 与每卡 `memory.free`（`run_dsv41_tp8_40l.sh` 已有检查）。
+- 40 层 TP8 的 `.so` 已全部在 `build/sgl_static_dsv41/cache/`，重启命中缓存，
+  构建阶段不再是瓶颈（主要耗时是权重加载 ~108 s）。
+
 ---
 
 ## 9. 下一步
 
-1. **端到端正确性（最高优先）**：最小安全配置 + `DSV41_STATIC_ROWS=1`（单行），
-   跑 8 token，与 `/tmp/ref_t8.json` 对照
-   （官方 SGLang baseline，8 条同 prompt 贪心解码：`[5, 17209, 15, 23021, 55607, 83224, 271, 37460]`）。
-   逐位相同之后才谈性能。
-2. **TP=8 端到端**：层代码已验，还差把 `DSV41_STATIC_*` 那套装配层在 TP=8 下拼起来
-   （`dsv41_static_layer.py` 的 head / Engram 分片本来就按行切，理论无需改）。
-3. **定位 decode 第 2 步挂死**：在最小配置下复现，用 `compute-sanitizer --tool synccheck`
-   或给 kernel 的 poll 循环加计数器 dump，找出等的是哪个 tick / 哪个 `SEND::counter`。
+> 本轮之后的状态：TP=8 的 40 层**装配**已打通（见 §8.8），
+> decode 仍卡在“首个真实 step 不返回”，且已收窄到 kernel 本体、单层可复现。
+
+1. **先做脱离 SGLang 的最小复现（最高优先）**：用 `mhc_check.py`（不经 SGLang、自造输入）
+   跑一次单层静态层，确认 kernel 本体能否返回。这一步能把 SGLang 完全排除，
+   决定后续是查 kernel 还是查接线。
+2. **再逐节点裁剪定位**：在单层里只留 `act_quant` + 一个 GEMM，逐个加节点，
+   找出第一个不返回的；配合 poll 循环计数器 dump 或 `compute-sanitizer --tool synccheck`。
+   注意单层实验里 8 行 step 走 T=8 的 build（活跃行 1），`DSV41_STATIC_ROWS` 那条路径要单独确认。
+3. **端到端正确性（挂死解决后最高优先）**：最小安全配置 + `DSV41_STATIC_ROWS=1`，
+   跑 8 token，与官方 SGLang baseline 的贪心 token
+   （`[5, 17209, 15, 23021, 55607, 83224, 271, 37460]`）逐位对照。逐位相同之后才谈性能。
 4. **`DSV41_HEAD_ARGMAX` 未命中**：查 `_head_by_logits` / `_ok_rows` / `data_ptr` 的对齐条件。
 5. **性能特化**：按 T=1 → T=2 → T=4 → T=8 逐档，需要独占 GPU 才能计时。
    TP=8 每卡只需 ~59.4 GiB，8 张卡全都够。

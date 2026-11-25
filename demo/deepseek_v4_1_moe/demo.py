@@ -512,10 +512,10 @@ def main():
     ap.add_argument("--nvcc-flag", action="append", default=[], help="an nvcc flag for the layer (repeatable), e.g. "
                     "--nvcc-flag=-DSTATIC_RESET_IN_KERNEL (the serving build; note the '=')")
     args = ap.parse_args()
-    if not (args.gpus == 1 or (args.gpus == 4 and args.tp == 4)) or args.gpus > torch.cuda.device_count():
-        raise ValueError(f"--gpus {args.gpus} --tp {args.tp}: --gpus 1, or --gpus 4 with --tp 4 (the GPUs visible: "
+    if not (args.gpus == 1 or (args.gpus == args.tp and args.tp in (4, 8))) or args.gpus > torch.cuda.device_count():
+        raise ValueError(f"--gpus {args.gpus} --tp {args.tp}: --gpus 1, or --gpus == a --tp of 4 or 8 (the GPUs visible: "
                          f"{torch.cuda.device_count()})")
-    if args.tp not in (1, 2, 4) or not 0 <= args.rank < args.tp:
+    if args.tp not in (1, 2, 4, 8) or not 0 <= args.rank < args.tp:
         raise ValueError(f"--tp {args.tp} --rank {args.rank}: tp 1, 2 or 4 (whole 128-row blocks of gate | up)")
     snapshot = download_layer(args.checkpoint, args.layer, revision=args.revision)
     cfg = model_config(snapshot)

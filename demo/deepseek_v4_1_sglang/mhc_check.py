@@ -25,6 +25,7 @@ ap.add_argument("--checkpoint", required=True)
 ap.add_argument("--layer", type=int, default=3)
 ap.add_argument("--kind", choices=("attn", "moe"), default="attn")
 ap.add_argument("--no-norm", action="store_true", help="the post only")
+ap.add_argument("--pos", type=int, default=4096, help="(attn) the KV positions already in the cache (the demo's --pos)")
 ap.add_argument("--out", default="/work/mhc")
 ap.add_argument("--flag", action="append", default=[])
 ap.add_argument("--timeline", action="store_true", help="the timing build: when each node's tasks ran")
@@ -54,7 +55,7 @@ def relrms(x, y):
 if attention:
     variant, ratio = attn_weights.variant_of(cfg, L), cfg["compress_ratios"][L]
     csrc, heads = L == cfg["candidate_source_layer"], 64 // NG
-    top = 4096
+    top = a.pos
     rows = (top + 2 + 255) // 256 * 256
     cap = max(((top + 1) // max(ratio, 1) + 255) // 256 * 256, attn_demo.NC)
     shards = [attn_weights.layer_tensors(read, cfg, L, NG, r, rows, d) for r, d in zip(range(NG), devs)]
