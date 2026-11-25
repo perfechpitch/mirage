@@ -208,40 +208,95 @@ TP=4 回归验证（同一份共享代码）：
 
 数字逐位相同 ⇒ **无回归**。
 
-### 5.3b 为什么 bs=1 要用 TP 而不是 DP+EP（量化依据）
+### 5.3b 为什么 bs=1 要用 TP 而不是 DP+EP / EP2（量化依据）
 
-先分清两个场景：**bs=1 延迟**用 TP，**大 batch 吞吐**用 DP+EP。下面只算 bs=1。
+先分清两个场景：**bs=1 延迟**用 TP，**大 batch 吞吐**才轮到 DP+EP。下面只算 bs=1。
 
-bs=1 解码一个 token、每层每卡必须从 HBM 读的字节（只读 top-6 命中的专家）：
+#### TP8 与 "TP8 + EP2" 的确切切分
 
-| 组件 | TP4 | **TP8** | DP+EP8（最慢那张卡） |
+SGLang 的定义（`runtime_context.py`）：
+
+```python
+"moe_tp_size": tp_size // moe_ep_size // moe_dp_size,
+```
+
+所以 `tp=8, ep=2` 意味着：
+
+| 组件 | 切分 | 代码依据 |
+|---|---|---|
+| attention（wq_a/b、wo_a/b、kv、indexer） | **TP = 8** | `parallel_group="attn_tp"` |
+| routed MoE | **EP 2 组 × 组内 TP 4** | `moe_tp_size = 8//2//1 = 4` |
+| shared expert | **TP = 8**（不降级） | `parallel_group="tp"` → `tp_group`，不是 `moe_tp_group` |
+| embed / head / norms | TP = 8 | — |
+
+具体形态：384 个专家切成 2 组（192 个/组），每个专家被组内 4 个 rank 按 intermediate 切 4 份
+（`intermediate_size_per_partition = 2304 // 4 = 576`）。
+每卡内存 = 192 × 1/4 = **48 个专家当量**，和 TP8 的 384 × 1/8 = 48 完全一样（都是 59.4 GiB/卡）。
+
+两个常被误解的点：
+
+- **shared expert 不会跟着 EP 降级**。它用 `tp_group`（8 卡），不是 `moe_tp_group`（4 卡）。
+  只有走 DeepEP/MegaMOE 这类 A2A 后端时才变 `"replicated"`（每卡全量复制）。
+- **没有额外的两次 all-to-all**。不带 A2A 后端时，归约就是一次跨 8 卡的普通 all-reduce
+  （`if reduce_results and (moe_tp_size > 1 or moe_ep_size > 1): tensor_model_parallel_all_reduce(...)`），
+  通信量和 TP8 相同。
+
+#### bs=1 每层每卡从 HBM 读的字节
+
+| 配置 | routed | shared | attn+gate | 合计 | 40 层 ÷ 7 TB/s |
+|---|---|---|---|---|---|
+| **纯 TP8** | 15.94 | 4.22 | 19.14 | **39.29 MiB** | **235 µs** |
+| TP8 + EP2 | 18.30 | 4.22 | 19.14 | **41.66 MiB** | **250 µs** (+6.0%) |
+| DP+EP8（最慢卡） | 35.9 | 4.2 | 19.1 | 59.2 | 355 µs |
+
+**EP2 唯一的劣势就是路由不均**：6 个专家随机落到 2 组，慢组专家数服从 `max(X, 6−X)`，`X ~ Bin(6, 0.5)`：
+
+| 慢组拿到 | 概率 | routed | vs TP8 |
 |---|---|---|---|
-| attention | 30.6 MiB | **15.3** | 15.3 |
-| shared expert | 8.5 | **4.2** | 4.2 |
-| routed（6 专家） | 27.9 | **15.9** | **35.9**（摊到 2 个专家 × 全宽） |
-| router gate（每卡复制） | 3.8 | 3.8 | 3.8 |
-| **每层合计** | 67 | **37** | 57 |
-| **40 层 ÷ 7 TB/s** | 412 µs | **226 µs** | 346 µs |
+| 3 | **31.2%** | 13.95 MiB | **0.88×（赢）** |
+| 4 | 46.9% | 18.59 | 1.17× |
+| 5 | 18.8% | 23.24 | 1.46× |
+| 6 | 3.1% | 27.89 | **1.75×** |
 
-四条理由：
+`E[max] = 3.94`（均值 3.0，**1.3× 不均**）。也就是说：
+**EP2 用 69% 概率变慢（最坏 +75%）去换 31% 概率快 12%**。而纯 TP8 的 39.29 是恒定的，零抖动。
+对 bs=1 冲延迟而言，抖动来自路由、不可控 —— 所以选纯 TP8。
 
-1. **TP 完美均分，EP 不均。** TP 下 6 个专家**每个**都被切 8 份，人人平等；
-   EP 下 6 个专家散到 8 个 rank，必有 rank 摊到 2 个、有 rank 摊到 0 个 —— 延迟由**最慢的那张**决定，
-   期望 max ≈ 2，直接比 TP8 慢 2.4×。
-2. **通信形态。** TP 只要 1 次 all-reduce（10 KB 的 hidden，可走 NVLS multicast）；
-   EP 要 dispatch + combine 两次 all-to-all，且 bs=1 时没有任何 batch 可以摊薄。
-3. **DP 在并发 = 1 时无意义**（收益是把多个请求分给多卡）。
-4. **KV 在 TP 组内是复制的**（MLA，`num_key_value_heads = 1`），
+#### 其余三条理由
+
+1. **TP 完美均分，EP 不均。** TP 下 6 个专家**每个**都被切 8 份；EP 下必有 rank 摊到 2 个、
+   有 rank 摊到 0 个，延迟由**最慢那张**决定。
+2. **DP 在并发 = 1 时无意义**（收益是把多个请求分给多卡）。
+3. **KV 在 TP 组内是复制的**（MLA，`num_key_value_heads = 1`），
    所以 bs=1 下 DP attention 也拿不到"每卡 KV 变小"的好处。
 
-反过来，大 batch 时 DP+EP 明显更优：EP 是"少量专家 × 全宽"，每个专家上的 token 多了 GEMM 才有密度；
-而 TP 切 intermediate 会**引入 padding 浪费**（TP4: 576→640 浪费 11%，TP8: 288→320 浪费 11%）。
-这正是 SGLang 在我们日志里给的那条警告的含义：
+#### 一个必须知道的限制
+
+`overrides.py` 里**所有 A2A 后端都会把 ep_size 强改成 tp_size**：
+
+```python
+_A2A_EP_SPANNING_BACKENDS = {"megamoe","deepep","deepep_v2","mooncake","nixl",
+                             "ascend_fuseep","flashinfer_nvlink_one_sided",
+                             "flashinfer_megamoe","mori","pplx","ascend_ops"}
+def _a2a_ep_size(view):
+    if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
+        return {"ep_size": view.tp_size}     # ep=2 会被改成 8
+```
+
+所以 **`tp=8, ep=2` 只在 `moe_a2a_backend=none` 时成立**；一旦上 DeepEP/MegaMOE 就自动变成 `ep=8`。
+
+#### 大 batch 时反过来
+
+EP 是"少量专家 × 全宽"，每个专家上的 token 多了 GEMM 才有密度；而 TP 切 intermediate 会
+**引入 padding 浪费**（TP4: 576→640，TP8: 288→320，各 11%）。T=8 时两者基本打平
+（`E[max] = 26.8/48`，不均降到 11.5%），T=64+ 时 EP 明显更好。这正是 SGLang 那条警告的含义：
 
 > flashinfer_mxfp4 MoE padded the local intermediate size from 576 to 640 ...
 > **benchmark it against a TP/EP configuration that avoids padding**
 
-这个 trade-off 在 bs=1 时翻转成 TP 占优。
+**比 EP2 更值得做的**：EP2 那 31% 的赢面本质是"省掉 TP8 的 padding"。直接把 padding 干掉更好 ——
+W13 的 item 从 64 行改成 32 行，288 = 9×32 正好整除，routed 从 15.94 → **14.94 MiB（−6.3%）**，
+确定性收益、零抖动、不用 EP。w2 的 K 仍需补到 384（128 行 tile 要求），所以只赚 6.3% 而非 11%。
 
 ### 5.4 TP=4 的 head 数约束（历史记录）
 
