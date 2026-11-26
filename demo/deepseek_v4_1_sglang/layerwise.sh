@@ -29,6 +29,15 @@ ONLY=${ONLY:-both}
 # the KV cache share. The 40-layer static build is what wants the memory (measured: ~164 GB/rank in use at
 # 32K with the default 0.40); raise this only if SGLang asks for less KV, never to make room for weights.
 MEMFRAC=${MEMFRAC:-}
+# DETAIL=1 prints the eight values behind each relRMS; DUMPDIR=<dir> writes the whole tensors (.npy, both sides, with
+# a manifest of the relRMS). Both default off; DUMPDIR is what you want when the question is "what exactly differs",
+# and `python dump_layers.py --dir <dir>` reads it back with no GPU.
+DETAIL=${DETAIL:-}
+DUMPDIR=${DUMPDIR:-}
+# The planner needs the mirage venv's z3 (4.16); the sglang venv's is 4.15 and sitecustomize dies on it with
+# "ImportError: libz3.so.4.16", which does NOT stop the run -- it silently runs stock SGLang instead. That is exactly
+# the kind of quiet non-measurement the assertion below is for.
+export LD_LIBRARY_PATH=/opt/dlami/nvme/saboxu/venvs/mirage/lib/python3.12/site-packages/z3/lib:${LD_LIBRARY_PATH:-}
 mkdir -p "$OUT"
 
 # the two variables that decide whether the chain under test is the one that failed (see FINDINGS_correctness 8.3):
@@ -44,12 +53,25 @@ run() {   # run <tag> <TPBAR>
       DSV41_STATIC_CHECK=1 DSV41_STATIC_MHC=1 DSV41_STATIC_AR=0 \
       DSV41_STATIC_TPB=1 DSV41_STATIC_TPBAR=$tpbar \
       DSV41_STATIC_CHECK_STEPS=$STEPS DSV41_STATIC_MAX_POS=33000 \
+      ${DETAIL:+DSV41_STATIC_DETAIL=$DETAIL} ${DUMPDIR:+DSV41_STATIC_DUMPDIR=$DUMPDIR} \
       python l2_check.py --model "$CKPT" --row "$ROW" --tokens "$TOKENS" --out "$OUT/$tag" \
       ${MEMFRAC:+--mem-fraction "$MEMFRAC"} \
       > "$OUT/$tag.log" 2>&1
   local rc=$?
   grep -a "static layers serving\|patched SGLang" "$OUT/$tag.log" | head -2 | sed 's/^/    /'
   [ $rc -ne 0 ] && echo "    rc=$rc (a timeout or a crash; see $OUT/$tag.log)"
+  # A run that never loaded the hook is stock SGLang with a static-looking log. It happens (sitecustomize's imports
+  # fail softly) and it produces a plausible answer to a question that was never asked, so refuse it here.
+  if ! grep -qa "patched SGLang" "$OUT/$tag.log"; then
+    echo "    INVALID: the hook never loaded, this was stock SGLang"
+    grep -am2 "Error in sitecustomize\|ImportError" "$OUT/$tag.log" | sed 's/^/      /'
+    return 9
+  fi
+  if ! grep -qa "check " "$OUT/$tag.log"; then
+    echo "    INVALID: no comparison line; see the NOT checked reasons below"
+    grep -am4 "NOT checked\|NOT FINITE" "$OUT/$tag.log" | cut -c1-170 | sed 's/^/      /'
+    return 9
+  fi
   return $rc
 }
 

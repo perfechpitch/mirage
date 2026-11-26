@@ -19,6 +19,7 @@ DSV41_STATIC_CKPT (a directory with inference/config.json and the shards, defaul
 DSV41_STATIC_OUT (build directory), DSV41_STATIC_MAX_POS (the largest position, default 2047), DSV41_STATIC_ROOT,
 DSV41_STATIC_PROF (a file: the kernels' own stamps of the last step when the driver rewrites it, see dsv41_static_prof.py).
 """
+import json
 import os
 import time
 
@@ -201,6 +202,72 @@ def _log(msg):
 def _relrms(a, b):
     a, b = a.double(), b.double()
     return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
+
+
+DETAIL = os.environ.get("DSV41_STATIC_DETAIL", "0") != "0"   # the values behind a check line, not just the relRMS
+
+
+def _detail(name, got, ref, n=8):
+    """The numbers behind a check line: what a relRMS of 6e-2 or a NaN actually looks like.
+
+    A relRMS says "these differ by 6%". It cannot say whether the failure is a scale (every value off by 6%), a sign,
+    a permutation of the columns, or one or two garbage elements -- and those have nothing in common as bugs. So this
+    prints, for both tensors: the norm, the first n values, and where the largest magnitude sits. A NaN then shows
+    which tensor it entered and at which index; a permutation shows the same multiset in a different order; a scale
+    shows equal argmax/argmin positions and a constant ratio.
+
+    DSV41_STATIC_DETAIL=1. It is opt-in: n x 2 numbers a sublayer is a lot of log, but it is the only reading that
+    distinguishes those cases, and it costs one sync-free .cpu() per compared sublayer.
+    """
+    g = got.detach().float().flatten()
+    r = ref.detach().float().flatten()
+    def one(v):
+        fin = torch.isfinite(v)
+        n_nan = int((~fin).sum())
+        head = " ".join(f"{x:+.4f}" for x in v[:n].tolist())
+        if n_nan:
+            first = int((~fin).nonzero()[0])
+            return f"norm nan({n_nan}/{v.numel()} non-finite, first at {first}) head[{head}]"
+        i = int(v.abs().argmax())
+        return f"norm {v.norm():.5g} max|{i}|{v[i]:+.4g} head[{head}]"
+    _log(f"detail {name}: static {one(g)} | sglang {one(r)}"
+         + (f" | |static|/|sglang| {g.norm().item() / max(r.norm().item(), 1e-30):.4g}"
+            if torch.isfinite(g).all() and torch.isfinite(r).all() else ""))
+
+
+DUMPDIR = os.environ.get("DSV41_STATIC_DUMPDIR")   # a directory: every compared sublayer's values, both sides
+
+
+def _dump_cmp(st, tag, got, ref):
+    """The complete tensors of one comparison, both sides, to DSV41_STATIC_DUMPDIR.
+
+    _detail prints eight values; this writes all of them. The point is to be able to answer a question afterwards
+    without another GPU run: which columns differ, is it a permutation, is one row garbage, does the ratio vary with
+    the magnitude. Files are .npy so the shape and dtype travel with the data -- an offline reader cannot mis-slice a
+    raw .bin (that is how the "logits of a TP shard" comparison went wrong once).
+
+    Stored as float32 even when the source is bf16: a bf16 value is exactly representable in fp32, so the dump is
+    lossless, and numpy has no bfloat16. The source dtype is in the manifest.
+
+    Layout:  {dir}/step{N}/{sub}{layer:02d}_{what}_{static|sglang}.npy
+             {dir}/manifest.jsonl   one line per comparison: names, shapes, dtypes, relRMS
+    Only rank 0, only steps <= DSV41_STATIC_CHECK_STEPS, and only in check mode (there is no reference otherwise).
+    """
+    try:
+        import numpy as np
+        d = os.path.join(DUMPDIR, f"step{st.steps}")
+        os.makedirs(d, exist_ok=True)
+        base = os.path.join(d, tag.replace(" ", "_").replace("/", "_"))
+        g, r = got.detach().float().cpu().contiguous(), ref.detach().float().cpu().contiguous()
+        np.save(base + "_static.npy", g.numpy())
+        np.save(base + "_sglang.npy", r.numpy())
+        with open(os.path.join(DUMPDIR, "manifest.jsonl"), "a") as fh:
+            json.dump(dict(step=st.steps, tag=tag, shape=list(g.shape),
+                           dtype_static=str(got.dtype), dtype_sglang=str(ref.dtype),
+                           relrms=_relrms(got, ref)), fh)
+            fh.write("\n")
+    except Exception as e:   # a dump must never end a run
+        _log(f"dump {tag} failed: {type(e).__name__}: {e}")
 
 
 TPBAR = os.environ.get("DSV41_STATIC_TPBAR", "1" if MHC else "0") != "0"   # a TP barrier after each sublayer's kernel
@@ -596,6 +663,10 @@ def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_red
                 _STATE["write_checks"]()
                 _log(f"check attn L{st.layer} ({st.variant}) step {st.steps} p {positions.view(-1)[:2].tolist()}: y relRMS "
                      f"static vs SGLang {_relrms(y, ref):.3e} (norms {y.float().norm():.4g}, {ref.float().norm():.4g})")
+                if DETAIL:
+                    _detail(f"attn L{st.layer} y", y, ref)
+                if DUMPDIR:
+                    _dump_cmp(st, f"attn{st.layer:02d}_y", y, ref)
             if PROBE and _rank() == 0 and st.steps <= 2 and st.layer in (0, 2, 3):
                 try:
                     _probe(st, positions, forward_batch)
@@ -791,6 +862,10 @@ def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
             _STATE["checks"] += 1
             _log(f"check MoE L{st.layer} step {st.steps}: y relRMS static vs SGLang {_relrms(s.bfloat16(), ref):.3e} "
                  f"(norms {s.norm():.4g}, {ref.float().norm():.4g})")
+            if DETAIL:
+                _detail(f"moe L{st.layer} y", s.bfloat16(), ref)
+            if DUMPDIR:
+                _dump_cmp(st, f"moe{st.layer:02d}_y", s.bfloat16(), ref)
         if KEEP == "sgl":
             return out
     else:
@@ -1000,6 +1075,16 @@ def _mhc_end(st, orig, hc, out, residual, stats_stream, next, world_size, precom
             msg += " bits " + " ".join(str(int(w[k].contiguous().view(torch.int16).sum(dtype=torch.int64)))
                                        for k in ("streams_out", "h_pre", "x_out") if k in w)
         _log(msg + f" (next {'yes' if next is not None else 'no'})")
+        if DETAIL:
+            _detail(f"mHC {tag} L{st.layer} R'", w["streams_out"], state.streams.flatten(1))
+            _detail(f"mHC {tag} L{st.layer} pre", w["h_pre"], state.pre)
+            if "gamma_next" in w and rows is not None:
+                _detail(f"mHC {tag} L{st.layer} x", w["x_out"], rows)
+        if DUMPDIR:
+            _dump_cmp(st, f"{tag}{st.layer:02d}_Rprime", w["streams_out"], state.streams.flatten(1))
+            _dump_cmp(st, f"{tag}{st.layer:02d}_pre", w["h_pre"], state.pre)
+            if "gamma_next" in w and rows is not None:
+                _dump_cmp(st, f"{tag}{st.layer:02d}_x", w["x_out"], rows)
     return state if KEEP == "sgl" else st.hc_state(next, _mhc)
 
 
