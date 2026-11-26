@@ -465,6 +465,25 @@ python -u full_decode.py \
 
 ### 8.3 真正的验收（goal 指定的那条链）
 
+#### 先决条件：goal 里那三个变量**不足以**选中出 NaN 的那条链（11-26 查清）
+
+| 变量 | 默认 | 为什么必须显式设 |
+|---|---|---|
+| `DSV41_STATIC_MHC` | **0（关）** | mHC 是模型 Block 的一部分（`hc_mult=4`），也是**唯一**把 sublayer 的收尾（交换区上的 all-reduce）放进内核的开关。MHC=0 时那部分留在 SGLang 自己的代码里 —— 被测的是**另一条链**。 |
+| `DSV41_STATIC_TPBAR` | **1（当 MHC=1）** | 每 sublayer 一个 **host** 栅栏，**11-26 才加**。它会**掩盖**内核栅栏失效：栅栏坏了也照样 finite。要证明内核栅栏本身够用，必须 `TPBAR=0`。 |
+| `DSV41_STATIC_TPB` | 1 | 内核内的起点栅栏（本次修复）。`TPB=0` 是反向对照。 |
+
+**证据**：11-25 的 `l2_nan.log` banner 是 `patched SGLang: attention all, MoE all (replace, PDL False)` ——
+**没有** `TPBAR=` 字样，而 `DSV41_STATIC_TPBAR` 的引入 commit 是 `2a69b646`（2026-11-26）。
+所以那次确实**没有任何跨 rank 同步**，NaN 与根因一致。
+反过来，今天再按老命令跑，`TPBAR` 会默认打开、把漂移盖住 —— 于是"修好了"可能只是"被 host 对齐了"。
+
+为此：
+1. hook 的 banner 现在打印 `MHC= TPBAR= TPB= engram=`（`dsv41_static_hook.py`），
+   日志能自证跑的是哪条链；
+2. `accept.sh` 显式设 `MHC=1 TPB=1 TPBAR=0`，并**断言** banner 里就是这个组合，
+   否则返回 9 而不是继续比数。
+
 **用 `l2_golden.py`，不是 `golden_all.py`。** `golden_all.py` 只跑 stock SGLang（生成 golden 本身）；
 验收需要的是**同一个脚本、同一 prompt、全 40 层静态**，而 `l2_golden.py` 正是这个：
 它走真实 32K prefill、`DSV41_STATIC_*` 生效、写出与 golden 完全同 schema 的 jsonl。

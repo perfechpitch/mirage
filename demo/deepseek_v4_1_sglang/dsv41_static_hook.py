@@ -1255,4 +1255,10 @@ if S2_DEFER:
 print(f"[dsv41_static] patched SGLang: attention {'all' if ATTN is None else sorted(ATTN)}, MoE "
       f"{'all' if MOE is None else sorted(MOE)} ({'check, keep ' + KEEP if CHECK else 'replace'}, PDL {PDL}"
       f"{', S2 argmax' if S2_ARGMAX else ''}{', S2 deferred greedy' if S2_DEFER else ''}"
-      f"{', head argmax' if HEAD_ARGMAX else ''})", flush=True)
+      f"{', head argmax' if HEAD_ARGMAX else ''}) "
+      # mHC / TPBAR / TPB decide whether the sublayer's end is in the kernel and whether anything lines the TP ranks
+      # up (dsv41_static_hook.py:206 and dsv41_static_layer.tpb_flag). Without them in the banner a run cannot say
+      # which chain it was: MHC defaults to 0, so the three DSV41_STATIC_* variables in the usual command do NOT
+      # select the mHC chain, and TPBAR defaults to a host barrier that hides a broken kernel one.
+      f"MHC={int(MHC)} TPBAR={int(TPBAR)} TPB={int(TPB)} engram={'off' if not ENGRAM else int(ENGRAM)}",
+      flush=True)

@@ -32,12 +32,24 @@ mkdir -p "$OUT"
 
 run_static() {   # run_static <row> <out-file> <static:1|0>
   local row=$1 out=$2 stat=$3
-  local envs=(DSV41_STATIC_ATTN=all DSV41_STATIC_MOE=all DSV41_STATIC_POOL=1)
+  # The configuration is the model's, not a subset of it. mHC=1 is part of DeepSeek-V4.1's Block (hc_mult=4) and it
+  # is what puts the sublayer's end -- the all-reduce over the exchange region -- inside the kernel; with mHC=0 that
+  # work stays in SGLang's own code and the chain under test is a different one. (dsv41_static_hook.py: MHC defaults
+  # to 0, so the goal's three variables alone do NOT select the static chain the NaN was measured in.)
+  #
+  # TPBAR=0 is deliberate: DSV41_STATIC_TPBAR (default 1 when MHC=1) is a host barrier after every sublayer, added
+  # 11-26, and it masks exactly the failure this run is supposed to prove gone -- with it on, a broken kernel barrier
+  # would still come out finite because the ranks are lined up on the host. TPB=1 is the kernel's own start barrier.
+  # So this run asks the strong question: does the chain reproduce the engine with NO host round trip at all?
+  local envs=(DSV41_STATIC_ATTN=all DSV41_STATIC_MOE=all DSV41_STATIC_POOL=1 DSV41_STATIC_MHC=1
+              DSV41_STATIC_TPB=1 DSV41_STATIC_TPBAR=0)
   # the baseline must be provably stock: boot/sitecustomize.py loads the hook only when DSV41_STATIC_ATTN or
   # DSV41_STATIC_MOE is non-empty, and `env` without -u would inherit an export from this shell and quietly make
   # the control a second static run. Unset them explicitly, then check the log for the hook's banner below.
-  [ "$stat" = "0" ] && envs=(-u DSV41_STATIC_ATTN -u DSV41_STATIC_MOE -u DSV41_STATIC_POOL -u DSV41_STATIC_CHECK)
+  [ "$stat" = "0" ] && envs=(-u DSV41_STATIC_ATTN -u DSV41_STATIC_MOE -u DSV41_STATIC_POOL -u DSV41_STATIC_CHECK
+                             -u DSV41_STATIC_MHC -u DSV41_STATIC_TPB -u DSV41_STATIC_TPBAR)
   echo "=== row $row, static=$stat -> $out"
+  echo "    ${envs[*]:-stock SGLang, no DSV41_STATIC_*}"
   timeout "${TIMEOUT:-5400}" env "${envs[@]}" python l2_golden.py \
       --model "$MODEL" --row "$row" --tokens "$TOKENS" --topk 32 --batch 1 \
       --tag $([ "$stat" = "1" ] && echo static || echo baseline) \
@@ -55,7 +67,15 @@ run_static() {   # run_static <row> <out-file> <static:1|0>
       echo "    INVALID: the static run patched only ${np:-0} processes (< $SGL_TP); the hook did not reach every rank"
       return 9
     fi
-    echo "    hook loaded in ${np} processes"
+    # and it ran the chain this script intends: mHC in the kernels, the kernel's barrier on, and NO host barrier
+    # (TPBAR would line the ranks up and hide a broken kernel barrier -- the whole point of this run).
+    local want="MHC=1 TPBAR=0 TPB=1"
+    if ! grep -qa "MHC=1 TPBAR=0 TPB=1" "$out.log"; then
+      echo "    INVALID: not the chain this script means to test (want '$want'); the banner says:"
+      grep -am1 -o "MHC=.*" "$out.log" | sed 's/^/      /'
+      return 9
+    fi
+    echo "    hook loaded in ${np} processes, chain: $want"
   elif [ "${np:-0}" -ne 0 ]; then
     echo "    INVALID: the baseline loaded the hook (${np} processes); a DSV41_STATIC_* leaked into it"
     return 9
