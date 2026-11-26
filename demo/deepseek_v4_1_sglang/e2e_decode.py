@@ -359,8 +359,10 @@ if DEBUG:   # now the GPU is idle: what the polled buffers hold AFTER the step s
     # It is the state at the END of the step, so a NaN cascade smears everything after the first bad layer: to
     # read the census right at the failure, run DSV41_E2E_LAYERS=5, whose last layer is the first one that goes
     # NaN (attn L4), instead of a 6-layer chain where L5 is last.
-    log = os.environ.get("DSV41_E2E_DBGLOG")
-    if log and os.path.exists(log):
+    # (dbglog, not log: `log` is this module's print helper at line 72, and naming a local `log` here shadowed it
+    # -- ast.parse cannot see that, the run fails with "'str' object is not callable" at the census print.)
+    dbglog = os.environ.get("DSV41_E2E_DBGLOG")
+    if dbglog and os.path.exists(dbglog):
         import ctypes
         import importlib.util
         from cuda.bindings import runtime as rt
@@ -377,7 +379,7 @@ if DEBUG:   # now the GPU is idle: what the polled buffers hold AFTER the step s
             "_db", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dump_buffers.py"))
         db = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(db)
-        ents = [e for e in db.resets(log) if e["rank"] == RANK]
+        ents = [e for e in db.resets(dbglog) if e["rank"] == RANK]
         # the layer's declarations, for the buffer names: <out>/rank<R>/<attn|moe><layer>_t<T>/build/layer.cu
         def _cu(kind):
             return os.path.join(a.out, f"rank{RANK}", f"{kind}0_t{T}", "build", "layer.cu")
@@ -385,7 +387,7 @@ if DEBUG:   # now the GPU is idle: what the polled buffers hold AFTER the step s
         decls = db.declarations(cu) if cu else []
         with open(f"{a.out}/buffers_rank{RANK}.txt", "w") as fh:
             if not ents:
-                fh.write(f"no [rl] rank {RANK} line in {log}: DSV41_RESET_DEBUG=1 was not on, or the stderr went "
+                fh.write(f"no [rl] rank {RANK} line in {dbglog}: DSV41_RESET_DEBUG=1 was not on, or the stderr went "
                          "elsewhere\n")
             for label, n, v, rd, n_nan, nff, nz, first in db.analyze(
                     RANK, ents, decls, copy=lambda p, k: _dev_bytes(p, k)):
