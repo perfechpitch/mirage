@@ -160,6 +160,9 @@ __device__ __forceinline__ void sa_q_parts(float const *part,
     ok[pp] = false;
   }
   bool all;
+#ifdef DSV41_SA_QPOLL_DEBUG
+  int spin = 0;
+#endif
   do {
     all = true;
 #pragma unroll
@@ -191,6 +194,25 @@ __device__ __forceinline__ void sa_q_parts(float const *part,
     if (!all && real) {
       poll_pause(STATIC_POLL_NS);
     }
+#ifdef DSV41_SA_QPOLL_DEBUG
+    // A bounded wait: a task that polls for ever says what it polled (the bytes there) and then leaves, so
+    // the kernel ends and the printf reaches the host. Off unless DSV41_STATIC_FLAGS=-DDSV41_SA_QPOLL_DEBUG.
+    if (++spin == 20000000) {
+      if (threadIdx.x < 8) {            // the pollers that never saw q written: which columns, which bytes
+        int bad = -1;
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+          if (bad < 0 && !validf4(v[0][k])) bad = k;
+        }
+        int const ii = threadIdx.x + 256 * (bad < 0 ? 0 : bad);
+        uint32_t const *w4 = reinterpret_cast<uint32_t const *>(src + 4 * ii);
+        printf("[sa_q] t %d g %d bad %d i %d: %08x %08x %08x %08x base %08x\n", t, g, bad, ii,
+               w4[0], w4[1], w4[2], w4[3],
+               (unsigned)((unsigned long long)(uintptr_t)part & 0xFFFFFFFFu));
+      }
+      break;
+    }
+#endif
   } while (!all && real);
 #pragma unroll
   for (int k = 0; k < 8; k++) {

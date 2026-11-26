@@ -485,7 +485,12 @@ class StaticAttn(MhcMixin):
                                  sw))
             os.environ["HC_DRY"] = os.environ.get("HC_DRY_ATTN", "0")
         out = os.path.join(out_root, f"rank{rank}", f"attn{layer}" + (f"_t{T}" if T != 8 else ""))   # (each T its own: its .so)
-        flags = ["-DSTATIC_RESET_IN_KERNEL", f"-DSTATIC_PDL_TRIGGER={int(pdl)}"] + os.environ.get("DSV41_STATIC_FLAGS", "").split()
+        flags = [f"-DSTATIC_PDL_TRIGGER={int(pdl)}"] + os.environ.get("DSV41_STATIC_FLAGS", "").split()
+        # DSV41_STATIC_SERVING=0: the host reset path (static_launch memsets every buffer before each launch, and the
+        # kernel always runs its TP start barrier). The serving build resets only 3 buffers per launch and leaves the
+        # 7 by_reader ones to their readers, so whatever the harness wrote into them is consumed once.
+        if os.environ.get("DSV41_STATIC_SERVING", "1") != "0":
+            flags.insert(0, "-DSTATIC_RESET_IN_KERNEL")
         if PROF_SHARE:
             flags.append("-DSTATIC_STAMP_REBIND")
         if XFLAG:
@@ -717,7 +722,12 @@ class StaticMoE(MhcMixin):
             hw = head_demo.head_tensors(read, tp, rank, dev, sw)
             w.update({k: hw[k] for k in ("head_w", "logits", "head_ids") if k in hw})
         out = os.path.join(out_root, f"rank{rank}", f"moe{layer}" + (f"_t{T}" if T != 8 else ""))
-        flags = ["-DSTATIC_RESET_IN_KERNEL", f"-DSTATIC_PDL_TRIGGER={int(pdl)}"] + os.environ.get("DSV41_STATIC_FLAGS", "").split()
+        flags = [f"-DSTATIC_PDL_TRIGGER={int(pdl)}"] + os.environ.get("DSV41_STATIC_FLAGS", "").split()
+        # DSV41_STATIC_SERVING=0: the host reset path (static_launch memsets every buffer before each launch, and the
+        # kernel always runs its TP start barrier). The serving build resets only 3 buffers per launch and leaves the
+        # 7 by_reader ones to their readers, so whatever the harness wrote into them is consumed once.
+        if os.environ.get("DSV41_STATIC_SERVING", "1") != "0":
+            flags.insert(0, "-DSTATIC_RESET_IN_KERNEL")
         if engram or head:   # the gate / the head's GEMM waits on the post's counter: a release (tasks/engram_gate.cuh)
             fast = "-DHCP_FAST_END" in flags
             flags = [f for f in flags if f != "-DHCP_FAST_END"]

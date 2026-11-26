@@ -106,3 +106,7 @@ benchmark/microbench/*.json
 
 # profiler CSV dumps written next to the demo
 /demo/qwen3/mirage_*.csv
+
+# a static-layer build cache dir named "1" (MIRAGE_STATIC_BUILD_CACHE is a DIRECTORY, not a flag: a script that
+# set it to the boolean-looking "1" left the nvcc output of 80 layers here)
+/demo/deepseek_v4_1_sglang/1/

@@ -114,8 +114,14 @@ __device__ __forceinline__ void
     tma3_l2(j.wsf, 0, 0, j.rb * j.ktall + kt, EVICT_LAST);
   }
   if (wait0) { // weights_after: its node has finished a task
+    int spin0 = 0;
     while (cnt_ld(wait0) == 0) {
       poll_pause(FP8_POLL_NS);
+#ifdef DSV41_SA_QPOLL_DEBUG
+      if (++spin0 == 40000000 && threadIdx.x == 0) {
+        printf("[g13] stuck in wait0 (the weights_after counter) sm %d\n", (int)blockIdx.x);
+      }
+#endif
     }
   }
   int const g0 = g;
@@ -165,8 +171,17 @@ __device__ __forceinline__ void
     }
   }
   if (act_cnt) {
+#ifdef DSV41_SA_QPOLL_DEBUG
+    int spin1 = 0;
+#endif
     while (cnt_ld(act_cnt) < act_target) { // the poll interval: FP8_POLL_NS
       poll_pause(FP8_POLL_NS);
+#ifdef DSV41_SA_QPOLL_DEBUG
+      if (++spin1 == 40000000 && threadIdx.x == 0) {
+        printf("[g13] stuck in act_cnt: have %u need %u sm %d\n", cnt_ld(act_cnt), act_target,
+               (int)blockIdx.x);
+      }
+#endif
     }
     STAGE_STAMP(FP8_STAMP == 2)
     asm volatile("fence.proxy.async.global;" ::: "memory");
@@ -301,6 +316,17 @@ __device__ __noinline__ int
     }
 #endif
     int const row0 = j.rb * 128;
+#ifdef DSV41_SA_QPOLL_DEBUG
+    // The q parts: what this tile actually stores per token. 0xFFFFFFFF here is a NaN the consumer would
+    // wait for for ever (its "written" test is bits != 0xFFFFFFFF).
+    if (mode == COMBINE_SLOTS && row0 == 0 && threadIdx.x == 64) {
+      printf("[g13] sm %d store row %d t0..7: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+             (int)blockIdx.x, row, (uint32_t)__float_as_uint(v[0]), (uint32_t)__float_as_uint(v[1]),
+             (uint32_t)__float_as_uint(v[2]), (uint32_t)__float_as_uint(v[3]),
+             (uint32_t)__float_as_uint(v[4]), (uint32_t)__float_as_uint(v[5]),
+             (uint32_t)__float_as_uint(v[6]), (uint32_t)__float_as_uint(v[7]));
+    }
+#endif
     switch (mode) {
       case COMBINE_SLOTS:
         tile_epilogue<COMBINE_SLOTS>(out, N, row0, split, row, v);
@@ -619,6 +645,14 @@ __device__ __forceinline__ void run_gemm_fp8_tile(Maps const &maps,
     } else if (warp == 6) {
       L.gi1 = rg;
     }
+#ifdef DSV41_SA_QPOLL_DEBUG
+    if constexpr (SELF::buf == 5) {   // wq_b's q parts: the node sparse_attn polls for
+      if (threadIdx.x == 0) {
+        printf("[g13] enter r%d task (%d,%d,%d) sm %d out %08x\n", (int)g.rank, tk.x, tk.y, tk.z,
+               (int)blockIdx.x, (unsigned)((unsigned long long)(uintptr_t)out & 0xFFFFFFFFu));
+      }
+    }
+#endif
   };
   if constexpr (FUSED) {
     // the loader (warp 0) issues the job's weights first (it does not wait:

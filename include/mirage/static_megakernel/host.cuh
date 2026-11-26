@@ -514,6 +514,16 @@ static void build_maps(Maps &maps,
 // and the re-armed buffers filled for the first launch
 static void build_serving(GpuState &s) {
   G &g = s.g;
+  if (getenv("DSV41_RESET_DEBUG")) {   // which buffers each side resets: serving (in-kernel) vs the host path
+    int rb = 0;
+    for (BufReset const &b : s.resets) {
+      rb += b.by_reader ? 1 : 0;
+      fprintf(stderr, "[rl] rank %d: p %p bytes %zu stride %zu v %u by_reader %d\n", (int)s.g.rank, (void *)b.p,
+              b.bytes, b.stride, (unsigned)b.value, (int)b.by_reader);
+    }
+    fprintf(stderr, "[rl] rank %d: %zu resets, %d by_reader, %zu for the kernel\n", (int)s.g.rank, s.resets.size(),
+            rb, s.resets.size() - rb);
+  }
   g.gen_ptr = dmalloc<unsigned>(s, 4);
   g.arrive = dmalloc<unsigned>(s, 4);
   MKS_CK(cudaMemset(g.gen_ptr, 0, 4));
@@ -831,6 +841,20 @@ static bool static_host_rebind(int r, std::string const &name, void *p) {
   using namespace static_host;
   GpuState &s = g_gpus[r];
   bool found = false; STATIC_X_FLAG_REBIND(s.g, name, p) STATIC_STAMP_REBIND_(s.g, name, p) // H1, stamps (core.cuh)
+#ifdef STATIC_RESET_IN_KERNEL
+  // "@prime": re-arm the buffers the reader re-arms (by_reader: memset once at build and then only by their
+  // readers), which a harness that wrote into them after the build (random_inputs: the KV caches) otherwise
+  // leaves as data the first launch consumes as if a producer had published it. p is not used.
+  if (name == "@prime") {
+    for (BufReset const &b : s.resets) {
+      if (b.by_reader) {
+        MKS_CK(cudaMemset(b.p, b.value, b.bytes));
+      }
+    }
+    MKS_CK(cudaMemset(s.g.stamps, 0, NSM * NSTAMP * 8));
+    return true;
+  }
+#endif
   auto const bufs = slot_args(s.args, "buf.", MAX_BUFS);
   for (int i = 0; i < MAX_BUFS; i++) {
     if (!bufs[i].empty() && bufs[i][0] == "tensor" && bufs[i][1] == name) {

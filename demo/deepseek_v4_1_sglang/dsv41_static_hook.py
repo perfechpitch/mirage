@@ -40,6 +40,14 @@ def _ids(name):
 ATTN, MOE = _ids("DSV41_STATIC_ATTN"), _ids("DSV41_STATIC_MOE")   # None: every layer
 CHECK = os.environ.get("DSV41_STATIC_CHECK", "0") != "0"
 CHECK_STEPS = int(os.environ.get("DSV41_STATIC_CHECK_STEPS", "3"))   # check mode, mHC in the kernels: steps printed per sublayer
+# DSV41_STATIC_CHECK_LAYERS=0,20: compare only these layers (empty: every static layer).  One layer answers "does the
+# static kernel compute SGLang's sublayer" as well as forty do, and it answers in seconds instead of an hour: each
+# comparison runs both kernels on a 32K KV, which is the whole cost of the check.
+CK_LAYERS = {int(x) for x in os.environ.get("DSV41_STATIC_CHECK_LAYERS", "").split(",") if x.strip()}
+
+
+def _ck(layer: int) -> bool:
+    return not CK_LAYERS or layer in CK_LAYERS
 CHECK_BITS = os.environ.get("DSV41_STATIC_CHECK_BITS", "0") != "0"   # and the static outputs' integer sums with each line
 PROBE = os.environ.get("DSV41_STATIC_PROBE", "0") != "0"
 POOL = os.environ.get("DSV41_STATIC_POOL", "1") != "0"
@@ -124,6 +132,32 @@ assert not (SMALL and os.environ.get("DSV41_X_FLAG", "0") != "0"), "DSV41_STATIC
 assert not (SMALL and ENGRAM and not ENGRAM2), "DSV41_STATIC_ROWS: with DSV41_ENGRAM=2 (or no Engram), not 1"
 
 
+_WHY_LOGGED = set()
+
+
+def _why_skip(layer, mode, rows, sd, extra: str) -> None:
+    """Check mode, rank 0: say ONCE per (layer, rows) why a forward did not run the static layer.
+
+    Without this a guard that does not hold is indistinguishable from a hook that was never
+    loaded: the patched forward falls back to SGLang's own kernel silently, the run prints
+    nothing but its output ids, and the check reads as "no news".  Both skips that cost us a
+    run are logged here: a non-decode (extend) step, which with `--tokens 1` is the whole run
+    (SGLang samples the first token in the prefill, so there is no decode step to check), and
+    a decode step of the wrong row count (the static layers are built for T rows and check
+    mode refuses others)."""
+    if not CHECK or _rank() != 0:
+        return
+    kind = "decode" if mode.is_decode() else "prefill/extend"
+    key = (layer, kind, rows, extra)   # (the reason is part of the key: the SAME rows with another reason is news)
+    if key in _WHY_LOGGED:
+        return
+    _WHY_LOGGED.add(key)
+    _log(f"L{layer}: {kind} step of {rows} rows NOT checked -- {extra}; "
+         f"T={T}, ok_rows={_ok_rows(rows)}, sd={'set' if sd is not None else None}, "
+         f"POOL={POOL}, MHC={MHC}, mode={mode}, serving={_STATE['serving']}, "
+         f"started={_STATE['started']}")
+
+
 def _ok_rows(rows: int) -> bool:
     """A decode step of this many rows runs the static layers: T, or with DSV41_STATIC_ROWS (and not in check mode) 1 .. T;
     with DSV41_STATIC_T up to its largest T (check mode: exactly one of them)."""
@@ -138,8 +172,9 @@ os.environ.setdefault("MIRAGE_STATIC_BUILD_CACHE", os.path.join(OUT, "cache"))
 _orig_init = _mr.ModelRunner.init_cuda_graphs
 _orig_attn = _v4.MQALayer.forward
 _orig_moe = _dv2.DeepseekV2MoE.forward
-_STATE = {"tp_group": None, "started": False, "serving": False}   # serving: past init_cuda_graphs (SGLang's warmup and
-                                                                  # autotune run dummy prefill and decode steps there)
+_STATE = {"tp_group": None, "started": False, "serving": False, "checks": 0}   # serving: past init_cuda_graphs (SGLang's
+                                                                  # warmup and autotune run dummy prefill and decode steps there)
+                                                                  # checks: sublayer comparisons printed (check mode)
 
 
 def _rank():
@@ -153,6 +188,22 @@ def _log(msg):
 def _relrms(a, b):
     a, b = a.double(), b.double()
     return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
+
+
+TPBAR = os.environ.get("DSV41_STATIC_TPBAR", "1" if MHC else "0") != "0"   # a TP barrier after each sublayer's kernel
+
+
+def _tpb(what: str = "") -> None:
+    """The ranks in lockstep at a sublayer boundary, before the next kernel launches.
+
+    With mHC in the kernels (DSV41_STATIC_MHC=1) the all-reduce is in the kernel too, so SGLang's own one (a
+    collective, and therefore the only thing that lined the TP ranks up) is skipped: sum_store then writes
+    exchange set (n+1) % 2 while a peer polls set n % 2, and hc_post_combine's CTAs never end (e2e_decode.py's
+    watchdog dumps). This is what launch_func does host-side for a one-process chain (chain_spike.py,
+    full_decode.py), for a process a rank. Cheap: an NCCL barrier, next to a launch's host cost."""
+    if TPBAR and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        g = _STATE.get("tp_group")
+        torch.distributed.barrier(group=g if g is not None else torch.distributed.group.WORLD)
 
 
 def _active():
@@ -312,6 +363,15 @@ def _init_cuda_graphs(self, *args, **kwargs):
             torch.distributed.barrier(group=_STATE["tp_group"])
     out = _orig_init(self, *args, **kwargs)
     _STATE["serving"] = True
+    _log(f"static layers serving: T={T}, TS={TS}, check={CHECK}, AR={AR}, MHC={MHC}, POOL={POOL}, KEEP={KEEP}, "
+         f"TPBAR={TPBAR}, "
+         f"check layers={sorted(CK_LAYERS) or 'all'}, steps<={CHECK_STEPS}; compared {_STATE['checks']} sublayers so far")
+    if not CHECK and not TPBAR and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        # the ranks launch the same sublayer sequence from 8 processes: without a barrier after each kernel one
+        # rank runs a layer ahead and writes a buffer a peer still reads -- the leading explanation for the first
+        # Reuse layer returning NaN with a finite input (FINDINGS_correctness.md §4: L3 or L4, by timing).
+        _log("WARNING: TPBAR=0 in a pure static chain (check=0, 8 ranks): the ranks are not kept in lockstep. "
+             "That is the leading explanation for NaN from the first Reuse layer on; DSV41_STATIC_TPBAR=1 rules it out")
     return out
 
 
@@ -400,13 +460,53 @@ def _probe(st, positions, forward_batch):
              f"{_relrms(a, k[:512]):.2e}, score relRMS {_relrms(b, k[512:]):.2e}; p {p}")
 
 
+def _log_tables(tables, core, positions, rpi, rows: int) -> None:
+    """DSV41_STATIC_NAN: once, the step's tables as filled vs SGLang's own core metadata.
+
+    The static kernels read their KV locations from StepTables, which is filled from SGLang's core
+    metadata; nothing else checks that the copy is faithful.  A shape mismatch there is silent in
+    both directions -- the copy broadcasts or truncates, the kernel reads a row that belongs to
+    another token, and the layer's output is wrong (NaN once the values are large enough) while
+    every buffer, id and scale looks fine."""
+    msg = [f"rows {rows} positions {positions.view(-1)[:rows].tolist()} rpi {rpi.view(-1)[:rows].tolist()}"]
+    t = tables.t
+    for name in ("swa_page_indices", "swa_out_cache_loc", "page_table", "seq_lens", "positions"):
+        v = getattr(core, name, None)
+        if v is None:
+            continue
+        shape = tuple(v.shape) if hasattr(v, "shape") else None
+        sample = v.view(-1)[:6].tolist() if hasattr(v, "view") else None
+        msg.append(f"core.{name} {shape} {sample}")
+    for k, v in t.items():
+        msg.append(f"table.{k} {tuple(v.shape)} {v.view(-1)[:6].tolist()}")
+    for r, p in tables.pages.items():
+        msg.append(f"pages[{r}] {tuple(p.shape)} {p.view(-1)[:6].tolist()}")
+    # the window's rows: SGLang's list vs the copy's, element by element for row 0
+    spi, wr = getattr(core, "swa_page_indices", None), t.get("window_rows")
+    if spi is not None and wr is not None and spi.shape[-1] == wr.shape[-1]:
+        eq = bool(torch.equal(spi[:rows].to(wr.dtype), wr[:rows]))
+        msg.append(f"window_rows copied exactly: {eq}")
+    else:
+        msg.append(f"window_rows SHAPE MISMATCH: core {tuple(spi.shape) if spi is not None else None} vs table "
+                   f"{tuple(wr.shape) if wr is not None else None}")
+    _log("tables " + " | ".join(msg))
+
+
 def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_reduce=False):
     st = getattr(self, "_dsv41", None)
     if st is None or not _active():
+        _why_skip(getattr(st, "layer", -1), forward_batch.forward_mode, x.shape[0], st,
+                  f"attached={st is not None}, active={_active()} "
+                  f"(no layer object or the hook is not past engine init)")
         return _orig_attn(self, x, positions, forward_batch, x_quant, defer_all_reduce)
     mode, rows = forward_batch.forward_mode, x.shape[0]
     sd = _pick(self, rows) if mode.is_decode() and rows > T else st   # (DSV41_STATIC_T: the layer of the smallest T >= rows)
-    if sd is not None and mode.is_decode() and _ok_rows(rows) and (rows == sd.T or POOL) and defer_all_reduce:
+    take = (sd is not None and mode.is_decode() and _ok_rows(rows)
+            and (rows == sd.T or POOL) and defer_all_reduce)
+    if not take:
+        _why_skip(st.layer, mode, rows, sd,
+                  f"defer_all_reduce={defer_all_reduce} (SGLang's mHC boundary path passes True)")
+    if take:
         st, S = sd, _set(sd.T)
         rpi = forward_batch.req_pool_indices[:rows]
         if not POOL:
@@ -417,6 +517,9 @@ def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_red
         if POOL and st.layer == S["first"]:
             fm = _v4.get_attn_backend().forward_metadata
             S["tables"].fill(getattr(fm, "core_attn_metadata", None) or fm.core_metadata, positions, rpi, rows)
+            if NANCHK and not _STATE.get("tables_logged"):
+                _STATE["tables_logged"] = True
+                _log_tables(S["tables"], getattr(fm, "core_attn_metadata", None) or fm.core_metadata, positions, rpi, rows)
         if not _STATE["started"]:
             capturing = torch.cuda.is_current_stream_capturing()
             _log(f"first static decode step (L{st.layer}): " + ("in a CUDA graph capture" if capturing else
@@ -452,15 +555,20 @@ def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_red
                 if emb.shape[0] < st.T:   # (DSV41_STATIC_ROWS / _T) T rows, the idle rows' 0
                     emb = torch.cat([emb, emb.new_zeros(st.T - emb.shape[0], emb.shape[1])])
             y = st.run(x, positions, st.R, emb=emb, ids=eg_ids)
+            _tpb(f"attn L{st.layer}")
             st.R = None
             _STATE["pending"] = st
             return out if CHECK else _mhc.AttnOutput(y)
         if CHECK:
             out = _orig_attn(self, x, positions, forward_batch, x_quant, defer_all_reduce)
+            if not _ck(st.layer):   # (DSV41_STATIC_CHECK_LAYERS) this layer is not compared: SGLang's own y, no static run
+                return out
             ref = out.partial if isinstance(out, _mhc.AttnOutput) else out
             y = _run_stats(st, x, positions)
             torch.cuda.synchronize()
-            if _rank() == 0 and st.steps <= 4:
+            if _rank() == 0 and st.steps <= CHECK_STEPS:
+                _STATE["checks"] += 1
+                _STATE["write_checks"]()
                 _log(f"check attn L{st.layer} ({st.variant}) step {st.steps} p {positions.view(-1)[:2].tolist()}: y relRMS "
                      f"static vs SGLang {_relrms(y, ref):.3e} (norms {y.float().norm():.4g}, {ref.float().norm():.4g})")
             if PROBE and _rank() == 0 and st.steps <= 2 and st.layer in (0, 2, 3):
@@ -469,7 +577,11 @@ def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_red
                 except Exception as e:   # a probe must not end the run
                     _log(f"probe L{st.layer} failed: {type(e).__name__}: {e}")
             return out if KEEP == "sgl" else _mhc.AttnOutput(y)
+        if REUSE_PROBE and POOL and st.layer in (3, 4) and st.steps == 0:
+            _reuse_probe(st, S["tables"], positions)
         y = _run_stats(st, x, positions)
+        _tpb(f"attn L{st.layer}")
+        _finite("attn", st, y, x)
         return y if AR else _mhc.AttnOutput(y)
     if POOL:
         return _orig_attn(self, x, positions, forward_batch, x_quant, defer_all_reduce)
@@ -498,13 +610,111 @@ def _run_stats(st, *args):
     return y
 
 
+REUSE_PROBE = os.environ.get("DSV41_STATIC_REUSE_PROBE", "0") != "0"
+
+
+def _reuse_probe(st, tables, positions):
+    """Inspect the actual pool rows addressed by B=1 reuse attention before launch."""
+    if st.variant != "reuse" or positions.numel() != 1 or torch.cuda.is_current_stream_capturing():
+        return
+    p = int(positions.flatten()[0])
+    pool = _v4.get_token_to_kv_pool()
+    kv = pool.get_extra_key_buffer(st.layer).view(torch.uint8).reshape(-1, 288)
+    swa = pool.get_swa_raw_buffer(st.layer).view(torch.uint8).reshape(-1, 528)
+    ids = st.w["compress_idx"][0].long()
+    pages = tables.pages[st.ratio][0]
+    valid = (ids >= 0) & (ids < (p + 1) // st.ratio) & (ids // 128 < pages.numel())
+    rows = pages[ids[valid] // 128].long() * 128 + ids[valid] % 128
+    cgood = (rows >= 0) & (rows < len(kv))
+    # The kernel writes the newest SWA row itself; only inspect historical rows here.
+    wr = tables.t["window_rows"][0, 1:min(p + 1, 128)].long()
+    wgood = (wr >= 0) & (wr < len(swa))
+    cscale = kv[rows[cgood], 256:]
+    wrows = swa[wr[wgood]]
+    _log(f"reuse probe L{st.layer} p={p}: invalid ids={int(((ids != -1) & ~valid).sum())}, "
+         f"bad physical rows={int((~cgood).sum())}, bad FP4 scales={int(((cscale & 127) == 127).sum())}, "
+         f"bad historical SWA rows={int((~wgood).sum())}, "
+         f"bad SWA values={int(((wrows[:, :512] & 127) == 127).sum())}, "
+         f"bad SWA scales={int((wrows[:, 512:] == 255).sum())}")
+
+
+NANCHK = os.environ.get("DSV41_STATIC_NAN", "0") != "0"   # report the first sublayer whose y is not finite
+_NAN_SEEN = set()
+_NAN_DUMPED = set()
+
+
+def _nan_dump(st) -> None:
+    """DSV41_STATIC_NAN: at a layer's first non-finite y, the inputs that could have produced it.
+
+    A finite x with a NaN y means the layer's own K or V is NaN.  For a compressed layer (full_r*
+    and reuse) K is (compressed cache rows, taken at the ids of compress_idx) x (their e4m3 scale
+    bytes), so both halves are read out here: ids past the buffer's rows address memory that is not
+    this layer's cache, and an e4m3 NaN scale (0x7F / 0xFF - the only two bytes with exponent 15
+    and mantissa 7) turns every K of that row into NaN no matter how right the addressing is.  The
+    window cache is a plain byte cache: its NaN comes only from the fp8 bytes SGLang wrote, so it is
+    reported by its contents instead."""
+    w = st.w
+    with torch.no_grad():
+        msg = []
+        ci, cc = w.get("compress_idx"), w.get("compress_cache")
+        if ci is not None:
+            c = ci.detach().cpu()
+            valid = c[c >= 0]
+            msg.append(f"compress_idx {tuple(ci.shape)} min {int(c.min())} max {int(c.max())} "
+                       f"valid {int(valid.numel())}/{c.numel()}")
+            if cc is not None:
+                flat = cc.view(torch.uint8).reshape(-1, 288)   # (rows, the fp4 row: 256 values, 32 scales)
+                rows = flat.shape[0]
+                ok = valid[valid < rows]
+                msg.append(f"compress_cache {rows} rows, ids past them {int((valid >= rows).sum())}")
+                if ok.numel():
+                    b = flat[ok.long().to(flat.device)][:, 256:288].to(torch.int16)
+                    bad = int((((b & 0x7F) == 0x7F)).any(1).sum())
+                    msg.append(f"referenced rows with a NaN/Inf e4m3 scale {bad}/{ok.numel()}")
+        wc = w.get("window_cache")
+        if wc is not None:
+            f = wc.view(torch.uint8)
+            msg.append(f"window_cache {tuple(wc.shape)} bytes 0xFF {int((f == 0xFF).sum())}")
+        _log(f"nan dump L{st.layer} ({st.variant}): " + "; ".join(msg))
+
+
+def _finite(tag: str, st, y, x=None) -> None:
+    """DSV41_STATIC_NAN, rank 0: say once per (sublayer, verdict) whether the static kernel's y is finite.
+
+    The end-to-end symptom of a non-finite sublayer is silent: the argmax of an all-NaN logit row is
+    index 0, so the model decodes 0, 0, 0 ... and every later step conditions on that garbage.  Reading
+    isfinite on each sublayer's y finds the layer where the numbers first go bad instead of inferring it
+    from the tokens.  `x` is checked too: a bad y from a bad x is the previous layer's fault."""
+    if not NANCHK or _rank() != 0:
+        return
+    with torch.no_grad():
+        yok = bool(torch.isfinite(y).all())
+        xok = None if x is None else bool(torch.isfinite(x).all())
+        ymax = float(y.float().abs().max())
+    key = (tag, st.layer, yok, xok)
+    if key in _NAN_SEEN:
+        return
+    _NAN_SEEN.add(key)
+    _log(f"{tag} L{st.layer} step {st.steps}: y finite={yok} (|y|max {ymax:.4g})"
+         + ("" if xok is None else f", x finite={xok}"))
+    if not yok and st.layer not in _NAN_DUMPED:
+        _NAN_DUMPED.add(st.layer)
+        _nan_dump(st)
+
+
 def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
     st = getattr(self, "_dsv41", None)
     rows = hidden_states.shape[0]
     if st is not None and rows > T:   # (DSV41_STATIC_T: the layer of the smallest T >= rows)
         st = _pick(self, rows)
-    if st is None or not _active() or forward_batch is None or not forward_batch.forward_mode.is_decode() or \
-            not _ok_rows(rows) or (rows < st.T and not MHC):
+    take = not (st is None or not _active() or forward_batch is None
+                or not forward_batch.forward_mode.is_decode()
+                or not _ok_rows(rows) or (rows < st.T and not MHC))
+    if not take:
+        if st is not None and forward_batch is not None:
+            _why_skip(st.layer, forward_batch.forward_mode, rows, st,
+                      f"active={_active()} fb={forward_batch is not None} "
+                      f"rows<st.T={rows < st.T} MHC={MHC}")
         return _orig_moe(self, hidden_states, forward_batch, *args, **kwargs)
     if not _ATTNS and not _STATE.get("moe_started"):   # (no static attention on this rank: the MoE layers report the first step)
         _STATE["moe_started"] = True
@@ -521,6 +731,7 @@ def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
             emb = m.embed_rows(ids[:, m.layer_hash_index], forward_batch, False).flatten(-2).to(torch.bfloat16).contiguous()
         v = st.variants.get(rows, st) if rows < st.T else st   # (DSV41_STATIC_ROWS: the build of these live rows, if any)
         y = v.run(x, st.R, emb=emb)
+        _tpb(f"moe L{st.layer}")
         if st.engram:
             st.eg_fresh = True   # (this forward's R'': the next Engram layer's forward passes it on, check mode compares it)
         st.R = None
@@ -538,6 +749,8 @@ def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
         else:
             ref = out if self.reduce_results else sum_post_experts_output(out.clone())
         torch.cuda.synchronize()   # (everything SGLang queued up to here has finished: a fault below is the static layer's)
+        if not _ck(st.layer):   # (DSV41_STATIC_CHECK_LAYERS) not compared: SGLang's own y, no static run
+            return out
         if DUMP:
             os.makedirs(DUMP, exist_ok=True)
             torch.save(hidden_states.cpu(), os.path.join(DUMP, f"x_r{_rank()}_L{st.layer}_s{st.steps}.pt"))
@@ -549,13 +762,15 @@ def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
             raise
         s = y.float().clone()
         torch.distributed.all_reduce(s, group=_STATE["tp_group"])
-        if _rank() == 0 and st.steps <= 4:
+        if _rank() == 0 and st.steps <= CHECK_STEPS:
+            _STATE["checks"] += 1
             _log(f"check MoE L{st.layer} step {st.steps}: y relRMS static vs SGLang {_relrms(s.bfloat16(), ref):.3e} "
                  f"(norms {s.norm():.4g}, {ref.float().norm():.4g})")
         if KEEP == "sgl":
             return out
     else:
         y = _run_stats(st, hidden_states)
+        _finite("MoE", st, y, hidden_states)
     return y if AR or SEAM else _dv2.MergedMoEOutput(y, None, self.experts, 1.0, False)
 
 
@@ -828,6 +1043,19 @@ _dv2.DeepseekV2MoE.forward = _moe_forward
 # torch.argmax's rules: the first maximum, a NaN as the maximum; 2 kernels, 4.3 us GPU at [8, 129280] on a B200 against
 # torch.argmax's 25.0 us reduce_kernel). Only sglang.srt.layers.sampler's torch.argmax calls change (its module's `torch`)
 S2_ARGMAX = bool(os.environ.get("DSV41_S2_ARGMAX"))
+if CHECK:   # the run's verdict on disk: a check that compared nothing must not read as a pass
+
+    def _write_check_count():
+        # written after EVERY comparison, not at exit: l2_check reads it while this process is
+        # still alive (it asks before llm.shutdown()), and an atexit hook would always look like 0
+        for path in (f"/tmp/dsv41_checks_rank{_rank()}.txt",):
+            try:
+                with open(path, "w") as f:
+                    f.write(str(_STATE["checks"]))
+            except OSError:
+                pass
+
+    _STATE["write_checks"] = _write_check_count
 if S2_ARGMAX:
     import fast_argmax as _fa
     import sglang.srt.layers.sampler as _smp

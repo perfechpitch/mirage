@@ -40,10 +40,29 @@ __device__ __forceinline__ void mbar_expect(uint32_t a, uint32_t tx) {
       : "memory");
 }
 __device__ __forceinline__ void mbar_wait(uint32_t a, int ph) {
+#ifdef DSV41_MBAR_DEBUG
+  // A bounded report: the CTA says which barrier it never sees arrive (gridDim names the node: 32 = wq_b).
+  for (long long n = 0;; n++) {
+    uint32_t done;
+    asm volatile(
+        "{\n.reg .pred P;\nmbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\nselp.u32 %0, 1, 0, P;\n}"
+        : "=r"(done)
+        : "r"(a), "r"(ph)
+        : "memory");
+    if (done) {
+      return;
+    }
+    if (n == 20000000) {
+      printf("[mbar] grid %u blk %u warp %u tid %u: never sees %08x ph %d\n", (unsigned)gridDim.x,
+             (unsigned)blockIdx.x, (unsigned)(threadIdx.x >> 5), (unsigned)threadIdx.x, a, ph);
+    }
+  }
+#else
   asm volatile("{\n.reg .pred P;\nW:\nmbarrier.try_wait.parity.shared::cta.b64 "
                "P, [%0], %1;\n@P bra D;\nbra W;\nD:\n}" ::"r"(a),
                "r"(ph)
                : "memory");
+#endif
 }
 
 // a contiguous global range (16-B aligned, bytes a multiple of 16) into shared

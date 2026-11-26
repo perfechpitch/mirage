@@ -599,13 +599,24 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
   // load is in flight while the threads do the resets, which do not need it
   long long t_start = 0;
   unsigned gen = 0;
+  unsigned arrive0 = 0;
   if (threadIdx.x == 0) {
     if constexpr (PDL_TRIGGER == 1) {
       asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     t_start = gtime();
     gen = *(unsigned const volatile *)g.gen_ptr + 1;
+    arrive0 = cnt_ld(g.arrive);
   }
+#ifdef DSV41_RESET_DEBUG
+  // The serving reset's bookkeeping: gen * gridDim.x is the arrival count the wait below needs, so a launch that
+  // reads a stale gen (or a grid of another size) passes before every SM has finished its resets.
+  if (threadIdx.x == 0 && sm_id == 0 && gen <= 2) {
+    printf("[rst] r%d gen %u grid %u arrive0 %u resets %d want %u n0 %llu v0 %u\n", (int)g.rank, gen,
+           (unsigned)gridDim.x, arrive0, g.resets.cnt, gen * (unsigned)gridDim.x,
+           g.resets.cnt ? g.resets.n[0] : 0ull, g.resets.cnt ? g.resets.v[0] : 0u);
+  }
+#endif
   for (int i = 0; i < g.resets.cnt; i++) {
     unsigned const w = g.resets.v[i] * 0x01010101u;
     uint4 const val = make_uint4(w, w, w, w);
@@ -652,6 +663,24 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
 #else
     while ((int)(cnt_ld(g.arrive) - gen * gridDim.x) < 0) {
     } // acquire: every SM of this launch has arrived (wrap-safe)
+#endif
+#ifdef STATIC_TP_BARRIER
+    // A layer per process (StaticKernel.launch_stream): nothing on the host
+    // lines the TP ranks up, so the kernel lines them up. The slot is NOT the
+    // exchange set's (push16 adds rg_set(); this store does not): a peer that
+    // is one launch ahead has written a LARGER gen, and ">= gen" still holds,
+    // so the wait is never satisfied by a stale value from the other set --
+    // which is what made a rank drift deadlock hc_post_combine's 4 CTAs.
+    if (sm_id == 0) {
+      uint4 const hello = make_uint4(gen, gen, gen, gen);
+      push16_mc(g.mc, g.rv, EXCHANGE_HELLO + (size_t)g.rank * 16, hello);
+    }
+    for (int r = 0; r < GPUS; r++) {
+      unsigned const volatile *hp =
+          (unsigned const volatile *)(g.rv + EXCHANGE_HELLO + (size_t)r * 16);
+      while (*hp < gen) {
+      }
+    }
 #endif
     if (sm_id == 0) {
       *g.gen_ptr = gen; // read by the next launch (after this one ends)

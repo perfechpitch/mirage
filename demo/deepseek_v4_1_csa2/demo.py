@@ -137,7 +137,7 @@ def build_graph(mpk: StaticMegakernel, w: dict, variant: str, ratio: int, csrc: 
     """Declare the variant's layer calls on the tensors of w (load_weights and state_tensors). num_gpus > 1: sum_store does the
     all-reduce."""
     compressed, full, reindex = variant != "swa", variant.startswith("full"), variant == "reindex"
-    mpk.poll_ns = 0   # the waits spin (no sleep between polls)
+    mpk.poll_ns = int(os.environ.get("DSV41_POLL_NS", "0"))   # the waits' sleep between polls, ns (0: spin)
     xb = int(mpk.num_gpus > 1)   # sum_store's exchange buffer
     if full or reindex:   # the indexer's tensors need more than config.cuh's default 24 slots (the layer defines STATIC_MAX_BUFS):
         mpk.max_bufs = (36 if full else 30) + xb   # exactly the slots the graph uses (each one more costs every launch)
