@@ -42,6 +42,11 @@ def main():
     ap.add_argument("--mem-fraction", type=float, default=0.40,
                     help="SGLang's share: the static layers re-read the weights from the checkpoint on top of it")
     ap.add_argument("--watchdog", type=float, default=3600.0)
+    ap.add_argument("--drop-last", type=int, default=0,
+                    help="prefill prompt[:-N] instead of the whole prompt (dump_prefill.py's --drop-last). 1 makes this "
+                         "run's first decode step the one at position len(prompt) - 1, which is the step a prefill dump "
+                         "taken with --drop-last 1 replays -- without it the two are a position apart and their "
+                         "per-layer values are different tokens'")
     ap.add_argument("--engram-config", default='{"placement": "cpu"}')
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -53,10 +58,18 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     ids = tok.encode(row["prompt"], add_special_tokens=False)
+    if a.drop_last:
+        ids = ids[:-a.drop_last]
     print(f"row {row['id']}\n  {len(ids)} prompt tokens, generating {a.tokens}", flush=True)
 
     import sglang as sgl
+    # DSV41_TRACE: reading values back, not serving. No cuda graph (above) and no flashinfer autotune, whose warmup is
+    # a dummy forward at the decode batch shape -- a second model path with nothing to do with the step being traced,
+    # and the one that faults (an HcState reaching hc_pre on the fused cross-layer mHC path) without producing a line.
+    trace = (os.environ.get("DSV41_TRACE") or "") not in ("", "0")
     extra = {"engram_config": json.loads(a.engram_config)} if a.engram_config else {}
+    if trace:
+        extra["disable_flashinfer_autotune"] = True
     tp = int(os.environ.get("SGL_TP", "8"))
     ctx = -(-(len(ids) + a.tokens + 1024) // 1024) * 1024
     llm = sgl.Engine(model_path=a.model, tokenizer_path=a.model, trust_remote_code=True, tp_size=tp,
@@ -79,7 +92,6 @@ def main():
     # count per rank on exit, and a run whose guards never held has to fail here, not look quiet
     # A trace run compares nothing by design (stock SGLang, no static side), so the guard does not apply to it --
     # and the counter files are removed first, because reading a previous run's would be the same false pass.
-    trace = (os.environ.get("DSV41_TRACE") or "") not in ("", "0")
     n = 0
     if trace:
         for p in glob.glob("/tmp/dsv41_checks_rank*.txt"):

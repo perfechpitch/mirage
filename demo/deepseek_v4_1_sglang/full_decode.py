@@ -46,6 +46,11 @@ A.add_argument("--out", default="/tmp/full_decode", help="the build directories"
 A.add_argument("--flag", action="append", default=[], help="an nvcc flag for every layer (repeatable)")
 A.add_argument("--rms", action="store_true", help="each sublayer's x_out/streams_out rms and nonfinite count")
 A.add_argument("--save-x", default=None, metavar="FILE", help="the last sublayer's x_out to this file (bf16 raw)")
+A.add_argument("--dump-dir", default=None, metavar="DIR",
+               help="every sublayer's x_out and streams_out (bf16 raw, [T, HID] and [T, 20480]) plus the logits, to "
+                    "DIR/layer{L:02d}_{x_out|streams_out}.bin and DIR/logits.bin: the chain's per-sublayer output to "
+                    "compare against a reference offline. Written after the first step (the warm one), so a run costs "
+                    "one extra step's wait, and no launch.")
 A.add_argument("--golden", default=None, help="a golden jsonl (golden_bench32k.jsonl): the row to compare with")
 A.add_argument("--row", type=int, default=0, help="with --golden: the row index")
 A.add_argument("--inputs-dir", default=None, metavar="DIR",
@@ -174,8 +179,15 @@ def bind_pool_state(wg, r, L, variant, ratio, cap):
 
 
 def _lst(v):
-    """A dumped metadata field as a list (the last row's tensor came out as a plain int when it had one element)."""
-    return v if isinstance(v, list) else [v]
+    """A dumped metadata field as a list (the last row's tensor came out as a plain int when it had one element).
+
+    The dumper now records some tables per request, i.e. as a list of lists, where an older dump wrote the single
+    request's flat; the row being replayed is request 0, so a one-level unwrap covers both."""
+    if not isinstance(v, list):
+        return [v]
+    if v and isinstance(v[0], list):
+        return v[0]
+    return v
 
 
 def make_tables(r):
@@ -375,6 +387,22 @@ def step(time_it: bool = False):
 
 
 step()                                   # warm: the caches and the code
+
+
+if a.dump_dir:                           # the chain's own numbers, every sublayer, one file each
+    os.makedirs(a.dump_dir, exist_ok=True)
+    for name, h, ws, _ in hs:            # (ws is the per-GPU list; rank 0's has the gather_f32 logits)
+        for nm in ("x_out", "streams_out"):
+            t = ws[0].get(nm)
+            if torch.is_tensor(t) and t.numel():
+                t.detach().cpu().contiguous().view(torch.int16).numpy().tofile(
+                    os.path.join(a.dump_dir, f"{name}_{nm}.bin"))
+    last_ws = hs[-1][2]
+    lg = last_ws[0].get("logits")
+    if torch.is_tensor(lg) and lg.numel():
+        lg.detach().float().cpu().contiguous().numpy().astype(np.float32).tofile(
+            os.path.join(a.dump_dir, "logits.bin"))
+    log(f"dumped {len(hs)} sublayers' x_out/streams_out and the logits to {a.dump_dir}")
 
 
 def topk_line():
