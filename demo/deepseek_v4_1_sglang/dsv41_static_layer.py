@@ -442,6 +442,38 @@ class StepTables:
             pages[:, :m].copy_(e[:, :m])
 
 
+def tpb_flag(flags: list, tp: int, pdl: bool, what: str) -> None:
+    """-DSTATIC_TP_BARRIER into a serving build's flags, or a failure if the build cannot honour it.
+
+    One copy for StaticAttn, StaticMoE and StaticHead: three copies of this reasoning already drifted apart, and a
+    build flag that carries a wrong reason is worse than none (FINDINGS_correctness.md 4.5).
+
+    Why it is needed: the TP ranks are separate processes with separate streams and nothing on the host lines them up.
+    A consumer reads in launch n what its peers publish in launch n -- the exchange region's set n % 2 (the mHC
+    sum_store's buffer) -- so "every rank is in this launch" is what makes that data exist. Without the barrier a peer
+    a launch or two behind leaves this launch reading the other set; the measured difference is a clean chain with a
+    host barrier and NaN from the first reuse layer without one (FINDINGS 4.1-4.5; the pathway from the bad value to
+    a NaN is still open in 4.3, so do not restate one here).
+
+    Why PDL cannot coexist: the barrier rests on "a rank that has started launch n has finished n - 1", which is the
+    stream being serialized. A programmatic dependent launch starts the next kernel before the previous one ends, so
+    that premise is void and the bound on the drift is gone. dsv41_static_hook.py resolves the conflict for the
+    serving path (PDL off, unless DSV41_STATIC_PDL_FORCE=1, which turns TPB off instead); this refusal covers every
+    other caller -- e2e_decode and full_decode pass pdl straight in.
+    """
+    if tp <= 1 or os.environ.get("DSV41_STATIC_TPB", "1") == "0":
+        return
+    assert "-DSTATIC_NO_START_BARRIER" not in flags, (
+        f"DSV41_STATIC_TPB with -DSTATIC_NO_START_BARRIER ({what}): core.cuh's NO_START_BARRIER branch has no TP "
+        "barrier, so the drift bound would be silently dropped and the NaN from FINDINGS 4.1 return. Give that branch "
+        "a barrier first, or build without NO_START_BARRIER")
+    assert not pdl, (
+        f"STATIC_TP_BARRIER with PDL ({what}): PDL starts the next launch before the previous one ends, so a rank in "
+        "launch n has NOT necessarily finished n - 1 and the barrier's bound on the drift is void. Drop --pdl / "
+        "DSV41_STATIC_PDL, or set DSV41_STATIC_TPB=0 and keep PDL")
+    flags.append("-DSTATIC_TP_BARRIER")
+
+
 class StaticAttn(MhcMixin):
     def __init__(self, layer: int, ckpt: str, rank: int, tp: int, dev, out_root: str, max_pos: int, sources: Sources, pdl: bool,
                  exchange_pool: ExchangePool = None, tables: StepTables = None, mhc: bool = False, stats: bool = False,
@@ -491,19 +523,7 @@ class StaticAttn(MhcMixin):
         # 7 by_reader ones to their readers, so whatever the harness wrote into them is consumed once.
         if os.environ.get("DSV41_STATIC_SERVING", "1") != "0":
             flags.insert(0, "-DSTATIC_RESET_IN_KERNEL")
-            # STATIC_TP_BARRIER (core.cuh kernel_begin): a layer per process, and nothing on the host lines the TP
-            # ranks up. The exchange region has two sets, so a rank one launch behind is still safe; two behind
-            # aliases the set a peer is writing, and the buffers reset at each launch are memset to 0xFF -- a NaN as
-            # float, so the symptom is NaN, not garbage (FINDINGS_correctness.md §4). The barrier sits BEFORE those
-            # resets and bounds the drift at one launch: each SM's thread 0 waits until every rank has published
-            # this launch's number. Serving only: the host reset path below has its own start barrier.
-            # DSV41_STATIC_TPB=0 for a timing run.
-            if tp > 1 and os.environ.get("DSV41_STATIC_TPB", "1") != "0":
-                assert "-DSTATIC_NO_START_BARRIER" not in flags, (
-                    "DSV41_STATIC_TPB with -DSTATIC_NO_START_BARRIER: core.cuh's NO_START_BARRIER branch has no TP "
-                    "barrier, so the drift bound would be silently dropped and the NaN from §4 return. Give that "
-                    "branch a barrier first, or build without NO_START_BARRIER")
-                flags.append("-DSTATIC_TP_BARRIER")
+            tpb_flag(flags, tp, pdl, "the attention build")
         if PROF_SHARE:
             flags.append("-DSTATIC_STAMP_REBIND")
         if XFLAG:
@@ -741,14 +761,7 @@ class StaticMoE(MhcMixin):
         # 7 by_reader ones to their readers, so whatever the harness wrote into them is consumed once.
         if os.environ.get("DSV41_STATIC_SERVING", "1") != "0":
             flags.insert(0, "-DSTATIC_RESET_IN_KERNEL")
-            # STATIC_TP_BARRIER (core.cuh kernel_begin): the same drift bound as the attention build (see StaticAttn);
-            # the MoE kernel's own resets and its exchange set alias the same way. DSV41_STATIC_TPB=0 for a timing run.
-            if tp > 1 and os.environ.get("DSV41_STATIC_TPB", "1") != "0":
-                assert "-DSTATIC_NO_START_BARRIER" not in flags, (
-                    "DSV41_STATIC_TPB with -DSTATIC_NO_START_BARRIER: core.cuh's NO_START_BARRIER branch has no TP "
-                    "barrier, so the drift bound would be silently dropped and the NaN from §4 return. Give that "
-                    "branch a barrier first, or build without NO_START_BARRIER")
-                flags.append("-DSTATIC_TP_BARRIER")
+            tpb_flag(flags, tp, pdl, "the MoE build")
         if engram or head:   # the gate / the head's GEMM waits on the post's counter: a release (tasks/engram_gate.cuh)
             fast = "-DHCP_FAST_END" in flags
             flags = [f for f in flags if f != "-DHCP_FAST_END"]
@@ -823,13 +836,9 @@ class StaticHead:
         self.w = head_demo.head_tensors(reader(ckpt), tp, rank, dev)
         flags = ["-DSTATIC_RESET_IN_KERNEL", f"-DSTATIC_PDL_TRIGGER={int(pdl)}"] + \
             [f for f in os.environ.get("DSV41_STATIC_FLAGS", "").split() if f.startswith("-DSTATIC_")]
-        # STATIC_TP_BARRIER: the head consumes the last MoE's output, so it needs the same bound as the other
-        # serving builds (see StaticAttn); without it the head can read a peer's half-written x.
-        if tp > 1 and os.environ.get("DSV41_STATIC_TPB", "1") != "0":
-            assert "-DSTATIC_NO_START_BARRIER" not in flags, (
-                "DSV41_STATIC_TPB with -DSTATIC_NO_START_BARRIER: core.cuh's NO_START_BARRIER branch has no TP "
-                "barrier, so the drift bound would be silently dropped. Build without NO_START_BARRIER")
-            flags.append("-DSTATIC_TP_BARRIER")
+        # STATIC_TP_BARRIER: the head consumes the last MoE's output, so it needs the same bound as the other serving
+        # builds (tpb_flag's docstring has the reasoning and the PDL refusal).
+        tpb_flag(flags, tp, pdl, "the head build")
         if PROF_SHARE:
             flags.append("-DSTATIC_STAMP_REBIND")
         out = os.path.join(out_root, f"rank{rank}", "head")
