@@ -620,7 +620,7 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
   // streams are such a buffer (the layer's 81920-byte exchange slot). A peer one launch behind publishes into the
   // other set, so this launch reads that peer's launch n - 2 value -- stale, and on the first steps of a run never
   // written at all; two behind overwrites the set a peer is reading. That is the aliasing the two sets bound, and
-  // FINDINGS_correctness.md 4.3-4.6 has the measurements. It does NOT establish why the bad value is a NaN rather
+  // FINDINGS_correctness.md 4.3-4.5 has the measurements. It does NOT establish why the bad value is a NaN rather
   // than a number: that pathway is still open there, so do not restate it as a mechanism here.
   // `>= gen`, not `== gen`: a peer one launch ahead has already finished this one (it cannot be at n + 1 without
   // having completed n), so its set n % 2 is written and its wait is satisfiable -- and requiring equality would
