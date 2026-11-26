@@ -399,23 +399,66 @@ python -u full_decode.py \
 
 ### 8.3 真正的验收（goal 指定的那条链）
 
-`full_decode.py` 是单进程旁路，它产出的是裸 logits（`--save-logits`）。
-而 `compare_golden.py` 吃的是 **jsonl**，所以验收要走 **SGLang 内**那条链：
+**用 `l2_golden.py`，不是 `golden_all.py`。** `golden_all.py` 只跑 stock SGLang（生成 golden 本身）；
+验收需要的是**同一个脚本、同一 prompt、全 40 层静态**，而 `l2_golden.py` 正是这个：
+它走真实 32K prefill、`DSV41_STATIC_*` 生效、写出与 golden 完全同 schema 的 jsonl。
+
+一键跑完（`accept.sh`）——产出物、对照、判定都在里面：
 
 ```bash
-# 1) 静态链跑一遍，产出与 golden 同格式的 jsonl（top-32 分布）
-python golden_all.py --model $MODEL --tokens 32 --rows 0-0 --concurrent 1 --out /tmp/static_row0.jsonl
-# 2) 与 golden 比：value / overlap / flips 三判据
-python compare_golden.py --golden golden_bench32k.jsonl --other /tmp/static_row0.jsonl
+cd /opt/dlami/nvme/saboxu/mirage/demo/deepseek_v4_1_sglang
+./accept.sh                 # row 0, 32 greedy steps
 ```
 
-判据（已与 golden 的 `deterministic: False` 对齐）：`--tol 0.15`（实测噪声底约 0.125）、
-`--min-overlap 0.6`；argmax flip 只报告、不判失败。
+它做的四件事：
+
+| # | 命令 | 产出 | 意义 |
+|---|---|---|---|
+| 1 | `l2_golden.py` + `DSV41_STATIC_ATTN=all MOE=all POOL=1` | `/tmp/accept/static_row0.jsonl` | **被测对象**：40 层全静态 |
+| 2 | `l2_golden.py`，hook 关掉（无 `DSV41_STATIC_*`） | `/tmp/accept/baseline_row0.jsonl` | **噪声底对照**：同一 engine、同一 row，只是不用静态核 |
+| 3 | `compare_golden.py --golden golden_bench32k.jsonl --other baseline_row0.jsonl` | `baseline_vs_golden.txt` | engine 自己的漂移 → 这才是 `--tol` 该用的数 |
+| 4 | `compare_golden.py --golden golden_bench32k.jsonl --other static_row0.jsonl` | `static_vs_golden.txt` | **验收** |
+
+外加一条最直接的对照：`compare_golden.py --golden baseline_row0.jsonl --other static_row0.jsonl`
+—— 把 engine 噪声完全消掉，剩下的差异只可能来自静态核。
+
+判据：`--tol 0.15`（实测噪声底约 0.125）、`--min-overlap 0.6`；argmax flip 只报告、不判失败。
+**NaN 与 sink 现在是硬失败**（见下）。
+
+#### 验收门本身修过一个洞（重要）
+
+`compare_golden.py` 原来**会让 NaN 通过**。文档写着 "value ... is the check that fails on NaN"，
+但 `nan > tol` 在 Python 里是 `False`，而且 `max()` 会把后出现的 NaN **丢掉**（`nan > x` 为 False，
+running max 保留有限值）。实测：最后两步全 NaN、token 序与 golden 相同的一行，输出
+`all rows within tolerance`、**exit 0**，`maxval` 还显示 0.000。这正好是 objective 要抓的那个失败形态。
+
+已修（`3be9901c`）：`isfinite` 判非有限并报步数；连续 ≥8 步 argmax 恒定而 golden 在变 → 判 "collapsed"；
+表格新增 `id0 n/steps` 让**部分** sink 也看得见。三个构造用例都验过
+（相同 → 0；末尾两步 NaN → 1；有限 collapse → 1），`--self` 对真实 golden 回归不变
+（163 行 / 5216 步 / 0 flips / `id0 0/32`）。
+
+#### 两个会白烧一整轮的陷阱（都已踩过并堵住）
+
+1. **`boot/sitecustomize.py` 的加载白名单原来没有 `l2_golden`。**
+   它只在命令行匹配 `("spawn_main", "sgl_generate", "sgl_gsm8k", "one_batch", "l2_check", "golden_forced")`
+   时才 import hook。`l2_golden.py` 的文档却明确要求带 `DSV41_STATIC_*` 跑它，
+   而名单里没有 → **父进程不会被 patch**（TP worker 靠 `spawn_main` 侥幸匹配到）。
+   已验证干净的那条链（`l2_check`，白名单内）实测有 9–10 条 `patched SGLang`、8 条
+   `static layers serving`。为让 `l2_golden` 与之一致，已把 `"l2_golden"` 加进名单。
+
+2. **`env` 不带 `-u` 会继承当前 shell 的 export**，于是"baseline"可能悄悄也跑静态核 ——
+   两个 run 一样，对照白做，而且**两边都会"通过"**。`accept.sh` 现在对 baseline 显式
+   `-u DSV41_STATIC_ATTN -u DSV41_STATIC_MOE -u DSV41_STATIC_POOL -u DSV41_STATIC_CHECK`，
+   并且**用日志自证**：static run 必须 ≥ `SGL_TP` 条 `patched SGLang`，baseline 必须 **0** 条，
+   否则返回 9 而不是继续。
+
+（`_ids("")` 返回**空集**、`None` 只对应 `"all"`，所以"unset = 不介入"本身是对的；
+问题只在上面两处传递链。）
 
 再做两件"证明门槛没定错"的事：
 
-1. **噪声底对照**：`bisect_repeat.sh`（同一 row、两个全新 engine，跑 stock SGLang）→
-   用它得到的 maxval 作为 `--tol` 的依据，而不是拍的 0.15。
+1. **噪声底对照**：上面第 3 步就是它（比 `bisect_repeat.sh` 更直接：同一 row、同一 engine 配置）。
+   要更严格的两个全新 engine 版本，用 `bisect_repeat.sh`。
 2. **验收工具自检**：`python compare_golden.py --golden golden_bench32k.jsonl --self`
    → 已实测通过：163 行 / 5216 步，`maxval` 全 0.000、`minovl` 全 1.00、0 flips。
    这证明 loader 能吃下整个 golden 文件（`error` 行会被跳过）。
