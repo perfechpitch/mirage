@@ -56,6 +56,14 @@ AR = os.environ.get("DSV41_STATIC_AR", "0") != "0"   # the all-reduce in the ker
 assert not (AR and CHECK), "check mode compares this rank's partial y: DSV41_STATIC_AR=0"
 SEAM = os.environ.get("DSV41_STATIC_SEAM", "0") != "0"   # no all-reduce in the kernels; the MoE takes the attention's seam kernel
 assert not (AR and SEAM), "DSV41_STATIC_SEAM: the all-reduce stays in SGLang (DSV41_STATIC_AR=0)"
+# The pools the static layers read are the v41_new layout (dsv41_static_layer.py:586 asserts it; the kernel's tables
+# are built against it). SGLang defaults it to "v4", so a run that forgets the variable dies at pool construction with
+# "KVLayout.V4: run SGLang with SGLANG_DSV4_KV_LAYOUT=v41_new" -- after the weights have loaded, which is a wasted
+# round. Set it here rather than in the shell scripts: this is the one place that runs in every process of every
+# entry point (sitecustomize), and the only one that cannot be forgotten. An explicit value still wins, so a
+# deliberate "v4" fails the layer's own assert loudly instead of being overridden silently.
+os.environ.setdefault("SGLANG_DSV4_KV_LAYOUT", "v41_new")
+
 MHC = os.environ.get("DSV41_STATIC_MHC", "0") != "0"   # mHC and the all-reduce in the kernels: a sublayer ends in its kernel
 # H1 (DSV41_X_FLAG, dsv41_static_layer): the flags pair a MoE launch with the attention launch before it, so both must run in
 # the same forwards: they do (decode, T rows, _active(); one launch each, check mode included), except the attention's prefill
@@ -102,7 +110,12 @@ EG_ROWS = os.environ.get("DSV41_EG_ROWS", "0") != "0"
 # (StepTables.fill: position 0, request slot 0, KV slot 0); the MoE layers get a build of n live rows for each n listed (its idle
 # rows not routed: no expert outside the live rows'); a step of n rows without one runs the T build, its idle rows routed. A
 # step of T rows runs exactly the T build as before
-ROWS = sorted({int(x) for x in os.environ.get("DSV41_STATIC_ROWS", "").split(",") if x.strip()})
+# Default "1": decode is a step of one row far more often than not (--batch 1, and every real decode), and without a
+# build of that size the hook refuses the step -- silently, as "rows<st.T", leaving a run that printed one comparison
+# and looked like it had measured something. A T=8 build only ever ran the static layers for a batch-8 decode, which
+# is not the case this goal is about. Set DSV41_STATIC_ROWS= to get the old behaviour (T only).
+_rows_env = os.environ.get("DSV41_STATIC_ROWS")
+ROWS = sorted({int(x) for x in ("1" if _rows_env is None else _rows_env).split(",") if x.strip()})
 assert all(0 < r < 8 for r in ROWS), f"DSV41_STATIC_ROWS {ROWS}: live-row builds below T"
 SMALL = bool(ROWS)
 # (11-21) DSV41_STATIC_T=16,32,64: the static layers also of these T (GLM-5.3 #821's way): a decode step of n > 8 rows runs
@@ -207,7 +220,36 @@ def _relrms(a, b):
 DETAIL = os.environ.get("DSV41_STATIC_DETAIL", "0") != "0"   # the values behind a check line, not just the relRMS
 
 
-def _detail(name, got, ref, n=8):
+def _one(v, n=8):
+    """One tensor as a line: norm, the first n values, where the largest magnitude sits, and any non-finite count.
+
+    .cpu() first, so the line is a snapshot of this moment: a kernel that later writes the same buffer cannot change
+    what was printed, and the printed numbers are the ones the comparison next to them was computed from."""
+    v = v.detach().float().flatten().cpu()
+    if v.numel() == 0:
+        return "empty"
+    fin = torch.isfinite(v)
+    n_nan = int((~fin).sum())
+    head = " ".join(f"{x:+.4f}" for x in v[:n].tolist())
+    if n_nan:
+        first = int((~fin).nonzero()[0])
+        return f"norm nan({n_nan}/{v.numel()} non-finite, first at {first}) head[{head}]"
+    i = int(v.abs().argmax())
+    return f"norm {v.norm():.5g} max|{i}|{v[i]:+.4g} head[{head}]"
+
+
+def _sgl(name, ref, n=8):
+    """SGLang's own value, printed where it is computed -- before this rank's static kernel runs on the same input.
+
+    This is the reference, and it is the one line that has to be right: a check line can only say how far the static
+    side is, but if the static kernel faults, NaNs or never returns, its line is the one that is missing. Printing
+    SGLang's here means the reference numbers of every sublayer are on disk regardless of what the static side does,
+    and it fixes the order the two sides are read in: SGLang first, this rank's kernel second.
+    DSV41_STATIC_DETAIL=1, same as _detail (it is the same formatting, one side)."""
+    _log(f"sglang {name}: {_one(ref.detach().float().flatten(), n)}")
+
+
+def _detail(name, got, ref, n=8, shown=()):
     """The numbers behind a check line: what a relRMS of 6e-2 or a NaN actually looks like.
 
     A relRMS says "these differ by 6%". It cannot say whether the failure is a scale (every value off by 6%), a sign,
@@ -216,26 +258,30 @@ def _detail(name, got, ref, n=8):
     which tensor it entered and at which index; a permutation shows the same multiset in a different order; a scale
     shows equal argmax/argmin positions and a constant ratio.
 
+    `shown` names the sides already printed (by _sgl, where the tensor was produced). Re-printing one here would put
+    the same tensor in the log twice, under two different moments, and a difference between the two copies would read
+    as a bug in the model instead of one in the buffer. So each side prints exactly once.
+
     DSV41_STATIC_DETAIL=1. It is opt-in: n x 2 numbers a sublayer is a lot of log, but it is the only reading that
-    distinguishes those cases, and it costs one sync-free .cpu() per compared sublayer.
+    distinguishes those cases, and it costs one .cpu() per compared sublayer.
     """
     g = got.detach().float().flatten()
     r = ref.detach().float().flatten()
-    def one(v):
-        fin = torch.isfinite(v)
-        n_nan = int((~fin).sum())
-        head = " ".join(f"{x:+.4f}" for x in v[:n].tolist())
-        if n_nan:
-            first = int((~fin).nonzero()[0])
-            return f"norm nan({n_nan}/{v.numel()} non-finite, first at {first}) head[{head}]"
-        i = int(v.abs().argmax())
-        return f"norm {v.norm():.5g} max|{i}|{v[i]:+.4g} head[{head}]"
-    _log(f"detail {name}: static {one(g)} | sglang {one(r)}"
+    one = _one
+    parts = [s + " " + one(t) for s, t in (("static", g), ("sglang", r)) if s not in shown]
+    _log(f"detail {name}: " + " | ".join(parts)
          + (f" | |static|/|sglang| {g.norm().item() / max(r.norm().item(), 1e-30):.4g}"
             if torch.isfinite(g).all() and torch.isfinite(r).all() else ""))
 
 
-DUMPDIR = os.environ.get("DSV41_STATIC_DUMPDIR")   # a directory: every compared sublayer's values, both sides
+DUMPDIR = os.environ.get("DSV41_STATIC_DUMPDIR")   # a directory: each sublayer's output, both sides
+# One value a sublayer, not three. A sublayer's output is what the next one consumes, so a chain comparison that has
+# every sublayer's output has everything: R' is that output before the norm and pre are its coefficients, and neither
+# says anything the next row of the table does not. DSV41_STATIC_DUMP_ALL=1 adds them for a sublayer that needs the
+# internals (40 layers x 2 sides x 3 quantities is ~20 MB, so this is about reading the dump, not disk).
+
+
+DUMP_ALL = os.environ.get("DSV41_STATIC_DUMP_ALL", "0") != "0"
 
 
 def _dump_cmp(st, tag, got, ref):
@@ -656,6 +702,12 @@ def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_red
             if not _ck(st.layer):   # (DSV41_STATIC_CHECK_LAYERS) this layer is not compared: SGLang's own y, no static run
                 return out
             ref = out.partial if isinstance(out, _mhc.AttnOutput) else out
+            # (a snapshot, not a view): SGLang's own y is the reference for every line below, so nothing this rank's
+            # kernel does to a buffer afterwards may change it -- an aliased ref would make the relRMS a comparison of
+            # the static output with itself, and the sglang column print the static numbers.
+            ref = ref.detach().clone()
+            if DETAIL and _rank() == 0 and st.steps <= CHECK_STEPS:   # SGLang's own, before this rank's kernel
+                _sgl(f"attn L{st.layer} y", ref)
             y = _run_stats(st, x, positions)
             torch.cuda.synchronize()
             if _rank() == 0 and st.steps <= CHECK_STEPS:
@@ -664,7 +716,7 @@ def _attn_forward(self, x, positions, forward_batch, x_quant=None, defer_all_red
                 _log(f"check attn L{st.layer} ({st.variant}) step {st.steps} p {positions.view(-1)[:2].tolist()}: y relRMS "
                      f"static vs SGLang {_relrms(y, ref):.3e} (norms {y.float().norm():.4g}, {ref.float().norm():.4g})")
                 if DETAIL:
-                    _detail(f"attn L{st.layer} y", y, ref)
+                    _detail(f"attn L{st.layer} y", y, ref, shown=("sglang",))
                 if DUMPDIR:
                     _dump_cmp(st, f"attn{st.layer:02d}_y", y, ref)
             if PROBE and _rank() == 0 and st.steps <= 2 and st.layer in (0, 2, 3):
@@ -844,9 +896,13 @@ def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
             ref = sum_post_experts_output(out._replace(routed=c(out.routed), shared=c(out.shared)).get_merged())
         else:
             ref = out if self.reduce_results else sum_post_experts_output(out.clone())
+        # (a snapshot): the reference the lines below compare against and print, before this rank's kernel runs
+        ref = ref.detach().clone() if torch.is_tensor(ref) else ref
         torch.cuda.synchronize()   # (everything SGLang queued up to here has finished: a fault below is the static layer's)
         if not _ck(st.layer):   # (DSV41_STATIC_CHECK_LAYERS) not compared: SGLang's own y, no static run
             return out
+        if DETAIL:   # the reference first, before this rank's MoE kernel: it survives a fault or a NaN below
+            _sgl(f"moe L{st.layer} y", ref)
         if DUMP:
             os.makedirs(DUMP, exist_ok=True)
             torch.save(hidden_states.cpu(), os.path.join(DUMP, f"x_r{_rank()}_L{st.layer}_s{st.steps}.pt"))
@@ -863,7 +919,7 @@ def _moe_forward(self, hidden_states, forward_batch=None, *args, **kwargs):
             _log(f"check MoE L{st.layer} step {st.steps}: y relRMS static vs SGLang {_relrms(s.bfloat16(), ref):.3e} "
                  f"(norms {s.norm():.4g}, {ref.float().norm():.4g})")
             if DETAIL:
-                _detail(f"moe L{st.layer} y", s.bfloat16(), ref)
+                _detail(f"moe L{st.layer} y", s.bfloat16(), ref, shown=("sglang",))
             if DUMPDIR:
                 _dump_cmp(st, f"moe{st.layer:02d}_y", s.bfloat16(), ref)
         if KEEP == "sgl":
@@ -928,6 +984,8 @@ if ENGRAM:
             torch.cuda.synchronize()
             got = st.w["streams_eg"].view(ref.shape)
             if _rank() == 0:
+                if DETAIL:   # SGLang's R'' alone, before the comparison reads the static one
+                    _sgl(f"Engram L{st.layer + 1} R''", ref)
                 _log(f"check Engram L{st.layer + 1} step {st.steps}: R'' relRMS static vs SGLang {_relrms(got, ref):.3e}, "
                      f"equal bits {(got.view(torch.int16) == ref.view(torch.int16)).float().mean().item():.4f}, "
                      f"|R'' - R'| relRMS {_relrms(got, st.w['streams_out'].view(ref.shape)):.3e} (SGLang's: "
@@ -1028,6 +1086,8 @@ if HEAD:
             ref = _orig_get_logits(self, hidden_states, lm_head, logits_metadata, embedding_bias, False).float()
             torch.cuda.synchronize()
             if _rank() == 0:
+                if DETAIL:   # the reference end of the chain, alone, before it is compared
+                    _sgl(f"head L{hd.steps} logits", ref)
                 am = (got.argmax(-1) == ref.argmax(-1)).float().mean().item()
                 top2 = ref.topk(2, -1).values
                 _log(f"check head step {hd.steps}: logits relRMS static vs SGLang {_relrms(got, ref):.3e}, argmax equal {am:.3f}, "
@@ -1067,6 +1127,11 @@ def _mhc_end(st, orig, hc, out, residual, stats_stream, next, world_size, precom
     torch.cuda.synchronize()
     if _rank() == 0 and st.steps <= CHECK_STEPS:
         w, rows = st.w, getattr(state.input, "rows", None)
+        if DETAIL:   # SGLang's own post first, on its own lines: the reference stands even if a comparison below raises
+            _sgl(f"mHC {tag} L{st.layer} R'", state.streams.flatten(1))
+            _sgl(f"mHC {tag} L{st.layer} pre", state.pre)
+            if "gamma_next" in w and rows is not None:
+                _sgl(f"mHC {tag} L{st.layer} x", rows)
         msg = f"check mHC {tag} L{st.layer} step {st.steps}: R' relRMS {_relrms(w['streams_out'], state.streams.flatten(1)):.2e}, " \
               f"pre {_relrms(w['h_pre'], state.pre):.2e}"
         if "gamma_next" in w and rows is not None:
@@ -1076,15 +1141,19 @@ def _mhc_end(st, orig, hc, out, residual, stats_stream, next, world_size, precom
                                        for k in ("streams_out", "h_pre", "x_out") if k in w)
         _log(msg + f" (next {'yes' if next is not None else 'no'})")
         if DETAIL:
-            _detail(f"mHC {tag} L{st.layer} R'", w["streams_out"], state.streams.flatten(1))
-            _detail(f"mHC {tag} L{st.layer} pre", w["h_pre"], state.pre)
+            _detail(f"mHC {tag} L{st.layer} R'", w["streams_out"], state.streams.flatten(1), shown=("sglang",))
+            _detail(f"mHC {tag} L{st.layer} pre", w["h_pre"], state.pre, shown=("sglang",))
             if "gamma_next" in w and rows is not None:
-                _detail(f"mHC {tag} L{st.layer} x", w["x_out"], rows)
+                _detail(f"mHC {tag} L{st.layer} x", w["x_out"], rows, shown=("sglang",))
         if DUMPDIR:
-            _dump_cmp(st, f"{tag}{st.layer:02d}_Rprime", w["streams_out"], state.streams.flatten(1))
-            _dump_cmp(st, f"{tag}{st.layer:02d}_pre", w["h_pre"], state.pre)
-            if "gamma_next" in w and rows is not None:
-                _dump_cmp(st, f"{tag}{st.layer:02d}_x", w["x_out"], rows)
+            # the sublayer's output: x when the kernel fused the next norm, else the residual R' it leaves behind
+            fused = "gamma_next" in w and rows is not None
+            _dump_cmp(st, f"{tag}{st.layer:02d}_x" if fused else f"{tag}{st.layer:02d}_Rprime",
+                      w["x_out"] if fused else w["streams_out"], rows if fused else state.streams.flatten(1))
+            if DUMP_ALL:   # the internals too (not x again: it is already the output above)
+                if fused:
+                    _dump_cmp(st, f"{tag}{st.layer:02d}_Rprime", w["streams_out"], state.streams.flatten(1))
+                _dump_cmp(st, f"{tag}{st.layer:02d}_pre", w["h_pre"], state.pre)
     return state if KEEP == "sgl" else st.hc_state(next, _mhc)
 
 

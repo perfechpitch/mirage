@@ -44,6 +44,10 @@ mkdir -p "$OUT"
 #   MHC=1    the sublayer's end -- the all-reduce over the exchange region -- inside the kernel
 #   CHECK=1  SGLang's post runs too, on the same input, and the two are compared
 # AR=0 is required by check mode (it compares this rank's partial y, so the all-reduce must not be added by SGLang).
+# DSV41_STATIC_ROWS=1: the build's T is 8, and a decode step of 1 row is rows < T, which the hook refuses to run
+# statically ("decode step of 1 rows NOT checked -- rows<st.T=True"). That rejection is silent in the summary -- the
+# first two runs of this script came back "1 sublayer comparisons printed" because the only comparison was a prefill
+# leftover. ROWS=1 gives the step a build of its own live rows, which is what --batch 1 needs.
 run() {   # run <tag> <TPBAR>
   local tag=$1 tpbar=$2
   echo "=== $tag (MHC=1, CHECK=1, TPB=1, TPBAR=$tpbar) -> $OUT/$tag.log"
@@ -52,7 +56,8 @@ run() {   # run <tag> <TPBAR>
       SGL_TP=8 DSV41_STATIC_ATTN=all DSV41_STATIC_MOE=all DSV41_STATIC_POOL=1 \
       DSV41_STATIC_CHECK=1 DSV41_STATIC_MHC=1 DSV41_STATIC_AR=0 \
       DSV41_STATIC_TPB=1 DSV41_STATIC_TPBAR=$tpbar \
-      DSV41_STATIC_CHECK_STEPS=$STEPS DSV41_STATIC_MAX_POS=33000 \
+      DSV41_STATIC_CHECK_STEPS=$STEPS DSV41_STATIC_MAX_POS=33000 DSV41_STATIC_ROWS=1 \
+      SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
       ${DETAIL:+DSV41_STATIC_DETAIL=$DETAIL} ${DUMPDIR:+DSV41_STATIC_DUMPDIR=$DUMPDIR} \
       python l2_check.py --model "$CKPT" --row "$ROW" --tokens "$TOKENS" --out "$OUT/$tag" \
       ${MEMFRAC:+--mem-fraction "$MEMFRAC"} \
@@ -82,7 +87,7 @@ echo
 for tag in sync kern; do
   [ -f "$OUT/$tag.log" ] || continue
   echo "=== $tag: which layer, if any"
-  python layerwise_report.py --log "$OUT/$tag.log" --cap "${CAP:-1e-1}" | sed 's/^/  /'
+  "$VENV/python" layerwise_report.py --log "$OUT/$tag.log" --cap "${CAP:-1e-1}" | sed 's/^/  /'
   echo
 done
 echo "expected: sync clean (the comparison works); kern the first divergence, which is the layer to fix."
