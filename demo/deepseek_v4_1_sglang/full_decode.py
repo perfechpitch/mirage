@@ -108,11 +108,10 @@ def mhc_into(wg, d, L, kind, gamma):
               streams_out=torch.zeros(T, HC * HID, dtype=torch.bfloat16, device=d),
               hc_fn=fn.to(d).contiguous(), hc_small=torch.cat([base, scale]).to(d).contiguous(),
               h_pre=torch.zeros(T, HC, device=d),
-              # hc_coef writes the framework's triplet ONLY when it is given somewhere to put it (h_post/h_comb nullable:
-              # the chain used to pass neither, so pre was the only coefficient that existed). Materializing them is what
-              # makes the mix comparable with SGLang's MHCState bit for bit -- and a wrong comb moves one stream and
-              # leaves its neighbours right, which is exactly the shape of the L0 FFN divergence.
-              h_post=torch.zeros(T, HC, device=d), h_comb=torch.zeros(T, HC * HC, device=d),
+              # NOT h_post/h_comb here: "h_comb" in w is the dispatch key that tells the demos "the framework runs the
+              # post" (dsv41_static_layer.py sets them for the serving path; see demo.py's `if "h_comb" in w`). Adding
+              # them to the chain's tensors silently skipped this sublayer's own dsv41_mhc_nodes, so streams_out was
+              # never written and every dump came out zero. Compare coefficients with mhc_check.py instead.
               x_out=torch.zeros(T, HID, dtype=torch.bfloat16, device=d),
               gamma_next=gamma.to(d).contiguous())
 
@@ -416,7 +415,9 @@ if a.dump_dir:                           # the chain's own numbers, every sublay
             os.path.join(a.dump_dir, "logits.bin"))
     # the mHC coefficients the post step used: R'[j] = sum_i comb[i][j] R[i] + post[j] out. Dumping them is what tells a
     # wrong coefficient set (a per-stream scale/mix, which leaves the other streams right) from a wrong sublayer output
-    # (which moves every stream the same way) -- the two look alike in the residuals alone.
+    # (which moves every stream the same way) -- the two look alike in the residuals alone. The chain's path does not
+    # materialize them (see mhc_into: h_post/h_comb in w is the "framework runs the post" dispatch key), so this only
+    # fires for a --out tree whose tensors carry them; mhc_check.py is how to compare coefficients.
     for name, _h, wsx, _bufs in hs:
         for nm in ("h_post", "h_comb"):
             t = wsx[0].get(nm)

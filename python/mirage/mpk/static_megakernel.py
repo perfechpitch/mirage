@@ -2230,11 +2230,7 @@ class StaticMegakernel(PersistentKernel):
         mix = self.new_tensor(dims=(T, 128), dtype=float32, name="hc_mix")
         self.gemm_tile_layer(input=a("streams"), weight=a("hc_fn_w"), output=mix)     # the mixes, fn as bf16 rows hi | lo
         coef = self.new_tensor(dims=(T, 32), dtype=float32, name="hc_coef")
-        self.hc_coef_layer(mix=mix, residual=a("streams"), hc_small=a("hc_small"), h_pre=a("h_pre"), output=coef,
-                           # w may also carry the post/comb outputs (hc_coef writes them only when given a place):
-                           # materializing them does not change the combine below, which reads coef
-                           h_post=a("h_post") if "h_post" in w else None,
-                           h_comb=a("h_comb") if "h_comb" in w else None)
+        self.hc_coef_layer(mix=mix, residual=a("streams"), hc_small=a("hc_small"), h_pre=a("h_pre"), output=coef)
         norm = "gamma_next" in w
         self.hc_post_combine_layer(sent=sent, residual=a("streams"), coef=coef, output=a("streams_out"),
                                    x=a("x_out") if norm else None, gamma=a("gamma_next") if norm else None,
