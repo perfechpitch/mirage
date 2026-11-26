@@ -33,7 +33,8 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--data", default="/opt/dlami/nvme/saboxu/data/long-code-arena/bench32k/*.jsonl")
     ap.add_argument("--row", type=int, default=0)
-    ap.add_argument("--tokens", type=int, default=1)
+    ap.add_argument("--tokens", type=int, default=10,
+                    help="decode steps to generate (10: the trace hook's default step count)")
     ap.add_argument("--batch", type=int, default=1,
                     help="prompts of the same length in flight. The static layers are built for T rows (8 by "
                          "dsk41_static_layer's default), and check mode refuses any other row count: the per-layer "
@@ -76,16 +77,26 @@ def main():
     print(f"generated {len(gids)} tokens in {dt:.1f} s; ids {gids}", flush=True)
     # a check that compared nothing must not read as a pass: the hook writes its printed-comparison
     # count per rank on exit, and a run whose guards never held has to fail here, not look quiet
+    # A trace run compares nothing by design (stock SGLang, no static side), so the guard does not apply to it --
+    # and the counter files are removed first, because reading a previous run's would be the same false pass.
+    trace = (os.environ.get("DSV41_TRACE") or "") not in ("", "0")
     n = 0
-    for p in glob.glob("/tmp/dsv41_checks_rank*.txt"):
-        try:
-            n = max(n, int(open(p).read().strip() or 0))
-        except (OSError, ValueError):
-            pass
+    if trace:
+        for p in glob.glob("/tmp/dsv41_checks_rank*.txt"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    else:
+        for p in glob.glob("/tmp/dsv41_checks_rank*.txt"):
+            try:
+                n = max(n, int(open(p).read().strip() or 0))
+            except (OSError, ValueError):
+                pass
     same = len({tuple(o.get("output_ids") or []) for o in out}) == 1
     print(f"  check: {n} sublayer comparisons printed on rank 0; the {a.batch} rows decoded identically: {same}",
           flush=True)
-    if n == 0:
+    if n == 0 and not trace:
         sys.exit("FAILED: no sublayer was compared (see the 'NOT checked' lines for why)")
     if a.out:
         json.dump({"row": row["id"], "prompt_tokens": len(ids), "ids": gids}, open(a.out, "w"), indent=1)

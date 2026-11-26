@@ -13,7 +13,15 @@ if os.path.exists("/usr/lib/python3.12/sitecustomize.py"):
 # only the run's own processes: its main script and its multiprocessing children. Other Python processes (cargo's build scripts
 # run `python -c`, and read its stdout) must stay plain.
 _cmd = " ".join(getattr(sys, "orig_argv", sys.argv))
-if (os.environ.get("DSV41_STATIC_ATTN") or os.environ.get("DSV41_STATIC_MOE")) and any(
+if os.environ.get("DSV41_TRACE") and any(
+    k in _cmd for k in ("spawn_main", "sgl_generate", "sgl_gsm8k", "one_batch", "l2_check", "golden_forced",
+                        "l2_golden")
+):
+    # stock SGLang, read back layer by layer: no static kernel of any kind
+    sys.path.insert(0, _here)
+    import dsv41_trace_hook  # noqa: F401,E402
+
+elif (os.environ.get("DSV41_STATIC_ATTN") or os.environ.get("DSV41_STATIC_MOE")) and any(
     k in _cmd for k in ("spawn_main", "sgl_generate", "sgl_gsm8k", "one_batch", "l2_check", "golden_forced",
                         "l2_golden")
 ):
