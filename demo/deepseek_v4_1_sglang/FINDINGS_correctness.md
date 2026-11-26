@@ -124,39 +124,65 @@ serving 路径下每个 sublayer 是 8 个进程各自 stream 上一次独立 la
 `full_decode.py:67` 明确注释 `FLAGS` 里不含 `STATIC_RESET_IN_KERNEL`（`the host reset path`），
 与上表一致。**唯一没有栅栏的路径，正是唯一出 NaN 的路径。**
 
-### 4.3 每次 launch 被 reset 的缓冲区，填充值就是 NaN
+### 4.3 0xFF 与 NaN 到底在哪 —— 只有交换区是跨卡的
 
-attn3 的生成代码（`build/sgl_static_dsv41/rank0/attn3/build/layer.cu`）：
+**先纠正一个我一开始写错的结论。** 我最初以为"每次 launch reset 的缓冲区"被抹成 `0xFF`、
+而 peer 会去读它们，所以晚到的 rank 会毁掉 peer 的输入。**这是错的**：`g.cnt`（计数器）和
+reset 列表都是 `dmalloc` 出来的**卡内私有**内存（`host.cuh:435`、`host.cuh:527`），
+`core.cuh:588` 的原话就是 "the resets left to the start (the host's list: **buffers only this GPU
+writes**)"。所以 reset 在任何位置都不会影响别的 rank。
 
-| 缓冲区 | bytes | reset 字节 | by_reader |
-|---|---|---|---|
-| `sparse_attn_ml` | 10240 | **255** | 0（内核每次 launch reset） |
-| `wo_a_part` | 65536 | **255** | 0（内核每次 launch reset） |
-| `sparse_attn_part` / `wq_a_part` / `wq_b_part` / `wkv_part` / `wo_b_part` | — | 255 | 1（读方自己重新武装） |
+真正跨卡的只有 **exchange 区**（`G::mc` / `G::rv`，"the exchange region: multicast address
+(GPUS > 1), this GPU's copy (**2 sets**)"）。而 `MHC=1`（11-25 那次和这次复现都用它）的 build 里
+它是有内容的 —— 实测 attn3_t1 / moe3_t1 的生成代码：
 
-`0xFF` 当 float 就是 NaN，这是本代码库的"尚未写入"哨兵（`runtime.cuh` 的 `valid16` / `validf4`
-都在判它）。所以读到它就是读到 NaN，与 `l2_nan.log` 里 `x finite=True / y NaN` 完全吻合。
+```
+STATIC_EXCHANGE_SET     86016
+STATIC_EXCHANGE_HELLO   81920
+STATIC_EXCHANGE_OFFSETS 全 0
+STATIC_EXCHANGE_BYTES   slot 23 = 81920      ← mHC sum_store 的 streams 交换缓冲
+```
+
+即：**每个 set 里 offset 0 有 81920 字节的跨卡交换缓冲**（mHC 的 streams all-reduce），
+hello 槽在其后（81920 + rank*16，8 rank 共 128 字节），set 步长 86016。
+（非 mHC 的 build 里 `BYTES` 全 0，确实没有交换缓冲 —— 这也是为什么 11-25 那次是 `MHC=1` 才炸。）
+
+`0xFF` 是**交换区未写入时的初始填充**（就是本代码库的"尚未写入"哨兵，`runtime.cuh` 的
+`valid16` / `validf4` 都在判它），float 位模式即 NaN。所以读到它就是读到 NaN，
+与 `l2_nan.log` 的 `x finite=True / y NaN` 吻合。
 
 ### 4.4 为什么首个 NaN 落在第一个 reuse 层
 
-reuse 层是**第一个消费另一层产物的层**（读 L2 的 `compress_cache` + `compress_idx`）。
-只写自己 buffer 的层（L0–L2）即使漂移也看不出来；一旦跨层传值，漂移立刻变现。
-首次 NaN 在 L3/L4 之间移动，取决于启动时序 —— 竞态特征，而非确定性算错。
+两步：
+
+1. **同一个 launch 内消费**：launch n 里，每个 rank 把 streams 写进 set `n % 2`，peer 在**同一个
+   launch n** 从 set `n % 2` 读。所以"所有 rank 都在 launch n"是数据存在的**前提**。
+2. **漂移 1 次就已经是错的**：落后一次的 peer 写的是 set `(n−1)%2`，当前 launch 要读的 set
+   `n%2` 里它那一格还是 launch `n−2` 的旧值（若从没写过，就是 0xFF → NaN）。
+
+而 reuse 层（L3/L4）是**第一个消费另一层产物**的层（读 L2 的 `compress_cache` + `compress_idx`），
+L0–L2 只写自己的缓冲。所以竞态第一次有了"跨层传值"这个兑现点 —— 首次 NaN 在 L3/L4 之间移动，
+取决于启动时序，是竞态而非确定性算错。
 
 ### 4.5 修法（已落到代码）
 
-内核起点栅栏 `-DSTATIC_TP_BARRIER`，位置在 `core.cuh:611–634`（584 那条分支内），
-**在 reset 循环（644）之前**。每个 SM 的 thread 0 等所有 rank 都发布了本次 launch 的编号
-（`EXCHANGE_HELLO + rank*16`，和 host 侧 `static_align_kernel` **同一个槽位、同一语义**），
-然后 `__syncthreads()` 放行本 SM 的其余线程。
+内核起点栅栏 `-DSTATIC_TP_BARRIER`，位置在 `core.cuh` 的 584 分支内、
+**在所有 task 之前**（`kernel_begin` 开头，第 616 行起）。每个 SM 的 thread 0 等所有 rank 都发布了
+本次 launch 的编号，然后 `__syncthreads()` 放行本 SM 的其余线程。
 
-> **位置必须在 reset 之前，这是我自己第一版写错的地方。**
-> 放在 reset 之后不只是"少保护一点"：reset 会把本卡自己的 `wo_a_part` / `sparse_attn_ml`
-> memset 成 `0xFF`，而这些**正是 peer 要读的**。晚到的 peer 不但拿到 NaN，它轮询的那份数据被抹掉后
-> **永远等不到** → 死锁，比 NaN 更糟。
-> 放在 reset 之前语义才成立：一个 rank 进入 launch n 就证明它已跑完 launch n−1（同 stream 串行），
-> 所以"所有 rank 都进入了 n"等价于"没有 rank 还在消费 n−1 的产物"，此时 reset 安全。
-> 顺带把漂移钳到 ≤ 1 次 launch —— 恰好是两套 exchange 需要的不变量。
+为什么用 `>= gen` 而不是 `== gen`，以及为什么它足够：
+- **`>=` 是必须的**：领先一次的 peer 值更大。而它既然能到 n+1，就**必然已经跑完 n**，
+  所以它 set `n%2` 的数据是齐的 —— 等它是安全的。若要求相等，一发生漂移就直接**死锁**。
+- **`>=` 也足够**：一个 rank 不可能在本 rank 还停在 n 时越过 n+1 —— 它 n+1 的栅栏要求
+  本 rank 已到 n+1。所以漂移被钳在**一次 launch**，恰好是两套 exchange 需要的不变量。
+- "进入 launch n 就证明跑完了 n−1" 来自 **stream 串行**（PDL 已排除，见下），不依赖内存序。
+
+> **一处我写错并已纠正**：本文件早先版本说"栅栏必须放在 reset 之前，否则 reset 会抹掉 peer 要读的
+> 数据、导致死锁"。**不对** —— reset 列表是卡内私有内存（§4.3），放在哪都不影响 peer。
+> 现在放在最前面是为了"任何 task 之前就先确认 peer 到齐"，语义干净；不是因为它不能放后面。
+> 记录这个纠正，是因为**错误的原因比错误的代码更危险**：照错误原因去改，下次就会改坏。
+
+`multimem.st` 会写包括本卡在内的所有副本，因此不会在 `r == g.rank` 上自旋死锁。
 
 `multimem.st` 会写包括本卡在内的所有副本，因此不会在 `r == g.rank` 上自旋死锁。
 

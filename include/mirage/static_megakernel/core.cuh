@@ -613,15 +613,19 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
 #endif
   }
 #ifdef STATIC_TP_BARRIER
-  // BEFORE the resets, not after. A rank entering launch n proves it finished launch n - 1 (one stream, serialized),
-  // so "every rank is in launch n" means no rank still consumes a buffer of launch n - 1 -- the resets below memset
-  // this GPU's own outputs to 0xFF, and those are exactly what a peer reads (wo_a_part, sparse_attn_ml). Wait after
-  // the resets instead and a late peer loses its input and hangs in its poll for ever, not merely gets NaN.
-  // It also bounds the drift at one launch, which is what the two-set exchange region needs (see the comment on the
-  // else branch): two launches ahead aliases the set a peer is still reading.
-  // The slot is NOT the exchange set's (push16 adds rg_set(); this store does not): a peer one launch ahead has
-  // written a LARGER gen, and ">= gen" still holds, so a stale value from the other set cannot satisfy the wait.
-  // The host path's barrier below does the same thing with push16 (FINDINGS_correctness.md §4).
+  // Every rank in this launch before any task runs. The cross-rank state is the exchange region only -- g.cnt and
+  // the resets are this GPU's own (host.cuh: "buffers only this GPU writes"), so the resets below are safe to do
+  // wherever this barrier sits; what is not safe is a task starting before the peers of THIS launch are here.
+  // The region has two sets (rg_set(): launch n uses set n % 2) and a consumer reads in launch n what its peers
+  // publish in launch n -- the mHC sum_store's 80 KB of streams, for one. So a peer one launch behind publishes into
+  // the OTHER set and its slot still holds the region's 0xFF fill, which is NaN as a float: a finite input with a
+  // NaN output, which is what l2_nan.log shows. Two behind also overwrites the set a peer is reading.
+  // `>= gen`, not `== gen`: a peer one launch ahead has already finished this one (it cannot be at n + 1 without
+  // having completed n), so its set n % 2 is written and its wait is satisfiable -- and requiring equality would
+  // deadlock the moment two ranks drift. A peer cannot pass this line at n + 2 while this one is at n, because its
+  // own barrier at n + 1 needed this rank at n + 1: the drift stays at one launch, which is what the two sets need.
+  // The slot is NOT the exchange set's (push16 adds rg_set(); this store does not): launches n and n + 1 write the
+  // same slot with a larger number, so a stale value from the other set can never satisfy the wait.
   if (threadIdx.x == 0) {
     if (sm_id == 0) {
       uint4 const hello = make_uint4(gen, gen, gen, gen);
