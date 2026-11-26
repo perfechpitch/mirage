@@ -166,6 +166,19 @@ def _ok_rows(rows: int) -> bool:
 assert not HEAD or MHC, "DSV41_HEAD: DSV41_STATIC_MHC=1"
 KEEP = os.environ.get("DSV41_STATIC_KEEP", "sgl" if CHECK else "static")
 PDL = os.environ.get("DSV41_STATIC_PDL", "0") != "0"
+# TPB (dsv41_static_layer): -DSTATIC_TP_BARRIER, the kernel's start barrier (core.cuh kernel_begin). It sits before
+# the per-launch resets and its premise is "a rank that has started launch n has finished launch n - 1" -- which is
+# only true without PDL: a programmatic launch starts the kernel while the previous one still runs. So PDL and the
+# barrier are mutually exclusive; correctness wins, and PDL=1 with TPB=1 says so instead of overlapping silently.
+TPB = os.environ.get("DSV41_STATIC_TPB", "1") != "0"
+if PDL and TPB:
+    if os.environ.get("DSV41_STATIC_PDL_FORCE", "0") == "0":
+        PDL = False
+    else:
+        # FORCE keeps PDL, so the barrier has to go: write it back through the env the layers read, or the hook and
+        # the build would disagree about it.
+        os.environ["DSV41_STATIC_TPB"] = "0"
+        TPB = False
 OUT = os.environ.get("DSV41_STATIC_OUT", os.path.join(ROOT, "build", "sgl_static_dsv41"))
 MAX_POS = int(os.environ.get("DSV41_STATIC_MAX_POS", "2047"))
 os.environ.setdefault("MIRAGE_STATIC_BUILD_CACHE", os.path.join(OUT, "cache"))
@@ -192,9 +205,8 @@ def _relrms(a, b):
 
 TPBAR = os.environ.get("DSV41_STATIC_TPBAR", "1" if MHC else "0") != "0"   # a TP barrier after each sublayer's kernel
 # TPB (dsv41_static_layer): -DSTATIC_TP_BARRIER, the kernel's own start barrier (core.cuh kernel_begin), built into
-# every static layer. It bounds the TP drift at zero without a host round trip, and covers the MHC=0 chain that TPBAR
-# leaves unguarded. DSV41_STATIC_TPB=0 builds it out.
-TPB = os.environ.get("DSV41_STATIC_TPB", "1") != "0"
+# every static layer. It bounds the TP drift at one launch without a host round trip, and covers the MHC=0 chain that
+# TPBAR leaves unguarded. DSV41_STATIC_TPB=0 builds it out. Defined above with PDL: the two cannot both be on.
 
 
 def _tpb(what: str = "") -> None:
@@ -368,7 +380,7 @@ def _init_cuda_graphs(self, *args, **kwargs):
     out = _orig_init(self, *args, **kwargs)
     _STATE["serving"] = True
     _log(f"static layers serving: T={T}, TS={TS}, check={CHECK}, AR={AR}, MHC={MHC}, POOL={POOL}, KEEP={KEEP}, "
-         f"TPBAR={TPBAR}, TPB={TPB}, "
+         f"TPBAR={TPBAR}, TPB={TPB}, PDL={PDL}, "
          f"check layers={sorted(CK_LAYERS) or 'all'}, steps<={CHECK_STEPS}; compared {_STATE['checks']} sublayers so far")
     if not CHECK and not TPBAR and not TPB and torch.distributed.is_initialized() \
             and torch.distributed.get_world_size() > 1:
@@ -378,6 +390,13 @@ def _init_cuda_graphs(self, *args, **kwargs):
         # (FINDINGS_correctness.md §4: L3 or L4, by timing). DSV41_STATIC_TPBAR=1 or DSV41_STATIC_TPB=1 rules it out.
         _log("WARNING: no TP barrier in a pure static chain (check=0, TPBAR=0, TPB=0, 8 ranks): the ranks are not "
              "kept in lockstep. That is the leading explanation for NaN from the first Reuse layer on")
+    if os.environ.get("DSV41_STATIC_PDL", "0") != "0" and TPB and not PDL:
+        # asked for both: the barrier's premise is that a started launch implies the previous one ended, and a PDL
+        # launch violates it (the resets would overlap the kernel whose output peers still read). Turning PDL off is
+        # the fix; DSV41_STATIC_PDL_FORCE=1 keeps it and drops the barrier instead.
+        _log("NOTE: DSV41_STATIC_PDL=1 with TPB=1: PDL turned off (a programmatic launch starts before the previous "
+             "kernel ends, which is the premise the TP barrier relies on). DSV41_STATIC_PDL_FORCE=1 for a PDL "
+             "timing run with DSV41_STATIC_TPB=0")
     return out
 
 

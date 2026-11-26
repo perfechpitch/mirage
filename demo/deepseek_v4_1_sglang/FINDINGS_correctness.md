@@ -189,6 +189,21 @@ reuse 层是**第一个消费另一层产物的层**（读 L2 的 `compress_cach
 仍然没有跨 GPU 栅栏**。那条路径默认关闭；现在由 `dsv41_static_layer.py` 里的断言兜住 ——
 两者同时出现时直接报错，而不是静默丢掉漂移界。将来若要启用该分支，得先给它也加一块。
 
+#### PDL 与栅栏互斥
+
+栅栏的语义依赖一个前提：**一个 rank 启动了 launch n，就说明它已经跑完 launch n−1**。
+PDL（programmatic dependent launch, `-DSTATIC_PDL_TRIGGER=1`）恰好违反它 —— kernel 在上一个 kernel
+还在跑时就启动，而 reset 就发生在 kernel 起点。所以两者不能同时开：
+
+| `DSV41_STATIC_PDL` | `DSV41_STATIC_TPB` | 结果 |
+|---|---|---|
+| 0（默认） | 1（默认） | PDL=0, TPB=1 ✅ |
+| 1 | 1 | **PDL 被强制关掉**，打 NOTE |
+| 1 + `DSV41_STATIC_PDL_FORCE=1` | 1 | **TPB 被强制关掉**（写回环境变量，build 与 hook 一致） |
+| 1 | 0 | PDL=1, TPB=0（纯计时跑） |
+
+五种组合都实跑过决策表，没有"两个都开"的格子。PDL 默认是 0，所以默认 serving 路径本来就满足前提。
+
 **为什么不再用 host 侧 `TPBAR`（NCCL）**：它每个 sublayer 一次，一个 step 80 次，bs=1 延迟敏感；
 内核栅栏没有 host 往返。两者都在，`TPBAR` 仍按 `MHC` 决定，保留作为对照。
 
