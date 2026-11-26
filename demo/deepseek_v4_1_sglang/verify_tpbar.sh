@@ -23,16 +23,19 @@ LAYERS=${DSV41_E2E_LAYERS:-6}
 REPS=${REPS:-2}
 WARM=${WARM:-1}
 ROW=${ROW:-0}
-VENV=${VENV:-/opt/dlami/nvme/saboxu/venvs/sglang/bin}
+VENV=${VENV:-/opt/dlami/nvme/saboxu/venvs/mirage/bin}
 OUT=${OUT:-/tmp/tpbar_verify}
 export PATH=$VENV:$PATH
+# the planner's z3, as full_decode needs it (FINDINGS §8.2); absent, the build still runs from the source tree
+export LD_LIBRARY_PATH=/opt/dlami/nvme/saboxu/venvs/mirage/lib/python3.12/site-packages/z3/lib:${LD_LIBRARY_PATH:-}
 mkdir -p "$OUT"
 
-# the sglang venv has torch + torchrun; e2e_decode imports no sglang, only torch and the layer module
+# what e2e_decode reads: DSV41_E2E_LAYERS, DSV41_E2E_MHC, DSV41_STATIC_TPB / DSV41_E2E_NOSYNC (the barrier pair),
+# and STATIC_TOKENS (its T; 1, the script's own default). DSV41_STATIC_ATTN/MOE/POOL belong to the SGLang hook and
+# mean nothing here -- set them and a run would look configured while none of it took effect.
 export DSV41_E2E_LAYERS=$LAYERS
-export DSV41_STATIC_ATTN=all DSV41_STATIC_MOE=all DSV41_STATIC_POOL=1
-export DSV41_STATIC_MHC=1 DSV41_STATIC_AR=0 DSV41_STATIC_TPBAR=0
-export DSV41_STATIC_MAX_POS=33000
+export DSV41_E2E_MHC=1            # the model has hc_mult=4: mHC off is a diagnosis, not the model
+export STATIC_TOKENS=1
 
 run() {   # run <tag> <out-dir> <env...>
   local tag=$1 dir=$2; shift 2
