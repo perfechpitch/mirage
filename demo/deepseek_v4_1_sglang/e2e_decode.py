@@ -337,6 +337,20 @@ if DEBUG:   # now the GPU is idle: what the polled buffers hold AFTER the step s
                     fh.write(f" per token {per}")
                 fh.write("\n")
 
+    # The exchange region: the ONLY cross-rank state (FINDINGS 4.3), and the one thing the dump above cannot see --
+    # it lists the layer's declared tensors, not the region the sum_store publishes into. It is zero-filled at
+    # allocation (_exchange_region), so on its own a region that a peer never wrote reads all zero, and a 0xFF here
+    # can only have been pushed in by someone: either says which witness failed.
+    if pool.buf is not None:
+        with open(f"{a.out}/exchange_rank{RANK}.txt", "w") as fh:
+            b = pool.buf.detach().contiguous().view(torch.uint8)
+            slot = int(pool.slot)
+            for k in range(int(pool.taken)):
+                r = b[k * slot:(k + 1) * slot]
+                nz = int((r != 0).sum())
+                nff = int((r == 0xFF).sum())
+                fh.write(f"region {k:>2} slot {slot}: nonzero {nz} of {r.numel()}, 0xFF {nff}\n")
+
 if a.dump:
     # The step above ran every layer once from the deterministic init (random_inputs seeds each tensor's own
     # generator), so two processes with the same arguments start from the same bytes: the dumps must match bit
