@@ -244,26 +244,28 @@ L0–L2 只写自己的缓冲。所以竞态第一次有了"跨层传值"这个�
 
 #### 编译验证（CPU 上的 nvcc，不需要 GPU）
 
-四组 flag 全部编译通过（attn3 / moe4 / head 三类真实生成的层）：
+三类真实生成的层（`attn3_t1` / `moe` / `head`），带/不带 `-DSTATIC_TP_BARRIER`，全部零错误：
 
-| 组合 | 结果 |
-|---|---|
-| `-DSTATIC_RESET_IN_KERNEL`（serving，无栅栏） | ✅ `.nv_fatbin` = 0x02de80 |
-| `-DSTATIC_RESET_IN_KERNEL -DSTATIC_TP_BARRIER` | ✅ `.nv_fatbin` = 0x02df20（**+160 字节**设备代码） |
-| 两者都不给（host 路径） | ✅ |
-| `-DSTATIC_NO_START_BARRIER`（± `TP_BARRIER`） | ✅ 两种 fatbin 尺寸**完全相同** |
+| 层 | 不带栅栏 `.nv_fatbin` | 带栅栏 | 增量 |
+|---|---|---|---|
+| `attn3_t1` | 0x02da58 | 0x02df00 | **+1192 B** |
+| `moe` | 0x03dcb8 | 0x03e148 | **+1160 B** |
+| `head` | 0x05a960 | 0x05adf8 | **+1176 B** |
 
 两个要点：
 
-1. **`+160` 字节证明栅栏真的进了设备代码**。最初我以为"`.so` 尺寸相同 = 没编进去"，其实是段对齐把
-   160 字节吸收了；看 `.nv_fatbin` 而非文件大小才看得出。另外 `nvcc -E` 里
-   `EXCHANGE_HELLO + (size_t)g.rank * 16` 的出现次数是 1 次（带 flag）/ 0 次（不带），也是直接证据。
-2. **`NO_START_BARRIER` ± `TP_BARRIER` 的 fatbin 尺寸完全相同**，直接证明了下面那个缺口。
+1. **`.nv_fatbin` 的增量是"栅栏进了设备代码"的证据**。不要看 `.so` 的文件大小：ELF 段对齐会把
+   这一两千字节吸收掉，文件尺寸可能一模一样。也不要用 `nvcc -E`——`-DSTATIC_NO_START_BARRIER`
+   ± `TP_BARRIER` 时 fatbin 尺寸**完全相同**，正是因为那块代码在另一个分支里被预处理掉了。
+2. **增量为什么是 1.1–1.2 KB 而不是几百字节**：每个 SM 的 thread 0 要依次等 8 个 rank，
+   `for (r = 0; r < GPUS; r++)` 被完全展开 —— 8 段 "读槽 + 比较 + 回跳"，加上 push16 的
+   `multimem.st`，一千多字节是合理的。**旧的 `+160 B` 记录是另一版构建测的，已作废**；
+   以这张表为准（同一条命令可复现，见 §9 变更记录）。
 
 **已知剩余缺口**：`STATIC_TP_BARRIER` 那块代码在 `#elif defined(STATIC_RESET_IN_KERNEL)` 分支内
-（`core.cuh:584`），所以 **`STATIC_NO_START_BARRIER` 分支（548–583，`DSV41_X_FLAG=1` 的实验路径）
-仍然没有跨 GPU 栅栏**。那条路径默认关闭；现在由 `dsv41_static_layer.py` 里的断言兜住 ——
-两者同时出现时直接报错，而不是静默丢掉漂移界。将来若要启用该分支，得先给它也加一块。
+（`core.cuh` 584 那条），所以 **`STATIC_NO_START_BARRIER` 分支（548–583，`DSV41_X_FLAG=1` 的实验路径）
+仍然没有跨 GPU 栅栏**。那条路径默认关闭；现在由 `tpb_flag()`（`dsv41_static_layer.py:445`）的断言兜住
+—— 两者同时出现时直接报错，而不是静默丢掉漂移界。将来若要启用该分支，得先给它也加一块。
 
 #### build cache 会正确失效（否则验收会用到没栅栏的旧 so）
 
