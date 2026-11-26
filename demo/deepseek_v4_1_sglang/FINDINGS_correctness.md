@@ -113,6 +113,16 @@ float 位模式就是 **NaN**。所以症状不是"数值不准"，是确定的 
 serving 路径下每个 sublayer 是 8 个进程各自 stream 上一次独立 launch，**层间没有任何 host 同步**。
 8 个进程互相独立推进，落后 2 次是常态而不是意外。
 
+**决定性证据：同一套权重，只差"层间有没有 host 同步"。**
+
+| run | 模式（hook 横幅） | 层间同步 | 结果 |
+|---|---|---|---|
+| `l2_pool3.log` | `(check, keep sgl, PDL False)` | ✅ 每层都跑 SGLang 自己的 kernel，它的 collective 顺带对齐 | L0–L6 relRMS 正常 |
+| `l2_nan.log` | `(replace, PDL False)` | ❌ 纯静态，8 个进程各跑各的 | attn L0–L3 有限，**attn L4 `y finite=False, x finite=True`**，之后全 NaN |
+
+这条对照比"改 flag 前后"强得多：**同一个脚本、同一套权重、同一批 prompt**，唯一变量是同步。
+同步 → 干净；不同步 → 首个 reuse 层 NaN。这是"缺跨 rank 栅栏"的直接因果，不是相关性。
+
 ### 4.2 三条路径的实测对照
 
 | 路径 | reset 由谁做 | 层间 TP 对齐 | 结果 |
@@ -155,15 +165,20 @@ serving 路径下每个 sublayer 是 8 个进程各自 stream 上一次独立 la
 | 工具 | 它**实际**能看到什么 | 看不到什么 |
 |---|---|---|
 | `DSV41_E2E_DEBUG=1` → `post_rank{R}.txt` | 层**声明的张量**（`attn[i].w` / `moe[i].w`）里的 `0xFF` 计数 | kernel 内部 scratch（`wo_a_part`、`sparse_attn_ml`）、交换区 |
-| 新增：同一开关 → `exchange_rank{R}.txt` | 交换区**每个 region** 的 nonzero 字节数与 `0xFF` 计数 | 具体是哪个 peer 的哪个偏移（只到 region 粒度） |
-| `DSV41_RESET_DEBUG=1` → stderr 的 `[rl]` 行 | reset 列表每项的**指针、字节数、填充值**（`v=255`） | 跑完之后这些缓冲里实际剩什么 |
+| 同上 → `exchange_rank{R}.txt` | 交换区**每个 region** 的 nonzero 与 `0xFF` 计数 | 只到 region 粒度 |
+| **新** `DSV41_RESET_DEBUG=1` + `DSV41_E2E_DBGLOG=<该 run 的日志>` → `buffers_rank{R}.txt` | **每一个** reset 缓冲：名字（从 `layer.cu` 的 `buf.N` 声明 1:1 匹配）、字节、NaN 数、`0xFF` 数、首个 NaN 的下标 | 只是**步末**状态 |
+
+第三项是这轮新做的（`dump_buffers.py` + `e2e_decode` 接线）。`[rl]` 行给出每个 reset 缓冲的**地址**，
+`e2e_decode` 在**自己进程内**用 `cudaMemcpy` 读回——设备地址只在本进程有效，跨进程读会挂，
+所以 `dump_buffers.py` 单独跑时只对"指针所属进程"合法，这点在它的 docstring 里写明了。
 
 判读方式（这才是关键，别再含糊）：
-- `exchange_rank` 里某 region **nonzero = 0** → 那个 region 的 peer 一次都没发布过
-  （交换区是清零分配的，所以"没写过"= 全零），支持"漂移导致消费方读到未发布数据"；
-- 出现 **`0xFF`** → 它是被别人**推进来的**（不是分配填充），说明 NaN 是从某个本地
-  0xFF 缓冲经 sum_store 流进交换区的，指向"本地哨兵被提前读"那条链；
-- `post_rank` 里声明张量有 `0xFF` → 问题在层外部的输入，不在交换协议。
+- **`NaN` 数 = 字节数/4** → 整个缓冲**还是 0xFF 填充**（0xFFFFFFFF 按 float32 就是 NaN），
+  即"生产者一次都没写"；
+- **`NaN` 数 < 字节数/4 且 `first NaN` 不为 0** → 里面**被推进了真 NaN**，前面若干字是真实数据；
+- `nonzero = 0` → 缓冲被清零过（`v=0` 的反例），或从没被写。
+- 已知的局限：这是**步末**状态，NaN 级联会把首个坏层之后的一切都染成 NaN。要贴着故障点看，
+  用 `DSV41_E2E_LAYERS=5`（最后一层正好是首个出 NaN 的 attn L4），而不是 6 层把 L5 放最后。
 
 **在拿到这些之前，不要在任何地方断言 NaN 的确切来源。**
 

@@ -63,8 +63,18 @@ run() {   # run <tag> <out-dir> <env...>
 }
 
 # the control first: it builds the TPB=0 set, which tpb0_hostsync then reuses, and its answer is the one that says
-# whether the barrier is the difference at all
+# whether the barrier is the difference at all.
+# The control also carries the buffer census: DSV41_RESET_DEBUG=1 has each layer print its reset entries' addresses
+# to stderr, DSV41_E2E_DBGLOG points e2e_decode at that captured stderr, and it reads every one back in its own
+# process after the step (buffers_rank{R}.txt). That answers the one question still open -- whether the NaN sat in a
+# buffer the layer fills with 0xFF each launch (a local sentinel read early) or in an exchange buffer a peer never
+# published this launch (FINDINGS 4.3). A NaN count equal to bytes/4 is "still the fill"; a smaller one with a
+# nonzero first-NaN index is "a real NaN was pushed in".
+export DSV41_RESET_DEBUG=1
+export DSV41_E2E_DEBUG=1
+export DSV41_E2E_DBGLOG=$OUT/tpb0_nosync.log   # run() sends stdout+stderr there
 run tpb0_nosync     "$OUT/build_tpb0" DSV41_STATIC_TPB=0 DSV41_E2E_NOSYNC=1
+unset DSV41_RESET_DEBUG DSV41_E2E_DEBUG DSV41_E2E_DBGLOG
 run tpb1            "$OUT/build_tpb1" DSV41_STATIC_TPB=1
 run tpb0_hostsync   "$OUT/build_tpb0" DSV41_STATIC_TPB=0
 
@@ -75,3 +85,12 @@ for t in tpb1 tpb0_hostsync tpb0_nosync; do
 done
 echo
 echo "expected: tpb1 finite, tpb0_hostsync finite, tpb0_nosync NOT FINITE (the 11-25 NaN, reproduced on purpose)"
+if [ -f "$OUT/build_tpb0/buffers_rank0.txt" ]; then
+  echo
+  echo "=== the control's buffer census (rank 0), which buffer held the NaN:"
+  grep -E "NaN [1-9]" "$OUT/build_tpb0/buffers_rank0.txt" | head -12
+  echo "  (full list: $OUT/build_tpb0/buffers_rank0.txt)"
+else
+  echo
+  echo "no buffer census: the control's DEBUG block did not run (see $OUT/tpb0_nosync.log)"
+fi

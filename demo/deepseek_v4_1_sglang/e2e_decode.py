@@ -351,6 +351,48 @@ if DEBUG:   # now the GPU is idle: what the polled buffers hold AFTER the step s
                 nff = int((r == 0xFF).sum())
                 fh.write(f"region {k:>2} slot {slot}: nonzero {nz} of {r.numel()}, 0xFF {nff}\n")
 
+    # The kernel's own scratch (wo_a_part, sparse_attn_ml, the exchange y_sent of each layer ...): 0xFF-filled and
+    # polled, and invisible to the dumps above. DSV41_RESET_DEBUG=1 makes each layer print their addresses on
+    # stderr before the run ([rl] lines: core.cuh / host.cuh), so with the stderr captured to DSV41_E2E_DBGLOG
+    # this reads every one of them back IN THIS PROCESS -- the pointers are this process's, so another process
+    # cannot read them (dump_buffers.py documents that and is for the standalone case).
+    # It is the state at the END of the step, so a NaN cascade smears everything after the first bad layer: to
+    # read the census right at the failure, run DSV41_E2E_LAYERS=5, whose last layer is the first one that goes
+    # NaN (attn L4), instead of a 6-layer chain where L5 is last.
+    log = os.environ.get("DSV41_E2E_DBGLOG")
+    if log and os.path.exists(log):
+        import ctypes
+        import importlib.util
+        from cuda.bindings import runtime as rt
+
+        def _dev_bytes(ptr, n):
+            """n bytes at a raw device address of THIS process (the layer's own allocation)."""
+            buf = ctypes.create_string_buffer(n)
+            (err,) = rt.cudaMemcpy(buf, ptr, n, rt.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+            if err != rt.cudaError_t.cudaSuccess:
+                raise RuntimeError(f"cudaMemcpy({ptr:#x}, {n}): {err}")
+            return buf.raw[:n]
+
+        spec = importlib.util.spec_from_file_location(
+            "_db", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dump_buffers.py"))
+        db = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(db)
+        ents = [e for e in db.resets(log) if e["rank"] == RANK]
+        # the layer's declarations, for the buffer names: <out>/rank<R>/<attn|moe><layer>_t<T>/build/layer.cu
+        def _cu(kind):
+            return os.path.join(a.out, f"rank{RANK}", f"{kind}0_t{T}", "build", "layer.cu")
+        cu = next((p for p in map(_cu, ("attn", "moe")) if os.path.exists(p)), None)
+        decls = db.declarations(cu) if cu else []
+        with open(f"{a.out}/buffers_rank{RANK}.txt", "w") as fh:
+            if not ents:
+                fh.write(f"no [rl] rank {RANK} line in {log}: DSV41_RESET_DEBUG=1 was not on, or the stderr went "
+                         "elsewhere\n")
+            for label, n, v, rd, n_nan, nff, nz, first in db.analyze(
+                    RANK, ents, decls, copy=lambda p, k: _dev_bytes(p, k)):
+                fh.write(f"{label} bytes {n} v {v} by_reader {rd}: NaN {n_nan} 0xFF {nff} nonzero {nz}"
+                         f" first NaN {first}\n")
+        log(f"buffer census -> {a.out}/buffers_rank{RANK}.txt ({len(ents)} reset entries)")
+
 if a.dump:
     # The step above ran every layer once from the deterministic init (random_inputs seeds each tensor's own
     # generator), so two processes with the same arguments start from the same bytes: the dumps must match bit
