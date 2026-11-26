@@ -191,6 +191,10 @@ def _relrms(a, b):
 
 
 TPBAR = os.environ.get("DSV41_STATIC_TPBAR", "1" if MHC else "0") != "0"   # a TP barrier after each sublayer's kernel
+# TPB (dsv41_static_layer): -DSTATIC_TP_BARRIER, the kernel's own start barrier (core.cuh kernel_begin), built into
+# every static layer. It bounds the TP drift at zero without a host round trip, and covers the MHC=0 chain that TPBAR
+# leaves unguarded. DSV41_STATIC_TPB=0 builds it out.
+TPB = os.environ.get("DSV41_STATIC_TPB", "1") != "0"
 
 
 def _tpb(what: str = "") -> None:
@@ -364,14 +368,16 @@ def _init_cuda_graphs(self, *args, **kwargs):
     out = _orig_init(self, *args, **kwargs)
     _STATE["serving"] = True
     _log(f"static layers serving: T={T}, TS={TS}, check={CHECK}, AR={AR}, MHC={MHC}, POOL={POOL}, KEEP={KEEP}, "
-         f"TPBAR={TPBAR}, "
+         f"TPBAR={TPBAR}, TPB={TPB}, "
          f"check layers={sorted(CK_LAYERS) or 'all'}, steps<={CHECK_STEPS}; compared {_STATE['checks']} sublayers so far")
-    if not CHECK and not TPBAR and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        # the ranks launch the same sublayer sequence from 8 processes: without a barrier after each kernel one
-        # rank runs a layer ahead and writes a buffer a peer still reads -- the leading explanation for the first
-        # Reuse layer returning NaN with a finite input (FINDINGS_correctness.md §4: L3 or L4, by timing).
-        _log("WARNING: TPBAR=0 in a pure static chain (check=0, 8 ranks): the ranks are not kept in lockstep. "
-             "That is the leading explanation for NaN from the first Reuse layer on; DSV41_STATIC_TPBAR=1 rules it out")
+    if not CHECK and not TPBAR and not TPB and torch.distributed.is_initialized() \
+            and torch.distributed.get_world_size() > 1:
+        # the ranks launch the same sublayer sequence from 8 processes: with neither barrier one rank runs a launch
+        # ahead, two ahead aliases the exchange set a peer still reads, and the per-launch resets are 0xFF (NaN as
+        # float) -- the leading explanation for the first Reuse layer returning NaN with a finite input
+        # (FINDINGS_correctness.md §4: L3 or L4, by timing). DSV41_STATIC_TPBAR=1 or DSV41_STATIC_TPB=1 rules it out.
+        _log("WARNING: no TP barrier in a pure static chain (check=0, TPBAR=0, TPB=0, 8 ranks): the ranks are not "
+             "kept in lockstep. That is the leading explanation for NaN from the first Reuse layer on")
     return out
 
 

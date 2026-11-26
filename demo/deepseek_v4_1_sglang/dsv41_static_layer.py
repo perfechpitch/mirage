@@ -491,6 +491,13 @@ class StaticAttn(MhcMixin):
         # 7 by_reader ones to their readers, so whatever the harness wrote into them is consumed once.
         if os.environ.get("DSV41_STATIC_SERVING", "1") != "0":
             flags.insert(0, "-DSTATIC_RESET_IN_KERNEL")
+        # STATIC_TP_BARRIER (core.cuh kernel_begin): a layer per process, and nothing on the host lines the TP ranks
+        # up. The exchange region has two sets, so a rank one launch ahead is still safe; two ahead aliases the set a
+        # peer is reading, and the buffers reset at each launch are memset to 0xFF -- a NaN as float, so the symptom is
+        # NaN, not garbage (FINDINGS_correctness.md §4). The barrier bounds the drift at zero: each SM's thread 0 waits
+        # until every rank has published this launch's number. DSV41_STATIC_TPB=0 for a timing run.
+        if tp > 1 and os.environ.get("DSV41_STATIC_TPB", "1") != "0":
+            flags.append("-DSTATIC_TP_BARRIER")
         if PROF_SHARE:
             flags.append("-DSTATIC_STAMP_REBIND")
         if XFLAG:
@@ -728,6 +735,10 @@ class StaticMoE(MhcMixin):
         # 7 by_reader ones to their readers, so whatever the harness wrote into them is consumed once.
         if os.environ.get("DSV41_STATIC_SERVING", "1") != "0":
             flags.insert(0, "-DSTATIC_RESET_IN_KERNEL")
+        # STATIC_TP_BARRIER (core.cuh kernel_begin): the same drift bound as the attention build (see StaticAttn);
+        # the MoE kernel's own resets and its exchange set alias the same way. DSV41_STATIC_TPB=0 for a timing run.
+        if tp > 1 and os.environ.get("DSV41_STATIC_TPB", "1") != "0":
+            flags.append("-DSTATIC_TP_BARRIER")
         if engram or head:   # the gate / the head's GEMM waits on the post's counter: a release (tasks/engram_gate.cuh)
             fast = "-DHCP_FAST_END" in flags
             flags = [f for f in flags if f != "-DHCP_FAST_END"]
