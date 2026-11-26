@@ -304,6 +304,24 @@ DSV41_E2E_LAYERS=40 ./verify_tpbar.sh  # 完整 40 层（80 个 kernel）
 
 `tpb0_nosync` 就是 11-25 出 NaN 的那个配置。前两个共用一套 `TPB=0` build，所以只建两套。
 
+#### 已跑到的结果（11-26）
+
+反向对照 **已证实**。`DSV41_E2E_LAYERS=6`、`TPB=0`、`DSV41_E2E_NOSYNC=1`（= 11-25 配置）：
+
+```
+[e2e] built 6 layers in 1.8 min on rank 0
+[e2e] NOT FINITE in 6 sublayers, the first is attn L3: attn L3, moe L3, attn L4, moe L4, attn L5, moe L5
+```
+
+- 首个非有限就是 **`attn L3`**，之后 L3–L5 全毁 —— 与 11-25 `e2e_t1.log` 的 L3 NaN **一字不差**。
+- 而这一步的输入是有限的（同一份随机 KV，11-26 的白盒扫描 0 个非有限 scale 字节），
+  所以不是"输入带 NaN"，是 kernel 自己**读**到了 `0xFF` 哨兵。
+- 之后进程在 warmup 那一步**挂住**（`dist.barrier()` 再也到不了，有 rank 在 kernel 里自旋）。
+  所以这条对照必须"只跑一步"，否则会白等：这正是 `DSV41_E2E_ONE=1` 存在的原因，
+  也是"漂移"的第二个表现（不只是 NaN，还会死锁）。
+
+正向（`TPB=1`）与 `tpb0_hostsync` 两档待 GPU 空闲后补跑。
+
 **为什么不用 `l2_check.py` 做这条对照**：`CHECK=0` 的纯静态链会让它在没比过任何 sublayer 时
 主动 `exit FAILED`（"a check that compared nothing must not read as a pass"）—— 那是它该做的；
 而 `CHECK=1` 每层先跑 SGLang 的 kernel，那些 collective 顺便把 rank 对齐了，**掩盖**了漂移。

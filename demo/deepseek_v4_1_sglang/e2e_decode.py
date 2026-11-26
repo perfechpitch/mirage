@@ -354,6 +354,13 @@ if a.dump:
         moe[-1].w["logits"].detach().cpu().contiguous().numpy().tofile(os.path.join(a.dump, "logits.bin"))
     log(f"dumped {a.layers} layers' x_out/streams_out and the logits to {a.dump}")
 
+if os.environ.get("DSV41_E2E_ONE", "0") != "0":
+    # One step and the verdict. The finite check above is the whole point of this mode: a chain without a barrier
+    # can spin in the *next* launch (the drift shows up as a hang once the first step has run), so it must not walk
+    # into the warmup's dist.barrier() and the timing loop.
+    log("DSV41_E2E_ONE: the one step and its verdict, no timing loop")
+    os._exit(0)
+
 for _ in range(a.warmup):
     step()
 torch.cuda.synchronize()

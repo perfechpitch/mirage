@@ -36,15 +36,22 @@ mkdir -p "$OUT"
 export DSV41_E2E_LAYERS=$LAYERS
 export DSV41_E2E_MHC=1            # the model has hc_mult=4: mHC off is a diagnosis, not the model
 export STATIC_TOKENS=1
+# one step and the verdict, no timing loop: the question here is finite or not, and a chain with no barrier spins in
+# the *next* launch (measured: the 11-25 configuration printed NOT FINITE from attn L3, then hung in the warmup step)
+export DSV41_E2E_ONE=${DSV41_E2E_ONE:-1}
 
 run() {   # run <tag> <out-dir> <env...>
   local tag=$1 dir=$2; shift 2
   echo "=== $tag"
-  env "$@" torchrun --nproc_per_node=8 e2e_decode.py --checkpoint "$CKPT" --row "$ROW" \
+  # a timeout, not just patience: with no barrier at all the 11-25 failure could be a spin (hc_post_combine's 4
+  # CTAs never end) rather than a NaN, and a hung torchrun would eat the whole window
+  timeout "${TIMEOUT:-900}" env "$@" torchrun --nproc_per_node=8 e2e_decode.py --checkpoint "$CKPT" --row "$ROW" \
       --layers "$LAYERS" --reps "$REPS" --warmup "$WARM" --out "$dir" > "$OUT/$tag.log" 2>&1
   local rc=$?
   local verdict
-  if grep -q "NOT FINITE" "$OUT/$tag.log"; then
+  if [ $rc -eq 124 ]; then
+    verdict="TIMEOUT (${TIMEOUT:-900}s) -- it spun, which is the drift too"
+  elif grep -q "NOT FINITE" "$OUT/$tag.log"; then
     verdict=$(grep -m1 -o "NOT FINITE.*" "$OUT/$tag.log")
   elif grep -q "x_out finite" "$OUT/$tag.log"; then
     verdict=$(grep -m1 -o "all .*x_out finite.*" "$OUT/$tag.log")
@@ -55,9 +62,11 @@ run() {   # run <tag> <out-dir> <env...>
   echo "    $OUT/$tag.log"
 }
 
+# the control first: it builds the TPB=0 set, which tpb0_hostsync then reuses, and its answer is the one that says
+# whether the barrier is the difference at all
+run tpb0_nosync     "$OUT/build_tpb0" DSV41_STATIC_TPB=0 DSV41_E2E_NOSYNC=1
 run tpb1            "$OUT/build_tpb1" DSV41_STATIC_TPB=1
 run tpb0_hostsync   "$OUT/build_tpb0" DSV41_STATIC_TPB=0
-run tpb0_nosync     "$OUT/build_tpb0" DSV41_STATIC_TPB=0 DSV41_E2E_NOSYNC=1
 
 echo
 echo "=== summary"
