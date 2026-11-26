@@ -613,17 +613,21 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
 #endif
   }
 #ifdef STATIC_TP_BARRIER
-  // Every rank in this launch before any task runs. The cross-rank state is the exchange region only -- g.cnt and
-  // the resets are this GPU's own (host.cuh: "buffers only this GPU writes"), so the resets below are safe to do
-  // wherever this barrier sits; what is not safe is a task starting before the peers of THIS launch are here.
-  // The region has two sets (rg_set(): launch n uses set n % 2) and a consumer reads in launch n what its peers
-  // publish in launch n -- the mHC sum_store's 80 KB of streams, for one. So a peer one launch behind publishes into
-  // the OTHER set and its slot still holds the region's 0xFF fill, which is NaN as a float: a finite input with a
-  // NaN output, which is what l2_nan.log shows. Two behind also overwrites the set a peer is reading.
+  // Every rank in this launch before any task runs. The cross-rank state is the exchange region alone: g.cnt and the
+  // resets are this GPU's own (host.cuh: "buffers only this GPU writes"), so wherever this barrier sits the resets
+  // are safe -- what is not safe is a task starting before the peers of THIS launch are here.
+  // A consumer reads in launch n what its peers publish in launch n, into set n % 2 (rg_set()); the mHC sum_store's
+  // streams are such a buffer (the layer's 81920-byte exchange slot). A peer one launch behind publishes into the
+  // other set, so this launch reads that peer's launch n - 2 value -- stale, and on the first steps of a run never
+  // written at all; two behind overwrites the set a peer is reading. That is the aliasing the two sets bound, and
+  // FINDINGS_correctness.md 4.3-4.6 has the measurements. It does NOT establish why the bad value is a NaN rather
+  // than a number: that pathway is still open there, so do not restate it as a mechanism here.
   // `>= gen`, not `== gen`: a peer one launch ahead has already finished this one (it cannot be at n + 1 without
   // having completed n), so its set n % 2 is written and its wait is satisfiable -- and requiring equality would
   // deadlock the moment two ranks drift. A peer cannot pass this line at n + 2 while this one is at n, because its
   // own barrier at n + 1 needed this rank at n + 1: the drift stays at one launch, which is what the two sets need.
+  // The slot is NOT the exchange set's (push16 adds rg_set(); this store does not): launches n and n + 1 write the
+  // same slot with a larger number, so a stale value from the other set can never satisfy the wait.
   // The slot is NOT the exchange set's (push16 adds rg_set(); this store does not): launches n and n + 1 write the
   // same slot with a larger number, so a stale value from the other set can never satisfy the wait.
   if (threadIdx.x == 0) {

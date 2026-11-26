@@ -124,45 +124,55 @@ serving 路径下每个 sublayer 是 8 个进程各自 stream 上一次独立 la
 `full_decode.py:67` 明确注释 `FLAGS` 里不含 `STATIC_RESET_IN_KERNEL`（`the host reset path`），
 与上表一致。**唯一没有栅栏的路径，正是唯一出 NaN 的路径。**
 
-### 4.3 0xFF 与 NaN 到底在哪 —— 只有交换区是跨卡的
+### 4.3 跨卡状态只有交换区；0xFF 与 NaN 的**确切**路径尚未查实
 
-**先纠正一个我一开始写错的结论。** 我最初以为"每次 launch reset 的缓冲区"被抹成 `0xFF`、
-而 peer 会去读它们，所以晚到的 rank 会毁掉 peer 的输入。**这是错的**：`g.cnt`（计数器）和
-reset 列表都是 `dmalloc` 出来的**卡内私有**内存（`host.cuh:435`、`host.cuh:527`），
-`core.cuh:588` 的原话就是 "the resets left to the start (the host's list: **buffers only this GPU
-writes**)"。所以 reset 在任何位置都不会影响别的 rank。
+**先纠正两处我自己写错的结论**（错误的原因比错误的代码更危险，见 §4.5 末尾）：
 
-真正跨卡的只有 **exchange 区**（`G::mc` / `G::rv`，"the exchange region: multicast address
-(GPUS > 1), this GPU's copy (**2 sets**)"）。而 `MHC=1`（11-25 那次和这次复现都用它）的 build 里
-它是有内容的 —— 实测 attn3_t1 / moe3_t1 的生成代码：
+1. ~~"每次 launch reset 的缓冲区被抹成 0xFF，而 peer 会去读它们"~~ —— **错**。`g.cnt`（计数器）
+   和 reset 列表都是 `dmalloc` 的**卡内私有**内存（`host.cuh:435`、`host.cuh:527`），`core.cuh:588`
+   原话是 "the resets left to the start (the host's list: **buffers only this GPU writes**)"。
+2. ~~"交换区未写入时是 0xFF"~~ —— **错**。`_exchange_region()`（`dsv41_static_layer.py:166`）分配后
+   立刻 `buf.zero_()`，所以未写入的交换格是 **0.0**，不是 NaN。
 
-```
-STATIC_EXCHANGE_SET     86016
-STATIC_EXCHANGE_HELLO   81920
-STATIC_EXCHANGE_OFFSETS 全 0
-STATIC_EXCHANGE_BYTES   slot 23 = 81920      ← mHC sum_store 的 streams 交换缓冲
-```
+**已经查实的部分**：
 
-即：**每个 set 里 offset 0 有 81920 字节的跨卡交换缓冲**（mHC 的 streams all-reduce），
-hello 槽在其后（81920 + rank*16，8 rank 共 128 字节），set 步长 86016。
-（非 mHC 的 build 里 `BYTES` 全 0，确实没有交换缓冲 —— 这也是为什么 11-25 那次是 `MHC=1` 才炸。）
+| 事实 | 证据 |
+|---|---|
+| 唯一的跨卡状态是 exchange 区（`G::mc`/`G::rv`，**2 套**） | `core.cuh:163`；`g.cnt`/resets 都是 `dmalloc` 私有 |
+| mHC=1 时交换区**非空**：每套 offset 0 有 81920 字节 | `attn3_t1`/`moe3_t1` 生成代码：`SET 86016`、`HELLO 81920`、`BYTES[23]=81920` |
+| 这块缓冲就是 mHC streams 的跨卡 all-reduce | `run_sum_store<StaticNode<...,23>>`（`attn3_t1/build/layer.cu:106`） |
+| 无 mHC 时 `BYTES` 全 0，**没有**交换缓冲 | 同一份生成代码；也解释了 11-25 那次要 `MHC=1` 才炸 |
+| 消费方在**同一个 launch** 内读 peer 在本次 launch 写的东西 | `sum_store` 的 push + 本地计数等待 |
 
-`0xFF` 是**交换区未写入时的初始填充**（就是本代码库的"尚未写入"哨兵，`runtime.cuh` 的
-`valid16` / `validf4` 都在判它），float 位模式即 NaN。所以读到它就是读到 NaN，
-与 `l2_nan.log` 的 `x finite=True / y NaN` 吻合。
+**尚未查实**：**为什么是 NaN 而不是"数值错"或"卡住"**。候选：
+- `gemm_tile.cuh:114` 是 `while (!valid16(x))` —— 读到哨兵是**自旋**（我这次确实观察到 NaN 之后进程挂住）；
+- `valid16` 的判据是 "至少一个 word 不是 0xFFFFFFFF"，所以**半个 16 字节被写**就会"通过"检查，
+  剩下的 0xFF 被当数据 → NaN。但这需要"门比写者更早放行"，而门（计数器）是卡内私有的，
+  这条链还没走通。
+
+**能一次性定性的实验**（`e2e_decode.py` 已经实现了，只是我还没在冻结配置下跑）：
+带 `DSV41_E2E_DEBUG=1` 跑一次，它会在步末把每个 buffer 的 `0xFF` 计数写进
+`post_rank{R}.txt`。如果 0xFF 出现在 reset 列表缓冲（`wo_a_part` / `sparse_attn_ml`），
+就是"本地哨兵被提前读"；如果出现在交换缓冲，就是交换协议；都没有，就得另找。
+**在拿到这个之前，不要在任何地方断言 NaN 的确切来源。**
 
 ### 4.4 为什么首个 NaN 落在第一个 reuse 层
 
-两步：
+已验证的是"跨层传值 + 时序"这一层，不涉及 NaN 的确切来源：
 
-1. **同一个 launch 内消费**：launch n 里，每个 rank 把 streams 写进 set `n % 2`，peer 在**同一个
-   launch n** 从 set `n % 2` 读。所以"所有 rank 都在 launch n"是数据存在的**前提**。
-2. **漂移 1 次就已经是错的**：落后一次的 peer 写的是 set `(n−1)%2`，当前 launch 要读的 set
-   `n%2` 里它那一格还是 launch `n−2` 的旧值（若从没写过，就是 0xFF → NaN）。
+1. **同一个 launch 内消费**：launch n 里每个 rank 把 streams 写进 set `n % 2`，peer 在同一个
+   launch n 从 set `n % 2` 读。所以"所有 rank 都在 launch n"是数据存在的**前提**。
+2. **漂移 1 次就已经是错的**：落后一次的 peer 写的是 set `(n−1)%2`，当前 launch 读的 set `n%2`
+   里它那一格还是 peer 在 launch `n−2` 写的东西。lag 2 时更糟：写到对方正在读的那一套。
+3. **为什么是"第一个" decode step**：objective 说根因定位在第一步。一个自洽的解释是——
+   越早期的 launch，交换区里"从没被写过"的格子越多（清零值 / 未完成态越多），
+   而越往后越可能只是**过期但有限**的旧值（悄悄算错，比 NaN 更难发现）。
+   **这一步是推测，不是证据**，要靠上面那个 DEBUG 实验或一次 32 步的长跑（看 NaN 是否只在
+   前几步出现）来确认。
 
 而 reuse 层（L3/L4）是**第一个消费另一层产物**的层（读 L2 的 `compress_cache` + `compress_idx`），
 L0–L2 只写自己的缓冲。所以竞态第一次有了"跨层传值"这个兑现点 —— 首次 NaN 在 L3/L4 之间移动，
-取决于启动时序，是竞态而非确定性算错。
+取决于启动时序，是竞态而非确定性算错（这一条有 11-25 与 11-26 两次独立复现，见 §4.6）。
 
 ### 4.5 修法（已落到代码）
 
