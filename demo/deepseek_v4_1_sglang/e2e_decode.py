@@ -94,6 +94,13 @@ from deepseek_v4_1_sglang import dsv41_static_layer as Lm                # noqa:
 
 T, HID, HC = Lm.T, Lm.HID, Lm.HC
 MHC = os.environ.get("DSV41_E2E_MHC", "1") != "0"   # 0 is a diagnosis only: the model has hc_mult=4, so no mHC is not the model
+# TPB: the layer kernels' own start barrier (-DSTATIC_TP_BARRIER, dsv41_static_layer). With it the ranks line up
+# inside the kernel, so the host barrier between launches is not needed -- and must not be paid for: this script is
+# the pure chain's timing harness, and a dist.barrier() per sublayer inflates the TPOT it reports.
+# With TPB=0 nothing lines the ranks up, which is the 11-25 configuration that returned NaN from the first Reuse
+# layer: DSV41_E2E_NOSYNC=1 reproduces it on purpose.
+TPB = os.environ.get("DSV41_STATIC_TPB", "1") != "0"
+NOSYNC = os.environ.get("DSV41_E2E_NOSYNC", "0") != "0"
 assert T == int(os.environ["STATIC_TOKENS"])
 cfg = Lm.attn_weights.model_config(a.checkpoint)
 variants = [Lm.attn_weights.variant_of(cfg, L) for L in range(40)]
@@ -244,6 +251,10 @@ def _sync():
     # torch.cuda.synchronize() waits for THIS process's GPU only: it leaves the ranks free to be at different
     # launches, and sum_store then writes exchange set (n+1)%2 while a peer polls set n%2 (hc_post_combine's 4
     # CTAs never end). The barrier is what launch_func does host-side for a one-process run.
+    # With -DSTATIC_TP_BARRIER the kernel does this itself (core.cuh kernel_begin, before the resets), so the host
+    # round trip is only paid when the build has no kernel barrier -- the timed path stays pure otherwise.
+    if NOSYNC or TPB:
+        return
     dist.barrier()
 
 
@@ -286,6 +297,28 @@ def _wait(layer, tag: str, timeout: float = None):
 step()
 torch.cuda.synchronize()
 log("one step done" + (f"; logits {tuple(moe[-1].w['logits'].shape)}" if moe[-1].head else ""))
+# Which sublayer first went bad. Every layer keeps its own x_out, so one pass locates the break: this is the line
+# that turns "the output is NaN" into "L3 or L4, by timing" (FINDINGS_correctness.md §4). Ran on the default path
+# too, not only under DEBUG: a run whose numbers are NaN must not read as a clean step.
+def _fin(t):
+    return t is None or bool(torch.isfinite(t).all())
+
+bad = []
+for i in range(a.layers):
+    if not _fin(attn[i].w.get("x_out")):
+        bad.append(f"attn L{i}")
+    if not _fin(moe[i].w.get("x_out")):
+        bad.append(f"moe L{i}")
+lg = moe[-1].w.get("logits") if moe[-1].head else None
+if lg is not None and not _fin(lg):
+    bad.append("head")
+if RANK == 0:
+    if bad:
+        log(f"NOT FINITE in {len(bad)} sublayers, the first is {bad[0]}: {', '.join(bad[:8])}"
+            + (f", ... ({len(bad)})" if len(bad) > 8 else ""))
+    else:
+        log(f"all {a.layers} attn + {a.layers} moe x_out finite"
+            + (f", logits {tuple(lg.shape)} finite" if lg is not None else ""))
 
 if DEBUG:   # now the GPU is idle: what the polled buffers hold AFTER the step says whether a producer
             # wrote late (a missing release/order) or never wrote the region at all (a tiling bug)

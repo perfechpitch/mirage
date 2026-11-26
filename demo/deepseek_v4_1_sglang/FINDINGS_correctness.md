@@ -283,43 +283,49 @@ top2           (8060,  -1.8848)      gap 0.125
 
 ## 8. 下一步（命令可直接复制）
 
-### 8.1 证实"缺栅栏"就是根因（最便宜的一刀）
+### 8.1 证实"缺栅栏"就是根因
 
-> 判读入口：banner 打印 `TPBAR=` 与 `TPB=`。看到 `check=False` 且两者都为 0 的日志，
-> 就**不能**用它论证"kernel 算错了"（那种配置本来就缺跨 rank 顺序）。
+> 判读入口：banner 打印 `TPBAR=`、`TPB=`、`PDL=`。看到 `check=False`、`TPBAR=0`、`TPB=0` 且 `PDL=0`
+> 的日志，就**不能**用它论证"kernel 算错了"（那种配置本来就缺跨 rank 顺序）。
 
-最小复现是 **`MHC=0` + 纯静态链**（`l2_nan.log` 的配置，NaN 在 L4）。
-现在 `TPB` 默认开，所以这条命令本身就是验证；再用 `DSV41_STATIC_TPB=0` 做反向对照，
-NaN 应当**重新出现** —— 一正一反才算证明：
+**一条命令跑完一正一反**（`verify_tpbar.sh`，三种配置互相对照）：
 
 ```bash
 cd /opt/dlami/nvme/saboxu/mirage/demo/deepseek_v4_1_sglang
-export PATH=/opt/dlami/nvme/saboxu/venvs/sglang/bin:$PATH PYTHONPATH=$PWD/boot
-export DSV41_STATIC_ATTN=all DSV41_STATIC_MOE=all DSV41_STATIC_POOL=1
-export DSV41_STATIC_AR=0 DSV41_STATIC_MHC=0 DSV41_STATIC_TPBAR=0
-export DSV41_STATIC_MAX_POS=33000 SGL_TP=8
-for tpb in 1 0; do
-  DSV41_STATIC_TPB=$tpb python l2_check.py \
-    --model /opt/dlami/nvme/saboxu/models/DeepSeek-V4.1-Flash-1017 \
-    --row 0 --tokens 1 --batch 8 > /tmp/tpb$tpb.log 2>&1
-  echo "=== TPB=$tpb"; grep -aE "attn L[0-9] step .*finite|MoE L[0-9] step .*finite" /tmp/tpb$tpb.log | head -12
-done
-# 判据: TPB=1 全 finite=True 且 TPB=0 重现 L4 NaN -> 根因确认
+./verify_tpbar.sh                      # 6 层：只建 12 个 kernel，够复现 L3/L4
+DSV41_E2E_LAYERS=40 ./verify_tpbar.sh  # 完整 40 层（80 个 kernel）
 ```
 
-注意：改了 build flag 会**作废已有 80 个 .so**（`-DSTATIC_TP_BARRIER` 进 nvcc 命令行），
-第一次跑要重编译约 1.4 min × 80。两轮之间 `DSV41_STATIC_TPB` 切换同样会各编译一次，
-所以 8.1 一共是两套 build（约 2 小时）。想省时间就先只跑 `TPB=1` 那轮。
-```
+| tag | 配置 | 期望 |
+|---|---|---|
+| `tpb1` | `TPB=1`（默认） | 全部 `x_out` finite ✅ |
+| `tpb0_hostsync` | `TPB=0` + 每层 `dist.barrier()` | finite（安全基线，但每 sublayer 付一次 host 往返） |
+| `tpb0_nosync` | `TPB=0` + `DSV41_E2E_NOSYNC=1` | **NOT FINITE**，首个在 L3 或 L4 ← 反向对照 |
 
-若证实，修法是**把 `TPBAR` 的默认值改成常开**（不再依赖 `MHC`）：
+`tpb0_nosync` 就是 11-25 出 NaN 的那个配置。前两个共用一套 `TPB=0` build，所以只建两套。
 
-```python
-TPBAR = os.environ.get("DSV41_STATIC_TPBAR", "1") != "0"
-```
+**为什么不用 `l2_check.py` 做这条对照**：`CHECK=0` 的纯静态链会让它在没比过任何 sublayer 时
+主动 `exit FAILED`（"a check that compared nothing must not read as a pass"）—— 那是它该做的；
+而 `CHECK=1` 每层先跑 SGLang 的 kernel，那些 collective 顺便把 rank 对齐了，**掩盖**了漂移。
+所以 NaN 的正反对照放在 `e2e_decode.py`，数值验收放在 8.3。
 
-（代价：每个 sublayer 一次 NCCL barrier；单步 80 个 sublayer 就是 80 次，bs=1 延迟敏感，所以
-正确性先全开，性能那轮再用 `DSV41_STATIC_TPBAR=0` 做对照并记录差异。）
+**`e2e_decode.py` 本身改了两处**（都是我 11-26 那次改动带来的副作用，已修正）：
+
+1. 每层后的 `_sync()` 在 `TPB=1` 时**直接返回**。原来是无条件 `dist.barrier()`：
+   既掩盖了漂移，又让这个计时工具每 sublayer 多付一次 host 往返，**测出来的 TPOT 不再是纯静态链的**。
+2. 步末新增逐层 finite 判定，打印 `all 40 attn + 40 moe x_out finite` 或
+   `NOT FINITE in N sublayers, the first is attn L3: ...`。正常路径也打印，不再只在 DEBUG 下才看得到。
+
+`_sync()` 的真值表（四种组合都实跑过）：
+
+| `DSV41_STATIC_TPB` | `DSV41_E2E_NOSYNC` | kernel 栅栏 | host barrier |
+|---|---|---|---|
+| 1（默认） | 0 | ON | 跳过 |
+| 0 | 0 | OFF | 调用 |
+| 0 | 1 | OFF | 跳过 ← 复现 |
+| 1 | 1 | ON | 跳过 |
+
+（`DSV41_E2E_LAYERS=6` 时首次 NaN 仍应落在 L3/L4；若 6 层没复现，用 40 层再试 —— 漂移是概率事件。）
 
 ### 8.2 真实 KV 的 40 层单进程链（从未跑完的那次）
 
