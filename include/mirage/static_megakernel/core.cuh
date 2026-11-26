@@ -599,15 +599,43 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
   // load is in flight while the threads do the resets, which do not need it
   long long t_start = 0;
   unsigned gen = 0;
+#ifdef DSV41_RESET_DEBUG
   unsigned arrive0 = 0;
+#endif
   if (threadIdx.x == 0) {
     if constexpr (PDL_TRIGGER == 1) {
       asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     t_start = gtime();
     gen = *(unsigned const volatile *)g.gen_ptr + 1;
+#ifdef DSV41_RESET_DEBUG
     arrive0 = cnt_ld(g.arrive);
+#endif
   }
+#ifdef STATIC_TP_BARRIER
+  // BEFORE the resets, not after. A rank entering launch n proves it finished launch n - 1 (one stream, serialized),
+  // so "every rank is in launch n" means no rank still consumes a buffer of launch n - 1 -- the resets below memset
+  // this GPU's own outputs to 0xFF, and those are exactly what a peer reads (wo_a_part, sparse_attn_ml). Wait after
+  // the resets instead and a late peer loses its input and hangs in its poll for ever, not merely gets NaN.
+  // It also bounds the drift at one launch, which is what the two-set exchange region needs (see the comment on the
+  // else branch): two launches ahead aliases the set a peer is still reading.
+  // The slot is NOT the exchange set's (push16 adds rg_set(); this store does not): a peer one launch ahead has
+  // written a LARGER gen, and ">= gen" still holds, so a stale value from the other set cannot satisfy the wait.
+  // The host path's barrier below does the same thing with push16 (FINDINGS_correctness.md §4).
+  if (threadIdx.x == 0) {
+    if (sm_id == 0) {
+      uint4 const hello = make_uint4(gen, gen, gen, gen);
+      push16_mc(g.mc, g.rv, EXCHANGE_HELLO + (size_t)g.rank * 16, hello);
+    }
+    for (int r = 0; r < GPUS; r++) {
+      unsigned const volatile *hp =
+          (unsigned const volatile *)(g.rv + EXCHANGE_HELLO + (size_t)r * 16);
+      while (*hp < gen) {
+      }
+    }
+  }
+  __syncthreads();   // the rest of this SM waits with its thread 0
+#endif
 #ifdef DSV41_RESET_DEBUG
   // The serving reset's bookkeeping: gen * gridDim.x is the arrival count the wait below needs, so a launch that
   // reads a stale gen (or a grid of another size) passes before every SM has finished its resets.
@@ -663,24 +691,6 @@ __device__ __forceinline__ void kernel_begin(G const &g, KernelLocals &L) {
 #else
     while ((int)(cnt_ld(g.arrive) - gen * gridDim.x) < 0) {
     } // acquire: every SM of this launch has arrived (wrap-safe)
-#endif
-#ifdef STATIC_TP_BARRIER
-    // A layer per process (StaticKernel.launch_stream): nothing on the host
-    // lines the TP ranks up, so the kernel lines them up. The slot is NOT the
-    // exchange set's (push16 adds rg_set(); this store does not): a peer that
-    // is one launch ahead has written a LARGER gen, and ">= gen" still holds,
-    // so the wait is never satisfied by a stale value from the other set --
-    // which is what made a rank drift deadlock hc_post_combine's 4 CTAs.
-    if (sm_id == 0) {
-      uint4 const hello = make_uint4(gen, gen, gen, gen);
-      push16_mc(g.mc, g.rv, EXCHANGE_HELLO + (size_t)g.rank * 16, hello);
-    }
-    for (int r = 0; r < GPUS; r++) {
-      unsigned const volatile *hp =
-          (unsigned const volatile *)(g.rv + EXCHANGE_HELLO + (size_t)r * 16);
-      while (*hp < gen) {
-      }
-    }
 #endif
     if (sm_id == 0) {
       *g.gen_ptr = gen; // read by the next launch (after this one ends)

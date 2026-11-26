@@ -83,54 +83,111 @@ dump 产物：`/tmp/prefill_row0`（968 个文件，8.4 GB，rank0 的 `r00_L{00
 
 ## 4. 根因：服务态纯静态链没有跨 rank 栅栏（唯一一条没栅栏的路径）
 
-对照三条路径，差别只有一件事 —— **层与层之间有没有东西把 8 个 TP rank 对齐**：
+### 4.0 代码自己写明了这个缺口
+
+`include/mirage/static_megakernel/core.cuh` 的 `kernel_begin` 有三条互斥分支：
+
+| 行 | 分支 | 谁用 |
+|---|---|---|
+| 548 | `#ifdef STATIC_NO_START_BARRIER` | `DSV41_X_FLAG=1`（实验，默认关） |
+| **584** | `#elif defined(STATIC_RESET_IN_KERNEL)` | **默认 serving 路径** |
+| 690 | `#else` | host reset 路径（`full_decode.py`、`l2_check` 默认） |
+
+而 584 那条分支的注释原文（`core.cuh:588-592`）：
+
+> Every SM waits until every SM **of this GPU** has done its resets (...) **No barrier over the GPUs**:
+> the exchange region has two sets (`EXCHANGE_SET`), and another GPU's launch n writes only into set
+> n % 2, which this GPU last read in launch **n − 2**.
+
+这段话把不变量说得很清楚，也把缺口说得很清楚：
+
+- 跨 GPU **没有**栅栏，只有"本 GPU 内所有 SM 到齐"；
+- 依赖的不变量是 **rank 间漂移 ≤ 1 次 launch**（这样 launch n 写的 set n%2，对端最早也要到 n−2 才读过）。
+
+**漂移 2 次就正好击穿这个不变量**：落后 2 次的对端此刻正在读 launch n−2 用的
+`(n−2) % 2 == n % 2` —— 正是领先方刚写的那一套。而每次 launch 的 reset 填充字节是 **`0xFF`**，
+float 位模式就是 **NaN**。所以症状不是"数值不准"，是确定的 NaN。
+
+### 4.1 为什么漂移会到 2 次
+
+serving 路径下每个 sublayer 是 8 个进程各自 stream 上一次独立 launch，**层间没有任何 host 同步**。
+8 个进程互相独立推进，落后 2 次是常态而不是意外。
+
+### 4.2 三条路径的实测对照
 
 | 路径 | reset 由谁做 | 层间 TP 对齐 | 结果 |
 |---|---|---|---|
-| `full_decode.py`（demo build，**host reset**） | host，每次 launch memset | ✅ 内核 `#else` 分支的起点栅栏 + `static_align_kernel` | 干净（`full40.log`，80 次 launch，`nf 0`） |
-| `l2_check` `CHECK=1`（每层先跑 SGLang 的 kernel） | serving（内核内） | ✅ SGLang 自己的 collective 顺便把 rank 对齐了 | 干净（`l2_pool3.log`，L0–L6 relRMS 正常） |
-| `l2_check` 纯静态链 `MHC=0` | serving（内核内） | ❌ **无** | L4 NaN（`l2_nan.log`） |
-| `e2e_decode` 纯静态链 `MHC=1`（11-25） | serving（内核内） | ❌ **无** | L3 NaN（`e2e_t1.log`） |
+| `full_decode.py`（demo build） | host，每次 launch memset | ✅ 走 690 分支，自带 `push16(EXCHANGE_HELLO...)` 起点栅栏 | 干净（`full40.log`，80 次 launch，`nf 0`） |
+| `l2_check` `CHECK=1`（每层先跑 SGLang kernel） | serving | ✅ SGLang 自己的 collective 顺便对齐 | 干净（`l2_pool3.log`，L0–L6 relRMS 正常） |
+| **serving 纯静态链** | serving | ❌ 584 分支，无跨 GPU 栅栏 | **首个 reuse 层 NaN**（`l2_nan.log` L4 / `e2e_t1.log` L3） |
 
-`full_decode.py:67` 明确不传 `-DSTATIC_RESET_IN_KERNEL`（注释：`the host reset path`），
-而 `core.cuh` 的 `#else` 分支注释写着 "the host resets the buffers and starts all GPUs together;
-the start barrier lines the GPUs up"。**所以：唯一没有栅栏的路径，正是唯一出 NaN 的路径。**
+`full_decode.py:67` 明确注释 `FLAGS` 里不含 `STATIC_RESET_IN_KERNEL`（`the host reset path`），
+与上表一致。**唯一没有栅栏的路径，正是唯一出 NaN 的路径。**
 
-### 4.1 为什么是 NaN，而不是"数值不准"
+### 4.3 每次 launch 被 reset 的缓冲区，填充值就是 NaN
 
-两个直接原因：
+attn3 的生成代码（`build/sgl_static_dsv41/rank0/attn3/build/layer.cu`）：
 
-1. **exchange 区只有两套（`EXCHANGE_SET`），容忍漂移 1 次 launch**。领先 2 次就写到对端正在读的那一套，
-   读到的就是别人上一层留下的字节。
-2. **每次 launch 被 reset 的缓冲区，填充字节是 `0xFF`**。attn3 的生成代码里：
+| 缓冲区 | bytes | reset 字节 | by_reader |
+|---|---|---|---|
+| `sparse_attn_ml` | 10240 | **255** | 0（内核每次 launch reset） |
+| `wo_a_part` | 65536 | **255** | 0（内核每次 launch reset） |
+| `sparse_attn_part` / `wq_a_part` / `wq_b_part` / `wkv_part` / `wo_b_part` | — | 255 | 1（读方自己重新武装） |
 
-   | 缓冲区 | bytes | reset 字节 | by_reader |
-   |---|---|---|---|
-   | `sparse_attn_ml` | 10240 | **255** | 0 |
-   | `wo_a_part` | 65536 | **255** | 0 |
-   | `sparse_attn_part` / `wq_a_part` / `wq_b_part` / `wkv_part` / `wo_b_part` | — | 255 | 1 |
+`0xFF` 当 float 就是 NaN，这是本代码库的"尚未写入"哨兵（`runtime.cuh` 的 `valid16` / `validf4`
+都在判它）。所以读到它就是读到 NaN，与 `l2_nan.log` 里 `x finite=True / y NaN` 完全吻合。
 
-   `0xFF` 当 float 位模式就是 **NaN**（这是本代码库的"尚未写入"哨兵，`valid16`/`validf4` 都在判它）。
-   所以漂移导致的不是"脏数据"，而是**确定性的 NaN**，与 `l2_nan.log` 里 `x finite=True / y NaN` 完全吻合。
-
-### 4.2 为什么首个 NaN 落在第一个 reuse 层
+### 4.4 为什么首个 NaN 落在第一个 reuse 层
 
 reuse 层是**第一个消费另一层产物的层**（读 L2 的 `compress_cache` + `compress_idx`）。
-只写自己 buffer 的层（L0–L2）即使漂移也看不出问题；一旦跨层传值，漂移立刻变现。
-首次 NaN 在 L3/L4 之间移动，取决于启动时序 —— 这正是竞态的特征，而不是确定性的算错。
+只写自己 buffer 的层（L0–L2）即使漂移也看不出来；一旦跨层传值，漂移立刻变现。
+首次 NaN 在 L3/L4 之间移动，取决于启动时序 —— 竞态特征，而非确定性算错。
 
-### 4.3 修法（已落到代码）
+### 4.5 修法（已落到代码）
 
-内核自带起点栅栏 `-DSTATIC_TP_BARRIER`（`core.cuh:667`）：
-每个 SM 的 thread 0 等所有 rank 都发布了本次 launch 的编号（`EXCHANGE_HELLO + rank*16`，
-和 host 侧 `static_align_kernel` **同一个槽位、同一语义**），于是漂移恒为 0。
+内核起点栅栏 `-DSTATIC_TP_BARRIER`，位置在 `core.cuh:611–634`（584 那条分支内），
+**在 reset 循环（644）之前**。每个 SM 的 thread 0 等所有 rank 都发布了本次 launch 的编号
+（`EXCHANGE_HELLO + rank*16`，和 host 侧 `static_align_kernel` **同一个槽位、同一语义**），
+然后 `__syncthreads()` 放行本 SM 的其余线程。
+
+> **位置必须在 reset 之前，这是我自己第一版写错的地方。**
+> 放在 reset 之后不只是"少保护一点"：reset 会把本卡自己的 `wo_a_part` / `sparse_attn_ml`
+> memset 成 `0xFF`，而这些**正是 peer 要读的**。晚到的 peer 不但拿到 NaN，它轮询的那份数据被抹掉后
+> **永远等不到** → 死锁，比 NaN 更糟。
+> 放在 reset 之前语义才成立：一个 rank 进入 launch n 就证明它已跑完 launch n−1（同 stream 串行），
+> 所以"所有 rank 都进入了 n"等价于"没有 rank 还在消费 n−1 的产物"，此时 reset 安全。
+> 顺带把漂移钳到 ≤ 1 次 launch —— 恰好是两套 exchange 需要的不变量。
+
 `multimem.st` 会写包括本卡在内的所有副本，因此不会在 `r == g.rank` 上自旋死锁。
 
-- 之前它是**死代码**：`grep -rn STATIC_TP_BARRIER` 全仓只有定义处，没有任何 build 定义它。
-- 现在 `dsv41_static_layer.py` 的 `StaticAttn` / `StaticMoE` 在 `tp > 1` 时默认加上它
-  （`DSV41_STATIC_TPB=0` 可关掉做计时）。
+- 之前它是**死代码**：`grep -rn STATIC_TP_BARRIER` 全仓只有 `#ifdef` 那处，没有任何 build 定义它。
+- 现在 `StaticAttn` / `StaticMoE` / `StaticHead` 在 **serving（`-DSTATIC_RESET_IN_KERNEL`）且 `tp > 1`**
+  时默认加上（`DSV41_STATIC_TPB=0` 关掉做计时）。host reset 路径不需要它（那条分支自带栅栏）。
 - banner 打印 `TPBAR=` 与 `TPB=`；两者都为 0 且 `check=0` 且 8 rank 时打 WARNING。
-- 编译已验证（CPU 上 nvcc，无需 GPU）：attn3 与 moe4 的真实生成层加 `-DSTATIC_TP_BARRIER` 均编译通过。
+- 与 `-DSTATIC_NO_START_BARRIER` 同时打开会**断言失败**（见下），不会静默失效。
+
+#### 编译验证（CPU 上的 nvcc，不需要 GPU）
+
+四组 flag 全部编译通过（attn3 / moe4 / head 三类真实生成的层）：
+
+| 组合 | 结果 |
+|---|---|
+| `-DSTATIC_RESET_IN_KERNEL`（serving，无栅栏） | ✅ `.nv_fatbin` = 0x02de80 |
+| `-DSTATIC_RESET_IN_KERNEL -DSTATIC_TP_BARRIER` | ✅ `.nv_fatbin` = 0x02df20（**+160 字节**设备代码） |
+| 两者都不给（host 路径） | ✅ |
+| `-DSTATIC_NO_START_BARRIER`（± `TP_BARRIER`） | ✅ 两种 fatbin 尺寸**完全相同** |
+
+两个要点：
+
+1. **`+160` 字节证明栅栏真的进了设备代码**。最初我以为"`.so` 尺寸相同 = 没编进去"，其实是段对齐把
+   160 字节吸收了；看 `.nv_fatbin` 而非文件大小才看得出。另外 `nvcc -E` 里
+   `EXCHANGE_HELLO + (size_t)g.rank * 16` 的出现次数是 1 次（带 flag）/ 0 次（不带），也是直接证据。
+2. **`NO_START_BARRIER` ± `TP_BARRIER` 的 fatbin 尺寸完全相同**，直接证明了下面那个缺口。
+
+**已知剩余缺口**：`STATIC_TP_BARRIER` 那块代码在 `#elif defined(STATIC_RESET_IN_KERNEL)` 分支内
+（`core.cuh:584`），所以 **`STATIC_NO_START_BARRIER` 分支（548–583，`DSV41_X_FLAG=1` 的实验路径）
+仍然没有跨 GPU 栅栏**。那条路径默认关闭；现在由 `dsv41_static_layer.py` 里的断言兜住 ——
+两者同时出现时直接报错，而不是静默丢掉漂移界。将来若要启用该分支，得先给它也加一块。
 
 **为什么不再用 host 侧 `TPBAR`（NCCL）**：它每个 sublayer 一次，一个 step 80 次，bs=1 延迟敏感；
 内核栅栏没有 host 往返。两者都在，`TPBAR` 仍按 `MHC` 决定，保留作为对照。

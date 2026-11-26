@@ -114,7 +114,9 @@ __device__ __forceinline__ void
     tma3_l2(j.wsf, 0, 0, j.rb * j.ktall + kt, EVICT_LAST);
   }
   if (wait0) { // weights_after: its node has finished a task
+#ifdef DSV41_SA_QPOLL_DEBUG
     int spin0 = 0;
+#endif
     while (cnt_ld(wait0) == 0) {
       poll_pause(FP8_POLL_NS);
 #ifdef DSV41_SA_QPOLL_DEBUG
