@@ -11,15 +11,19 @@ is impossible to satisfy; the distribution is what is reproducible.
 Three checks per step, each with its own verdict:
 
   value   the logprob of the token that was actually chosen.  Catches a real numeric
-          error anywhere, and is the check that fails on NaN / wrong weights.
+          error anywhere, and is the check that fails on NaN / wrong weights.  NaN is
+          checked with isfinite, not with a comparison: nan > tol is False, so a run
+          whose steps went NaN used to print "all rows within tolerance" and exit 0.
   overlap |top5(golden) & top5(other)|.  Catches a distribution that moved somewhere
           the chosen token does not show -- e.g. mass shifting to an off-branch
           candidate whose own logprob still looks plausible.
   rank    whether the golden's argmax is inside the other's top-k.  A flip is only
           reported, never failed: inside the noise band it is expected.
 
-A step FAILS on value error > --tol, or overlap < --min-overlap.  The script exits
-non-zero if any row fails, so it can gate a run.
+A step FAILS on a non-finite value, value error > --tol, or overlap < --min-overlap.  A
+row also FAILS if it collapsed to a single argmax across every step while golden varies
+(the "sinks to token 0" failure, which the tolerance alone does not see).  The script
+exits non-zero if any row fails, so it can gate a run.
 
   python compare_golden.py --golden /tmp/golden_bench32k.jsonl --other /tmp/mine.jsonl
   python compare_golden.py --golden /tmp/golden_bench32k.jsonl --self   # noise floor
@@ -51,8 +55,13 @@ def as_pairs(rec):
     return [[(float(lp), int(tid))] for lp, tid in zip(rec["logprobs"], rec["ids"]) if lp is not None]
 
 
+def _argmax(step):
+    """The step's argmax token (its logprob's max); a NaN logprob wins, as a broken step should."""
+    return max(step, key=lambda p: p[0])[1]
+
+
 def compare_step(golden_step, other_step):
-    """(value err, top5 overlap, argmax flip) for one decode step."""
+    """(value err, top5 overlap, argmax flip, other's argmax) for one decode step."""
     gmap = dict((tid, lp) for lp, tid in golden_step)
     omap = dict((tid, lp) for lp, tid in other_step)
     gold_argmax = max(gmap, key=lambda t: gmap[t])
@@ -73,7 +82,7 @@ def compare_step(golden_step, other_step):
     # distribution does inside the noise band -- reported, never a failure.  (Checking
     # only that golden's argmax is somewhere in the other's top-k would miss it: the
     # runner-up is always there.)
-    return value, overlap, other_argmax != gold_argmax
+    return value, overlap, other_argmax != gold_argmax, other_argmax
 
 
 def compare(golden, other, tol, min_overlap, verbose):
@@ -87,29 +96,49 @@ def compare(golden, other, tol, min_overlap, verbose):
             continue
         gs, os_ = as_pairs(g), as_pairs(o)
         n = min(len(gs), len(os_))
-        vals, ovls, nflip = [], [], 0
+        vals, ovls, nflip, amax = [], [], 0, []
         for i in range(n):
             total += 1
-            v, ov, flipped = compare_step(gs[i], os_[i])
+            v, ov, flipped, oa = compare_step(gs[i], os_[i])
             vals.append(v)
             ovls.append(ov)
+            amax.append(oa)
             if flipped:
                 nflip += 1
                 flips.append((name, i, g["ids"][i] if i < len(g["ids"]) else None))
         if not vals:
             continue
-        mx, mean = max(vals), sum(vals) / len(vals)
+        # NaN must be a failure, not a value: `max()` drops a NaN it meets second (nan > x is False), so a
+        # run whose last steps are NaN printed "all rows within tolerance" and exited 0 before this.
+        nbad = sum(1 for v in vals if not math.isfinite(v))
+        mx = math.inf if nbad else max(vals)
+        mean = math.inf if nbad else sum(vals) / len(vals)
         mo = min(ovls)
-        bad = mx > tol or mo < min_overlap
+        # a collapse to one token (the "sink to 0" failure): every step the same argmax while golden varies
+        uniq = len(set(t for t in amax if t is not None))
+        g_uniq = len(set(_argmax(s) for s in gs if s))
+        sunk = n >= 8 and uniq <= 1 and g_uniq > 3
+        bad = nbad > 0 or mx > tol or mo < min_overlap or sunk
         if bad:
-            fails.append((name, f"maxval={mx:.3f} minovl={mo:.2f}"))
-        print(f"{name[:58]:<58} {n:>5} {mx:>8.3f} {mean:>8.3f} {mo:>7.2f} {nflip:>5}"
+            why = []
+            if nbad:
+                why.append(f"{nbad}/{n} steps non-finite")
+            if mx > tol and not nbad:
+                why.append(f"maxval={mx:.3f}")
+            if mo < min_overlap:
+                why.append(f"minovl={mo:.2f}")
+            if sunk:
+                why.append(f"collapsed to one argmax ({uniq} distinct over {n} steps)")
+            fails.append((name, " ".join(why)))
+        mxs = "nan" if nbad else f"{mx:.3f}"
+        print(f"{name[:58]:<58} {n:>5} {mxs:>8} {'nan' if nbad else f'{mean:.3f}':>8} {mo:>7.2f} {nflip:>5}"
+              f"  id0 {sum(1 for t in amax if t == 0)}/{n}"
               f"{'  FAIL' if bad else ''}")
         if verbose and bad:
             for i in range(n):
-                if vals[i] > tol or ovls[i] < min_overlap:
+                if not math.isfinite(vals[i]) or vals[i] > tol or ovls[i] < min_overlap:
                     print(f"    step {i:>2}: value={vals[i]:.4f} overlap={ovls[i]:.2f} "
-                          f"golden_id={g['ids'][i] if i < len(g['ids']) else '?'}")
+                          f"other_id={amax[i]} golden_id={g['ids'][i] if i < len(g['ids']) else '?'}")
     print()
     print(f"{len(golden)} rows, {total} steps compared; tol={tol} min_overlap={min_overlap}")
     print(f"argmax flips (expected near a tie, not a failure): {len(flips)}")

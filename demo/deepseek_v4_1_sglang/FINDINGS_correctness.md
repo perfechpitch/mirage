@@ -160,6 +160,20 @@ reuse 层是**第一个消费另一层产物的层**（读 L2 的 `compress_cach
 
 `multimem.st` 会写包括本卡在内的所有副本，因此不会在 `r == g.rank` 上自旋死锁。
 
+**`multimem.st.weak` 没有 release 语义，这里不需要**（这条会被反复问到，记清楚）：
+- 栅栏要保证的是"peer 已进入 launch n"，而"peer 的上一次 launch 的写入已可见"来自
+  **stream 串行 + kernel 边界隐含的 memory fence**（PDL 已排除，见下）。在 launch n 里加
+  `__threadfence()` 什么也换不来，因为那些写属于**上一个 kernel**，早已越过边界。
+- "漂移 ≤ 1 次 launch" 是**纯计数**论证，不涉及内存序。
+- 单个 32-bit 字不会撕裂；槽位单调递增，读到 `>= gen` 就说明对方至少到了 gen。
+- host 路径（已由 `full40.log` 80 次 launch / 0 NaN 证明）用的是同一个 `multimem.st`。
+
+**地址安全性**（也验过）：`push16_mc` 写 `EXCHANGE_HELLO + rank*16`，不加 `rg_set()`。规划器
+`exchange_layout()` 为 hello 预留 `num_gpus*16` = 128 字节，且所有 buffer 的 offset 都 ≥
+`align(hello + 128)`，所以 128 字节的头不会被任何 buffer 覆盖（实测 attn3/moe4/head 的
+`STATIC_EXCHANGE_HELLO` 都是 0，最小的 buffer offset 是 4096）。`g.gen_ptr` 则是独立的
+`dmalloc`（`host.cuh:527`），不在 exchange 区，也不会和 offset 0 撞。
+
 - 之前它是**死代码**：`grep -rn STATIC_TP_BARRIER` 全仓只有 `#ifdef` 那处，没有任何 build 定义它。
 - 现在 `StaticAttn` / `StaticMoE` / `StaticHead` 在 **serving（`-DSTATIC_RESET_IN_KERNEL`）且 `tp > 1`**
   时默认加上（`DSV41_STATIC_TPB=0` 关掉做计时）。host reset 路径不需要它（那条分支自带栅栏）。
@@ -188,6 +202,25 @@ reuse 层是**第一个消费另一层产物的层**（读 L2 的 `compress_cach
 （`core.cuh:584`），所以 **`STATIC_NO_START_BARRIER` 分支（548–583，`DSV41_X_FLAG=1` 的实验路径）
 仍然没有跨 GPU 栅栏**。那条路径默认关闭；现在由 `dsv41_static_layer.py` 里的断言兜住 ——
 两者同时出现时直接报错，而不是静默丢掉漂移界。将来若要启用该分支，得先给它也加一块。
+
+#### build cache 会正确失效（否则验收会用到没栅栏的旧 so）
+
+`static_schedule.py` 的缓存键是 `md5(layer.cu) + nvcc 前 4 个参数 + extra_flags + code_tag()`，
+其中 `code_tag()`（`static_schedule.py:166`）是**所有** `include/mirage/static_megakernel/*.cuh`
+和 `tasks/*.cuh` 的 md5。实测：
+
+| commit | code_tag |
+|---|---|
+| `2a69b646`（栅栏改到 reset 之前之前） | `fff2dbcd6457` |
+| `30ef1805`（当前） | `a6b3a5c7587c` |
+
+**变了** —— 所以两条失效路径都成立：
+1. `-DSTATIC_TP_BARRIER` 进 `extra_flags` → 键变；
+2. 改 `core.cuh` 本身 → `code_tag` 变。
+
+代价要说清楚：**现有 80 个 `.so`（含 `/tmp/full_real` 那套）已全部失效**，
+下一次 serving 验收必然是一次约 2 小时的 80 核重编。这不是意外，是必须付的。
+好处是：不会出现"跑完了才发现用的是旧二进制"这种白烧一轮的情况。
 
 #### PDL 与栅栏互斥
 
