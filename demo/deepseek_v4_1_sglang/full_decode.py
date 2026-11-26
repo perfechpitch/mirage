@@ -72,6 +72,13 @@ FLUSH = a.flush_mb << 20
 FLAGS = list(a.flag)          # no STATIC_RESET_IN_KERNEL: the host reset path (launch_func)
 L40 = a.layers
 
+# The kernels' build cache (compile_static's MIRAGE_STATIC_BUILD_CACHE): without it every run nvcc's all 80 layers
+# again, even when <out>/a{L}/build holds the very same layer.cu from the last run -- the directory is only where a
+# build is *written*, the cache is what makes the next run skip it. Keyed by (md5(layer.cu), the flags, code_tag()),
+# so it also stays correct when the templates change. A fixed path, not one under <out>: a run with another --out
+# must still hit it (--out/... + --dump-dir changed between two runs of the same layers is what cost 40 minutes).
+os.environ.setdefault("MIRAGE_STATIC_BUILD_CACHE", "/tmp/mirage_static_cache")
+
 PRE = a.inputs_dir
 META, ADDR = None, None
 if PRE:   # the dump's last prefill row is the decode step's history: the caches hold [0, pos - 1]
@@ -101,6 +108,11 @@ def mhc_into(wg, d, L, kind, gamma):
               streams_out=torch.zeros(T, HC * HID, dtype=torch.bfloat16, device=d),
               hc_fn=fn.to(d).contiguous(), hc_small=torch.cat([base, scale]).to(d).contiguous(),
               h_pre=torch.zeros(T, HC, device=d),
+              # hc_coef writes the framework's triplet ONLY when it is given somewhere to put it (h_post/h_comb nullable:
+              # the chain used to pass neither, so pre was the only coefficient that existed). Materializing them is what
+              # makes the mix comparable with SGLang's MHCState bit for bit -- and a wrong comb moves one stream and
+              # leaves its neighbours right, which is exactly the shape of the L0 FFN divergence.
+              h_post=torch.zeros(T, HC, device=d), h_comb=torch.zeros(T, HC * HC, device=d),
               x_out=torch.zeros(T, HID, dtype=torch.bfloat16, device=d),
               gamma_next=gamma.to(d).contiguous())
 
@@ -402,7 +414,16 @@ if a.dump_dir:                           # the chain's own numbers, every sublay
     if torch.is_tensor(lg) and lg.numel():
         lg.detach().float().cpu().contiguous().numpy().astype(np.float32).tofile(
             os.path.join(a.dump_dir, "logits.bin"))
-    log(f"dumped {len(hs)} sublayers' x_out/streams_out and the logits to {a.dump_dir}")
+    # the mHC coefficients the post step used: R'[j] = sum_i comb[i][j] R[i] + post[j] out. Dumping them is what tells a
+    # wrong coefficient set (a per-stream scale/mix, which leaves the other streams right) from a wrong sublayer output
+    # (which moves every stream the same way) -- the two look alike in the residuals alone.
+    for name, _h, wsx, _bufs in hs:
+        for nm in ("h_post", "h_comb"):
+            t = wsx[0].get(nm)
+            if torch.is_tensor(t) and t.numel():
+                t.detach().float().cpu().contiguous().view(-1).numpy().astype(np.float32).tofile(
+                    os.path.join(a.dump_dir, f"{name}_{nm}.bin"))
+    log(f"dumped {len(hs)} sublayers' x_out/streams_out, coefficients and the logits to {a.dump_dir}")
 
 
 def topk_line():

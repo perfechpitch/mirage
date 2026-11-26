@@ -191,12 +191,46 @@ def _install() -> None:
             if not (torch.is_tensor(v) and v.dim() >= 2):
                 return
             row = v.detach().float().cpu().reshape(v.shape[0], -1)[-1]
+            # The coefficients that produced this residual: post[j] and comb[i][j] (R'[j] = sum_i comb[i][j] R[i] +
+            # post[j] out, hc_post.cuh). They go into the same row record, so one comparison covers both the residual
+            # and the mix that made it -- a wrong comb moves one stream and leaves its neighbours right, which looks
+            # exactly like a wrong sublayer output in the residuals alone.
+            coef = {}
+            for nm in ("post", "comb"):
+                o = getattr(r, nm, None)
+                for cand in (getattr(o, "data", None), o):
+                    if torch.is_tensor(cand) and cand.numel():
+                        coef[nm] = cand.detach().float().cpu().reshape(-1)
+                        break
             if _gate["pref"]:
                 _rec["layers"][f"{_gate['lid']}{suffix}"] = row
+                for nm, t in coef.items():
+                    _rec["layers"][f"{_gate['lid']}{suffix}_{nm}"] = t
             elif _gate["step"]:
                 _step_rec["rows"][f"{_gate['lid']}{suffix}"] = row
+                for nm, t in coef.items():
+                    _step_rec["rows"][f"{_gate['lid']}{suffix}_{nm}"] = t
 
         _oap, _omp = _mhc.run_attn_post, _mhc.run_moe_post
+        _oct = getattr(_mhc, "_compute_triplet", None)
+
+        def _triplet(*p, **k):
+            """The (pre, post, comb) one post is about to apply. Recorded here because it is the one function both post
+            paths (the fused collective and the plain one) build their coefficients in, and a layer whose post is fused
+            into the next layer's boundary never reaches run_moe_post at all."""
+            t = _oct(*p, **k)
+            if _LAYERS and _gate["lid"] >= 0 and isinstance(t, (tuple, list)) and len(t) == 3:
+                for nm, v in zip(("pre", "post", "comb"), t):
+                    if torch.is_tensor(v) and v.numel():
+                        row = v.detach().float().cpu().reshape(-1)
+                        if _gate["pref"]:
+                            _rec["layers"][f"{_gate['lid']}_ct_{nm}"] = row
+                        elif _gate["step"]:
+                            _step_rec["rows"][f"{_gate['lid']}_ct_{nm}"] = row
+            return t
+
+        if _oct is not None:
+            _mhc._compute_triplet = _triplet
 
         def _attn_post(*p, **k):
             r = _oap(*p, **k)
@@ -258,12 +292,19 @@ def _install() -> None:
             if not _gate["pref"] and not _gate["step"]:
                 return _orig_layer(self, *args, **kw)
             pre = None    # the residual the layer READS, taken before it runs: layer 0's is the embedding in every
-            try:          # stream (hc_broadcast), so it is the input the chain must start from
+            precoef = {}  # stream (hc_broadcast), so it is the input the chain must start from
+            try:
                 from sglang.srt.layers.layer_boundary.residual import batch as _rb
                 _rs = _rb.written_residual(fb)
                 pre = getattr(_rs, "streams", _rs)
                 if not (torch.is_tensor(pre) and pre.dim() >= 2):
                     pre = None
+                for nm in ("post", "comb"):   # the coefficients THIS stage's post will use (the fused boundary's
+                    o = getattr(_rs, nm, None)  # included: those layers never reach run_moe_post, so this is the
+                    for cand in (getattr(o, "data", None), o):   # only place their mix is visible)
+                        if torch.is_tensor(cand) and cand.numel():
+                            precoef[nm] = cand.detach().float().cpu().reshape(-1)
+                            break
             except Exception as e:
                 if _SHAPES and _shapes["n"] < 2:
                     print(f"[dump] pre-residual failed: {type(e).__name__}: {e}", flush=True)
@@ -304,6 +345,8 @@ def _install() -> None:
             if _LAYERS and torch.is_tensor(t) and t.dim() >= 2:
                 lid = int(getattr(self, "layer_id", -1))
                 pair = {"": t, "_st": st, "_in": pre}
+                for nm, c in precoef.items():
+                    pair[f"_in{nm}"] = c      # (the mix this stage's post applies: see the pre-residual read above)
                 # WHICH forward this is: SGLang runs a one-token dummy forward before the real prefill (a warmup at
                 # the decode shape), and it walks all 40 layers. Recording it made every "reference" layer the dummy
                 # token's -- and it is also why L0 never matched. Keep the forward that carries the position the chain
