@@ -11,7 +11,8 @@
 #   +  static vs baseline: engine noise cancels, only the kernels differ
 #
 # The first static run builds 80 layer kernels unless the cache holds them (FINDINGS_correctness.md §4.5: any
-# change to core.cuh invalidates every cached .so, via code_tag -- so expect ~2 h of nvcc on a cold cache).
+# change to core.cuh invalidates every cached .so, via code_tag -- so a cold cache costs a full rebuild, measured
+# at ~1.8 min for 96 nvcc invocations (6 layers x 8 ranks), so ~12-15 min for all 80).
 #
 #   ./accept.sh                     # row 0, 32 steps (the golden set's own shape)
 #   TOKENS=8 ./accept.sh            # a quick first look
