@@ -85,13 +85,15 @@ def compare_step(golden_step, other_step):
     return value, overlap, other_argmax != gold_argmax, other_argmax
 
 
-def compare(golden, other, tol, min_overlap, verbose):
-    fails, flips, total = [], [], 0
-    print(f"{'row':<58} {'steps':>5} {'maxval':>8} {'meanval':>8} {'minovl':>7} {'flips':>5}")
+def compare(golden, other, tol, min_overlap, verbose, as_json=False):
+    fails, flips, total, summ = [], [], 0, {}
+    if not as_json:
+        print(f"{'row':<58} {'steps':>5} {'maxval':>8} {'meanval':>8} {'minovl':>7} {'flips':>5}")
     for name, g in golden.items():
         o = other.get(name)
         if o is None:
-            print(f"{name[:58]:<58} MISSING")
+            if not as_json:
+                print(f"{name[:58]:<58} MISSING")
             fails.append((name, "missing from --other"))
             continue
         gs, os_ = as_pairs(g), as_pairs(o)
@@ -131,14 +133,23 @@ def compare(golden, other, tol, min_overlap, verbose):
                 why.append(f"collapsed to one argmax ({uniq} distinct over {n} steps)")
             fails.append((name, " ".join(why)))
         mxs = "nan" if nbad else f"{mx:.3f}"
-        print(f"{name[:58]:<58} {n:>5} {mxs:>8} {'nan' if nbad else f'{mean:.3f}':>8} {mo:>7.2f} {nflip:>5}"
+        summ[name] = dict(steps=n, maxval=None if nbad else mx, meanval=None if nbad else mean,
+                          minovl=mo, flips=nflip, nonfinite=nbad,
+                          id0=sum(1 for t in amax if t == 0), ok=not bad)
+        if not as_json:
+            print(f"{name[:58]:<58} {n:>5} {mxs:>8} {'nan' if nbad else f'{mean:.3f}':>8} {mo:>7.2f} {nflip:>5}"
               f"  id0 {sum(1 for t in amax if t == 0)}/{n}"
               f"{'  FAIL' if bad else ''}")
-        if verbose and bad:
+        if verbose and bad and not as_json:
             for i in range(n):
                 if not math.isfinite(vals[i]) or vals[i] > tol or ovls[i] < min_overlap:
                     print(f"    step {i:>2}: value={vals[i]:.4f} overlap={ovls[i]:.2f} "
                           f"other_id={amax[i]} golden_id={g['ids'][i] if i < len(g['ids']) else '?'}")
+    if as_json:
+        print(json.dumps(dict(rows=summ, steps=total, tol=tol, min_overlap=min_overlap,
+                              flips=len(flips), ok=not fails,
+                              failed=[n for n, _ in fails], why=dict(fails))))
+        return 0 if not fails else 1
     print()
     print(f"{len(golden)} rows, {total} steps compared; tol={tol} min_overlap={min_overlap}")
     print(f"argmax flips (expected near a tie, not a failure): {len(flips)}")
@@ -164,6 +175,10 @@ def main():
                     help="min |top5 & top5| / 5 per step: catches mass moving without the chosen token "
                          "showing it; 0.6 tolerates one of five swapping at a tie")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--json", dest="as_json", action="store_true",
+                    help="one JSON object instead of the table: per row maxval/meanval/minovl/flips/nonfinite/"
+                         "id0/ok, plus ok and why for the file. Same exit code, so accept.sh can compare the "
+                         "static run's maxval against the baseline's instead of a fixed --tol")
     a = ap.parse_args()
 
     golden = load(a.golden)
@@ -171,7 +186,7 @@ def main():
     if not golden:
         print(f"no usable rows in {a.golden}")
         return 2
-    return compare(golden, other, a.tol, a.min_overlap, a.verbose)
+    return compare(golden, other, a.tol, a.min_overlap, a.verbose, a.as_json)
 
 
 if __name__ == "__main__":

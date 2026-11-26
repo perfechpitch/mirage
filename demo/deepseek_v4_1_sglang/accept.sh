@@ -76,11 +76,51 @@ for row in $ROWS; do
   echo "=== row $row: baseline vs golden (the noise floor -- this is the number --tol should be)"
   python compare_golden.py --golden golden_bench32k.jsonl --other "$B" | tee "$OUT/row${row}_baseline_vs_golden.txt" | tail -6
   echo
-  echo "=== row $row: static vs golden (the acceptance)"
+  echo "=== row $row: static vs golden"
   python compare_golden.py --golden golden_bench32k.jsonl --other "$S" | tee "$OUT/row${row}_static_vs_golden.txt" | tail -8
   echo
   echo "=== row $row: static vs baseline (engine noise cancels; only the kernels differ)"
   python compare_golden.py --golden "$B" --other "$S" | tee "$OUT/row${row}_static_vs_baseline.txt" | tail -6
+
+  # The verdict, with the rule stated instead of eyeballed. Golden was written with 8 rows in flight and
+  # deterministic off; this run uses one row, so static-vs-golden carries that configuration gap too -- which is
+  # why the baseline (the same script, hook off) is measured alongside it. The static chain is right when it is
+  # no worse than the engine's own rerun, and the goldens' tuned 0.15 stays as the absolute cap.
+  python - "$OUT" "$row" <<'PY'
+import json, subprocess, sys, os
+out, row = sys.argv[1], sys.argv[2]
+def j(a, b):
+    r = subprocess.run([sys.executable, "compare_golden.py", "--golden", a, "--other", b, "--json"],
+                       capture_output=True, text=True)
+    return json.loads(r.stdout) if r.stdout.strip().startswith("{") else dict(ok=False, why={"": r.stdout[-200:]})
+base = j("golden_bench32k.jsonl", f"{out}/baseline_row{row}.jsonl")
+stat = j("golden_bench32k.jsonl", f"{out}/static_row{row}.jsonl")
+cross = j(f"{out}/baseline_row{row}.jsonl", f"{out}/static_row{row}.jsonl")
+def mx(d):
+    v = [r["maxval"] for r in d.get("rows", {}).values() if r.get("maxval") is not None]
+    return max(v) if v else None
+bm, sm, cm = mx(base), mx(stat), mx(cross)
+cap = max(base["tol"], bm or 0.0)
+print()
+print(f"=== VERDICT row {row}")
+print(f"  baseline vs golden   maxval {bm}   ok {base['ok']}")
+print(f"  static   vs golden   maxval {sm}   ok {stat['ok']}")
+print(f"  static   vs baseline maxval {cm}   ok {cross['ok']}   <- the sharp one")
+print(f"  rule: static must be ok in all three; its maxval vs golden <= max(tol {base['tol']}, baseline {bm})")
+bad = [n for n, d in (("static vs golden", stat), ("static vs baseline", cross)) if not d["ok"]]
+if not stat["ok"] or not cross["ok"]:
+    print(f"  RESULT: FAIL -- {', '.join(bad)}"
+          + "".join(f"\n    {n}: {d['why']}" for n, d in
+                    (("static vs golden", stat), ("static vs baseline", cross)) if d["why"]))
+    open(f"{out}/row{row}_verdict.txt", "w").write("FAIL\n" + json.dumps(dict(static=stat, baseline=base, cross=cross), indent=1))
+    sys.exit(1)
+if sm is not None and bm is not None and sm > cap:
+    print(f"  RESULT: FAIL -- static is noisier than the engine itself ({sm:.3f} > {cap:.3f})")
+    sys.exit(1)
+print(f"  RESULT: PASS -- the 40 layers reproduce the engine, within the engine's own noise"
+      f"{'' if cm is None else f' (static vs baseline maxval {cm:.3f})'}")
+open(f"{out}/row{row}_verdict.txt", "w").write("PASS\n" + json.dumps(dict(static=stat, baseline=base, cross=cross), indent=1))
+PY
 done
 
 echo
