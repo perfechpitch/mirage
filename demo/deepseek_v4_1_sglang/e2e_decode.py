@@ -320,6 +320,31 @@ if RANK == 0:
     if bad:
         log(f"NOT FINITE in {len(bad)} sublayers, the first is {bad[0]}: {', '.join(bad[:8])}"
             + (f", ... ({len(bad)})" if len(bad) > 8 else ""))
+        # WHERE THE NaN CAME FROM: 0xFF is this codebase's "not written yet" sentinel (config.cuh REARM), so a NaN whose
+        # payload is all ones is a buffer nobody wrote, not arithmetic. A real arithmetic NaN has a payload of zeros.
+        who = bad[0].split()[0]
+        idx = int(bad[0].split("L")[1]) if "L" in bad[0] else None
+        lay = (attn if who == "attn" else moe)[idx] if idx is not None else None
+        t = lay.w.get("x_out") if lay is not None else None
+        if t is not None:
+            bits = t.detach().view(torch.int16 if t.dtype == torch.bfloat16 else torch.int32).flatten()
+            fin = torch.isfinite(t.detach().flatten())
+            pat = torch.unique(bits[~fin]).tolist()
+            log(f"  {bad[0]} x_out: {int((~fin).sum())}/{t.numel()} not finite; their bit patterns "
+                f"{[hex(b & 0xFFFFFFFF) for b in pat[:8]]}")
+            if t.dtype == torch.bfloat16:
+                cnt = {hex(b & 0xFFFF): int((bits == b).sum()) for b in pat[:4]}
+                log(f"  same bits elsewhere in the tensor: {cnt}")
+        # The shared tensors: a `reuse` layer reads the source layer's compress_cache/compress_idx by reference, so a
+        # reset protocol that fires in the source's launch is visible here. 0xFF is the not-written-yet sentinel.
+        for nm in ("compress_cache", "compress_idx", "candidates", "index_k"):
+            for L in (max(0, (idx or 0) - 1), idx or 0):
+                tt = (attn[L].w or {}).get(nm) if L < len(attn) else None
+                if not torch.is_tensor(tt) or tt.numel() == 0:
+                    continue
+                bb = tt.detach().view(torch.uint8)
+                log(f"  attn L{L}.{nm} {tuple(tt.shape)} {tt.dtype}: 0xFF {int((bb == 0xFF).sum())}/{bb.numel()} bytes, "
+                    f"same object as L{idx}: {tt.data_ptr() == attn[idx].w.get(nm, tt).data_ptr()}")
     else:
         log(f"all {a.layers} attn + {a.layers} moe x_out finite"
             + (f", logits {tuple(lg.shape)} finite" if lg is not None else ""))
