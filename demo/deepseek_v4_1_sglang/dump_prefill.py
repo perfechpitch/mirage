@@ -81,7 +81,14 @@ def main():
     eng = Engine(model_path=a.model, tokenizer_path=a.model, trust_remote_code=True, tp_size=a.tp,
                  max_running_requests=1, cuda_graph_max_bs_decode=1, context_length=ctx,
                  max_total_tokens=ctx + 4096, mem_fraction_static=a.mem_fraction,
-                 disable_radix_cache=True, disable_cuda_graph=True, log_level="warning",
+                 disable_radix_cache=True, disable_cuda_graph=True,
+                 # `disable_cuda_graph=True` only turns off the DECODE graphs; the prefill runner still captures a
+                 # breakable graph, and any host-side read inside it invalidates the capture ("operation failed due
+                 # to a previous error during capture", which takes all 8 ranks down before the prompt is even fed).
+                 # A dump does not need that graph: eager prefill produces the same values, only slower.
+                 cuda_graph_backend_prefill=os.environ.get("DSV41_PREFILL_GRAPH", "disabled"),
+                 disable_prefill_cuda_graph=True,
+                 log_level="warning",
                  engram_config=json.loads(a.engram_config))
     try:
         out = eng.generate(input_ids=ids, sampling_params={"max_new_tokens": a.max_new, "temperature": 0.0})

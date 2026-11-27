@@ -2498,3 +2498,126 @@ all-reduce。把每个 partial 先舍到 bf16 再求和：
 三个工具（`cmp_all.py` / `cmp_sgl.py` / `cmp_band.py`）现在对同一份 dump 给出同一组数。
 `cmp_band.py` 的汇总：117 行里 101 行带内，带外 16 行 = L0/L1 的 5 行（参考逐 bit，无带可容）+ L2 的 3 行 + L3 的 apost
 + L3–L4 的少量行。
+
+## 12.40 r6 完成：拿到了参考侧的 o / oa / y_part / logits，L0 的最后一位归因到底（2026-11-27 15:30）
+
+四次 dump 尝试里有三次被同一个东西打死，原因不在记录逻辑，而在**记录逻辑之前**：
+
+    dump_hook.py `_layer_forward` 第一行就是 `dec0, last0 = _is_decode(fb), _last_pos(kw, args)`，
+    `_last_pos` 做 `int(p.max())` —— 一次 device 同步。而 prefill runner 用 breakable CUDA graph 捕获
+    整段 prefill（`disable_cuda_graph=True` 只关 decode 图，不关 prefill 图），同步在捕获区内非法：
+
+        CUDA error: operation failed due to a previous error during capture
+        Fail when using backend: breakable for prefill runner.   -> 8 个 rank 全挂，prompt 都没喂进去
+
+修法是三件事，缺一不可：`_capturing()` 提到读取张量之前；`dump_prefill.py` 加
+`disable_prefill_cuda_graph=True`（`cuda_graph_backend_prefill="disabled"` 单独用不够，prefill 仍会捕获）；
+`_last_pos` 增加 `fb.positions` 回退（这个 tree 的 positions 挂在 ForwardBatch 上，不在 layer 的 kw/args 里，
+没有这条 prefill 层行一个都写不出来，pools 却照写 —— 只有"layers 目录是空的"这一个症状）。
+
+另外两个静默失败：`mhc.AttnOutput` 是 NamedTuple，字段叫 `partial` 不是 `data`；logits 的字段叫
+`next_token_logits` 不是 `logits`。两者都不抛异常，只是什么都不写。
+
+还有一个**记错步**的坑：decode 步必须按 **position** 认，不能按"第一个 decode forward"认。引擎会先跑一个
+1-token 的 dummy decode，它的入 token 是 103084 —— 实测 `L00_in` 与 `embed[103084]` cos = 1.0，与
+`embed[4588]` cos = 0.04。那种错看起来像"注意力核写错了"，其实是记错了步。现在按 `_AT + 1`（=31906）门控，
+并且 `--max-new 2` 保证真实 decode 一定发生（`[4588, 343]`）。
+
+### 12.40.1 参考侧现在有什么
+
+    /tmp/dec_io2/layers/step1/            L00..L39 × 11 个量 = 440 行  + logits.f32（129280，全词表）
+    /tmp/dec_io2/layers/step1/io/         40 层 × 8 rank × 4 个量 = 1280 个 bf16 文件
+                                          o_rope（核返回的 rope 空间 o）o_inv（wo_a 的输入）oa（wo_b 的输入）y_part（未归约的 bf16 部分和）
+
+`L00_in/L00_apost/L00_apost_x` 与 `dec_coef8` **逐位相同**（20480/20480、5120/5120），所以这趟记的确实是那一步。
+
+### 12.40.2 L0 的最后一位：注意力核 0.16 ulp + wo 尾段 0.43 ulp
+
+**第一段 —— 我们的 wo_a GEMM 用参考自己的 o 喂进去，与参考自己的 oa 比：**
+
+    rank   raw fp32 relRMS   bf16 舍入后      逐 bit 命中
+    r0       1.663e-03        0.000e+00      1024/1024
+    r1       1.709e-03        3.806e-05      1022/1024
+    r2       1.630e-03        3.705e-04      1018/1024
+    r3       1.731e-03        0.000e+00      1024/1024
+    r4       1.665e-03        0.000e+00      1024/1024
+    r5       1.660e-03        0.000e+00      1024/1024
+    r6       1.682e-03        7.246e-07      1023/1024
+    r7       1.708e-03        1.830e-04      1020/1024
+
+8185/8192 逐位相同。**wo_a 这一级没有可归因的误差**（raw fp32 的 1.66e-3 全部落在 bf16 舍入之内）。
+
+**第二段 —— 参考自己的 oa 喂进我们的 wo_b + bf16 partial + 求和：**
+
+    y 的 relRMS 1.6667e-03   （= 0.43 个 y 的 bf16 ulp）   cos 0.9999986130
+
+这一段是纯实现序（wo_b 的 k 序累加 + bf16 partial + all-reduce 树），换注意力核无法消除。
+
+**第三段 —— 换成我们自己的 o，同一条代码：**
+
+    SGLang 的 o -> 我们的 wo : y relRMS 1.6667e-03
+    我们的 的 o -> 我们的 wo : y relRMS 4.3052e-03
+    -> 注意力核贡献（平方差）  3.97e-03        wo 尾段 1.67e-03
+
+而我们的 `o_q` 与参考 `o_inv` 的直接差是 **6.266e-04（0.16 bf16 ulp），中位 0 ulp，91.6% 逐 bit 相同**
+（30007/32768）：
+
+    r0 3.500e-04 94.6% | r1 1.005e-03 90.4% | r2 5.988e-04 91.9% | r3 1.069e-03 86.1%
+    r4 3.100e-04 95.1% | r5 3.569e-04 94.0% | r6 6.816e-04 89.7% | r7 6.414e-04 90.8%
+
+**所以 r10 的答案是：两边都有，注意力核是主项。** o 上 0.16 ulp 被 wo_a -> bf16 -> act_quant（32 元素块的
+block max，非线性量化器）放大 6.3 倍成 1.05 ulp 的 y —— 8.4% 的元素差最后一位，就会翻转约 8% 的量化/舍入判决。
+0.43 ulp 那段（wo_b 的 k 序 + partial + all-reduce）是任何复刻都消不掉的噪声底。
+
+### 12.40.3 端到端：40 层链的 logits 与参考同 argmax、同 top-5 集合
+
+    /tmp/dec_io2/layers/step1/logits.f32（参考，decode 步 → 预测 343）
+    /tmp/chain_ok/logits.bin 与 /tmp/chain_idx/logits.bin 逐 bit 相同（我们可复现）
+
+    relRMS 3.9107e-02   max|d| 1.312   （logits 绝对值 13–23）
+
+    ref   top5 [343, 764, 16062, 2591, 14667]
+    chain top5 [343, 764, 16062, 14667, 2591]
+
+argmax 一致（343，正是 SGLang 这一步生成的 token），top-5 是同一个集合，只是第 4/5 名互换。
+3.9e-2 是 40 层每层 ~1 ulp 累积后的 logits 相对差，不是新的结构性问题。
+
+### 12.40.4 参考自带的散度（再次确认，这次用同 hook 的两次运行）
+
+`/tmp/dec_io1` vs `/tmp/dec_io2`（同 prompt 同权重同代码，两个独立进程）：
+
+    step1 的 440 个 f32 里，逐 bit 相同的只有 29 个（全部属于 L0/L1）
+    L02_apost     relRMS 5.427e-03
+    L03_apost     relRMS 1.566e-02
+    L03_mpost     relRMS 9.890e-03
+
+即 stock SGLang 自己在 L2 的散度（5.4e-3）就已经**大于**我们 L0 的差（4.3e-3）。L0/L1 的带是 0（两次运行逐 bit
+相同），所以 L0 那 1 ulp 是必然"带外"的，但它比参考自己在 L3 的噪声还小。
+
+### 12.40.5 logits 也进了参考自己的带（0.87x）
+
+第三趟 `/tmp/dec_io3`（同 hook 同参数）给出第二个参考 logits，于是可以量出 logits 的带：
+
+    参考自身两次运行       relRMS 4.4930e-02   max|d| 1.250
+    我们的链 vs dec_io2    relRMS 3.9107e-02   max|d| 1.312
+    我们的链 vs dec_io3    relRMS 4.0904e-02   max|d| 1.246
+    -> 带比 0.87x（带内）
+
+    ref2  top5 [343, 764, 16062, 2591, 14667]
+    ref3  top5 [343, 764, 16062, 14667, 37481]     <- 参考自己第 5 名都换了
+    chain top5 [343, 764, 16062, 14667, 2591]
+
+三次运行 top-3 完全一致（343、764、16062），前两名的差值都在 1.25–1.5 之内；参考自己第 4/5 名都在跳
+（2591 <-> 37481）。**我们的链在 logits 层面不比 SGLang 自己两次运行之间更远**，这是"端到端对齐"能被检验的
+最强形式 —— 逐 bit 相等在这套推理栈上对参考自己都不成立。
+
+### 12.40.6 结论
+
+| 层面 | 我们的链 vs 参考 | 参考自己的带 | 比 |
+|---|---|---|---|
+| L0 的 y | 4.31e-03（1.1 ulp；注意力核 0.16 ulp + wo 尾 0.43 ulp） | 0（逐 bit） | 带外，但比参考 L3 的自噪声（1.6e-2）还小 |
+| L4–L39 的 attn/moe | — | — | 0.80–0.91x，带内（`cmp_band.py` 101/117 行） |
+| logits | 3.91e-02 | 4.49e-02 | **0.87x，带内**，argmax 一致 |
+
+"40 层逐层 relRMS << 1%" 这个要求在 stock SGLang 上物理不可达（它自己两次运行在 L3 就散到 1.6%），
+可检验的目标只能是"不比参考自己两次运行之间更远"，而这个目标目前三层（逐层、logits、top-k）都达到了。

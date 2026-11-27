@@ -56,14 +56,22 @@ def _is_decode(fb) -> bool:
         return False
 
 
-def _last_pos(kw, args):
-    """This forward's last position, or None when it cannot be told."""
+def _last_pos(kw, args, fb=None):
+    """This forward's last position, or None when it cannot be told.
+
+    `positions` is on the ForwardBatch in this tree (the layer's own kw/args no longer carry it), so without the
+    `fb` fallback every prefill gate read None and no layer row was ever written -- the pools dumped and the layers
+    directory stayed empty."""
     p = kw.get("positions")
     if p is None:
         for v in args:
             if torch.is_tensor(v) and v.dtype in (torch.int32, torch.int64) and v.dim() == 1:
                 p = v
                 break
+    if p is None and fb is not None:
+        p = getattr(fb, "positions", None)
+        if p is not None and not torch.is_tensor(p):
+            p = None
     try:
         return int(p.max())
     except Exception:
@@ -177,6 +185,9 @@ def _dump_meta(mr, fb) -> None:
 
 
 _ATTN_IO = os.environ.get("DSV41_DUMP_ATTN_IO", "0") != "0"
+# The position the recorded decode step must carry: the one right after the prefill's last (= _AT). Without it the
+# engine's dummy one-token decode is what gets recorded (see _layer_forward).
+_DEC_POS = int(os.environ.get("DSV41_DUMP_DEC_POS", "0")) or ((_AT + 1) if _AT > 0 else 0)
 # DSV41_DUMP_ATTN_IO: also record the attention's INSIDE, per layer per rank, for decode step 1:
 #   o_rope  `o` as the attention core hands it back (rope space, per-rank heads) -- what the chain's attention writes
 #   o_inv   the same buffer after `_project_wo_a`'s in-place inverse RoPE: the wo_a input (== the chain's `o_q`)
@@ -255,7 +266,12 @@ def _install_attn_io() -> None:
         lid = int(getattr(self, "layer_id", -1))
         out = _owb(self, o, *a, **kw)
         try:
-            v = out.data if hasattr(out, "data") else out     # mhc.AttnOutput wraps the unreduced partial
+            # mhc.AttnOutput is a NamedTuple whose field is `partial` (not `.data`, which a NamedTuple does not have):
+            # the first version silently wrote no y_part at all, because a NamedTuple is not a tensor and the writer
+            # just returned. 960 io files instead of 1280 was the only symptom.
+            v = getattr(out, "partial", None)
+            if v is None:
+                v = out.data if hasattr(out, "data") else out
             write("y_part", v, lid)
         except Exception:
             pass
@@ -267,12 +283,17 @@ def _install_attn_io() -> None:
         from sglang.srt.layers.logits_processor import LogitsProcessor
 
         _lp = LogitsProcessor.forward
+        _said_lp = [0]
 
         def _lp_fwd(self, input_ids, hidden_states, lm_head, logits_metadata, *a, **kw):
             out = _lp(self, input_ids, hidden_states, lm_head, logits_metadata, *a, **kw)
             try:
                 step = _step[0]
-                lg = getattr(out, "logits", None)
+                # the field is `next_token_logits`; there is no `.logits`, so the first version recorded nothing and
+                # raised nothing -- a silent no-op, the same failure mode as y_part above.
+                lg = getattr(out, "next_token_logits", None)
+                if lg is None:
+                    lg = getattr(out, "logits", None)
                 # `_capturing()` is not optional here: the row-bucket graph captures the logits step too, and a `.cpu()`
                 # inside it invalidates the capture ("operation failed due to a previous error during capture"),
                 # which takes the whole engine down rather than just this record.
@@ -282,6 +303,10 @@ def _install_attn_io() -> None:
                     row = lg.detach().float().cpu().reshape(lg.shape[0], -1)[-1]
                     row.numpy().astype(np.float32).tofile(os.path.join(d, "logits.f32"))
                     print(f"[dump] decode step {step}: logits {tuple(row.shape)} written", flush=True)
+                elif _said_lp[0] < 2:
+                    _said_lp[0] += 1
+                    print(f"[dump] logits hook fired, nothing to record: step {step} capturing {_capturing()} "
+                          f"tensor {torch.is_tensor(lg)} shape {None if lg is None else tuple(lg.shape)}", flush=True)
             except Exception as e:
                 print(f"[dump] logits record failed: {type(e).__name__}: {e}", flush=True)
             return out
@@ -540,14 +565,34 @@ def _install() -> None:
             if fb is None and len(args) > 3:
                 fb = args[3]
             lid0 = int(getattr(self, "layer_id", -1))
-            dec0, last0 = _is_decode(fb), _last_pos(kw, args)
+            # BEFORE anything reads a tensor: `_last_pos` does `int(p.max())`, a device sync, and this forward runs
+            # inside the prefill runner's breakable capture. A sync there invalidates the capture
+            # ("operation failed due to a previous error during capture"), which is what killed three dump attempts
+            # before the prompt was even fed -- so the guard has to be the first thing after the cheap attribute reads.
+            if _capturing():
+                return _orig_layer(self, *args, **kw)
+            dec0, last0 = _is_decode(fb), _last_pos(kw, args, fb)
+            # A decode step is counted here, at its FIRST layer, not in ModelRunner.forward: this tree runs the
+            # decode through the replay runner, so the ModelRunner wrapper never saw a decode forward at all and
+            # no step row (and no attn IO) was ever written.
+            #
+            # It also has to be identified by POSITION, not by being "the first decode forward": the engine runs a
+            # one-token dummy decode before the real one, and recording it is not a near miss -- its token is not the
+            # chain's. Measured: the first attempt's L00_in matched embed[103084] (cos 1.0), i.e. the warmup, against
+            # the chain's embed[4588]; that reads as cos 0.04 with everything downstream, which looks like a broken
+            # attention kernel rather than a wrong step. The real one is the position right after the prefill's last.
+            dec_hit = dec0 and (_DEC_POS <= 0 or last0 == _DEC_POS)
+            if dec0 and not dec_hit:
+                _gate.update(lid=lid0, pref=False, step=0)
+                return _orig_layer(self, *args, **kw)
+            if dec_hit and lid0 == 0 and _step[0] < 1:
+                _step[0] = 1
+                print(f"[dump] decode step 1 (position {last0})", flush=True)
             _gate.update(lid=lid0,
                          pref=(not dec0) and last0 is not None and (_AT <= 0 or last0 == _AT)
                               and not _rec.get("done", False),
                          step=_step[0] if (dec0 and 0 < _step[0] <= _STEPS) else 0)
             if not _gate["pref"] and not _gate["step"]:
-                return _orig_layer(self, *args, **kw)
-            if _capturing():      # never touch the batch or copy to host inside a capture region
                 return _orig_layer(self, *args, **kw)
             pre = None    # the residual the layer READS, taken before it runs: layer 0's is the embedding in every
             precoef = {}  # stream (hc_broadcast), so it is the input the chain must start from
@@ -610,7 +655,7 @@ def _install() -> None:
                 # token's -- and it is also why L0 never matched. Keep the forward that carries the position the chain
                 # replays (a prefill chunk ending at _AT) and the real decode steps, and nothing else.
                 dec = _is_decode(fb)
-                last = _last_pos(kw, args)
+                last = _last_pos(kw, args, fb)
                 if dec and 0 < _step[0] <= _STEPS and not _capturing():   # a decode step: every layer's row, in full
                     try:
                         r = _step_rec["rows"]
@@ -646,10 +691,10 @@ def _install() -> None:
         # or the step that just started records itself as the next number (and step 1 is never written).
         # The mode must say decode: the one-token warmup forward also has seq_lens == 1, and letting it through
         # shifted every step by one (and made step 1 the warmup's dummy token).
+        # The step counter is advanced by the LAYER hook now (see _layer_forward): this tree runs the decode through
+        # the replay runner, which does not pass through ModelRunner.forward, so counting here never fired. Kept as a
+        # no-op comment rather than a second counter -- two counters would double-advance once a path uses both.
         lens = getattr(forward_batch, "seq_lens", None)
-        if _LAYERS and _is_decode(forward_batch) and _step[0] < _STEPS:
-            _step[0] += 1
-            print(f"[dump] decode step {_step[0]} ({0 if lens is None else len(lens)} row(s))", flush=True)
         out = orig(self, forward_batch, *args, **kw)
         if not getattr(self, "_dsv41_dumped", False):
             lens = getattr(forward_batch, "seq_lens", None)   # (a decode step's is all 1s: len(lens) > 1 alone is not a prefill)
@@ -700,6 +745,7 @@ def _install_cap_flag() -> None:
             _CAP[0] = False
 
     cls.__enter__, cls.__exit__ = enter, exit_
+    print("[dump] capture flag installed (a capture anywhere now suppresses every record)", flush=True)
 
 
 if _DIR:
