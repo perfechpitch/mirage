@@ -45,6 +45,18 @@ A.add_argument("--greedy", action="store_true",
                     "own argmax token back as the next input (SGLang's generate at temperature 0). Without it every "
                     "--steps launch replays the same token at the same position, so the steps are identical")
 A.add_argument("--flush-mb", type=int, default=0, help="L2 emptied before each launch (0: not)")
+A.add_argument("--profile-build", action="store_true",
+               help="build the layers as TIMING builds (compile_static(profile=True)) and dump every task's "
+                    "[node, sm, start, end] of the probed launch: which node the span is actually made of")
+A.add_argument("--probe", action="store_true",
+               help="decompose the first layer's own span with the kernel's hardware stamps: start-barrier spread, "
+                    "barrier -> first task, first task -> last task end. No rebuild needed (every build stamps).")
+A.add_argument("--tpot", type=int, default=0, metavar="N",
+               help="time N whole decode steps the way a server sees them (all 80 launches queued back to back, one "
+                    "sync at the end) and report the median/p10/p90 step time and tok/s")
+A.add_argument("--async-launch", action="store_true",
+               help="queue each sublayer's launch without waiting for it (the serving path: the host never blocks "
+                    "between layers)")
 A.add_argument("--timeout", type=float, default=120.0, help="a launch longer than this is a hang (s)")
 A.add_argument("--out", default="/tmp/full_decode", help="the build directories")
 A.add_argument("--flag", action="append", default=[], help="an nvcc flag for every layer (repeatable)")
@@ -78,7 +90,9 @@ read = attn_weights.checkpoint_reader(a.checkpoint)
 cfg = attn_weights.model_config(a.checkpoint)
 heads = 64 // NG
 FLUSH = a.flush_mb << 20
+ASYNC_LAUNCH = bool(a.async_launch)
 FLAGS = list(a.flag)          # no STATIC_RESET_IN_KERNEL: the host reset path (launch_func)
+INFO = {}      # each sublayer's compile_plan info (the probe needs its schedule + mpk to name a task's node)
 L40 = a.layers
 
 # The kernels' build cache (compile_static's MIRAGE_STATIC_BUILD_CACHE): without it every run nvcc's all 80 layers
@@ -445,8 +459,9 @@ for L in range(L40):
             cc = wg.get("compress_cache")
             if cc is not None:
                 wg["compress_pages"] = TAB[r]["pages_for"](cc.shape[1])
-    sk, bufs, _ = attn_demo.build(ws, variant, ratio, csrc, heads, os.path.join(a.out, f"a{L}"),
-                                  extra_flags=FLAGS)
+    sk, bufs, inf = attn_demo.build(ws, variant, ratio, csrc, heads, os.path.join(a.out, f"a{L}"),
+                                    extra_flags=FLAGS, profile=bool(a.profile_build and L == 0))
+    INFO[f"attn{L}"] = inf
     K.append((f"attn{L}", sk, ws, bufs))
     WSD[L] = ws
     x = [wg["x_out"] for wg in ws]
@@ -474,7 +489,9 @@ for L in range(L40):
             # layer L+1 owns an Engram, which SGLang applies to this MoE's output BEFORE that layer runs: the kernel
             # computes R'' too (streams_eg) and its x_out from R'' (eg_gamma), so the chain can follow SGLang past it.
             engram_into(wg, d, r, L, EG_SRC[L])
-    sk, bufs, _ = moe_demo.build(wsm, os.path.join(a.out, f"m{L}"), extra_flags=FLAGS)
+    sk, bufs, inf = moe_demo.build(wsm, os.path.join(a.out, f"m{L}"), extra_flags=FLAGS,
+                                   profile=bool(a.profile_build and L == 0))
+    INFO[f"moe{L}"] = inf
     K.append((f"moe{L}", sk, wsm, bufs))
     x = [wg["x_out"] for wg in wsm]
     # R'' when this layer hosts an Engram (the next layer reads it), R' otherwise
@@ -620,6 +637,33 @@ def _eg_step_rows(step, L):
     return _EG_CACHE[(step, L)]
 
 
+def _launch(h, flush_bytes: int) -> None:
+    """One sublayer's launch.
+
+    --async-launch queues it and returns (the server's path: the host never blocks between layers, so the GPU finds the
+    next kernel already submitted). The kernels keep the ranks together through core.cuh's STATIC_TP_BARRIER start
+    barrier, which is what makes the doubled exchange set safe: a rank that entered launch n has finished n - 1.
+    Otherwise this WAITS for the kernel, which is the right thing for a correctness run (a hang is a hang) and the
+    wrong thing for a TPOT: the host's per-launch round trip would be counted 80 times."""
+    if not ASYNC_LAUNCH:
+        h.launch(flush_bytes, timeout_s=a.timeout)
+        return
+    if flush_bytes:
+        h.flush_l2(flush_bytes)
+    h.sk.launch_stream(torch.cuda.current_stream().cuda_stream, False)
+
+
+def _drain() -> None:
+    """--async-launch: the one wait of a step, after every layer is queued."""
+    if not ASYNC_LAUNCH:
+        return
+    for _, h, _, _ in hs:
+        h.sk.wait()
+
+
+_pending = []      # (name, harness) of the launches queued by the current step
+
+
 def step(step_no: int = 1, time_it: bool = False):
     """One launch of every sublayer. step_no picks the Engram rows (they are a per-token input, like the KV)."""
     spans = []
@@ -663,15 +707,14 @@ def step(step_no: int = 1, time_it: bool = False):
                 rows = _eg_step_rows(step_no, L)   # kernel's own eg_kv comes from them, and the attention of L+1 reads it
                 for r in range(min(NG, len(rows))):
                     ws[r]["eg_emb"].copy_(rows[r])
-            h.launch(FLUSH, timeout_s=a.timeout)
+            _launch(h, FLUSH)
+            _pending.append((name, h))
             # capture NOW: each sublayer's `streams` IS the previous one's `streams_out` (the chain links the tensors by
             # reference), so the next launch's copy overwrites the tensor this one wrote -- a dump at the end of the
             # step would show the neighbour's input, not this sublayer's output (verified: the aliased values compared
             # bit-identical to the reference row copied in afterwards)
             _TEACH_OUT[name] = (ws[0]["streams_out"][0].detach().float().cpu().clone(),
                                 ws[0]["x_out"][0].detach().float().cpu().clone())
-            if time_it:
-                spans.append((name, h.span_us()))
             if a.rms and not time_it:
                 print(rms_line(ws, name), flush=True)
             continue
@@ -686,11 +729,14 @@ def step(step_no: int = 1, time_it: bool = False):
                 # row 0 only: x is [T, HID] and a [HID] source would broadcast over every token row (it did, and
                 # since all attention layers share this wiring it clobbered the whole chain's inputs)
                 ws[r]["x"][:1].copy_(eg_next_x(src[r]["streams_eg"], L, devs[r])[None])
-        h.launch(FLUSH, timeout_s=a.timeout)
-        if time_it:
-            spans.append((name, h.span_us()))
+        _launch(h, FLUSH)
+        _pending.append((name, h))
         if a.rms and not time_it:
             print(rms_line(ws, name), flush=True)
+    _drain()      # async mode: the step's one wait, before anything reads a stamp or a buffer
+    if time_it:   # spans are device stamps: only valid once the launches have finished
+        spans = [(n, h.span_us()) for n, h in _pending]
+    _pending.clear()
     return spans
 
 
@@ -812,9 +858,112 @@ for s in range(a.steps):
     if a.rms:
         log(f"step {s + 1}/{a.steps} done")
 
+if a.probe:
+    # The layer's span is "last SM past the start barrier -> last SM's end", so it already excludes host latency. What
+    # it does not say is which of the three phases inside that window costs the time: lining the 148 SMs up, the
+    # cross-rank barrier's own wait, or the tasks. The stamps answer that per SM and per task without a profiler.
+    import numpy as np
+    n0, h0 = hs[0][0], hs[0][1]
+    h0.launch()
+    torch.cuda.synchronize()
+    lay = h0.layout
+    st = h0._array(0, "stamps", np.int64).reshape(lay["num_sms"], lay["num_stamps"])
+    t_start = st[:, lay["stamp_start"]]
+    end_col, task_col = lay["stamp_end"], lay["stamp_task0"]
+    bar = int(h0._array(0, "start_barrier", np.int64)[0])
+    t0 = int(t_start[t_start > 0].min())
+    end = int(st[:, end_col].max())
+    tsk = st[:, task_col]
+    first_task = int(tsk[tsk > 0].min()) if (tsk > 0).any() else 0
+    log(f"probe {n0}: span {h0.span_us():.1f} us over {int((st[:, end_col] > 0).sum())} SMs")
+    log(f"  SMs enter the kernel over {int(t_start[t_start > 0].max()) - t0} us "
+        f"({int((t_start > 0).sum())}/{len(st)} stamped)")
+    log(f"  all SMs past the start barrier at +{(bar - t0) / 1e3:.1f} us")
+    log(f"  first task starts at +{(first_task - t0) / 1e3:.1f} us  (barrier -> task {(first_task - bar) / 1e3:.1f} us)")
+    log(f"  last SM ends at +{(end - t0) / 1e3:.1f} us  (tasks span {(end - first_task) / 1e3:.1f} us)")
+    # The number the TPOT is actually made of: queue N launches back to back with no host wait between them (the
+    # server's path) and time them as a batch. span_us() alone is only "last SM past the start barrier -> last SM
+    # end", so it hides the kernel's entry and its barrier; this batch wall clock does not.
+    torch.cuda.synchronize()
+    for _ in range(3):
+        h0.sk.launch()
+    torch.cuda.synchronize()
+    N = 30
+    _a, _b = torch.cuda.Event(True), torch.cuda.Event(True)
+    _a.record()
+    for _ in range(N):
+        h0.sk.launch()
+    _b.record()
+    torch.cuda.synchronize()
+    per = _a.elapsed_time(_b) * 1e3 / N
+    log(f"  back-to-back {N}x: {per:.1f} us a launch (device wall), of which span {h0.span_us():.1f} us "
+        f"-> {(per - h0.span_us()):.1f} us a launch is entry + barrier")
+    if a.profile_build:
+        # The timing build's per-task stamps: the span is the union of these, so this says whether it is one long node
+        # (a real bottleneck) or one long dependency chain of short nodes (a latency problem, and no single node to fix).
+        from mirage.mpk import compiler
+        sk0 = h0.sk
+        inf0 = INFO[n0]
+        sch = json.load(open(inf0["paths"][0]))
+        nm = {n.graph_idx: compiler.tname(inf0["mpk"], n.outputs[0]) for n in compiler.graph_nodes(inf0["mpk"])}
+        node_of = {i: nm[t["node"]] for i, t in enumerate(sch["all_tasks"])}
+        queues = sch["worker_task_queues"]
+        tt = h0.task_times()[0]
+        per = {}
+        for sm, tasks in enumerate(tt):
+            for i, tup in enumerate(tasks):
+                if not tup or tup[0] <= 0 or tup[1] <= 0:
+                    continue
+                i_task = queues[sm][i] if i < len(queues[sm]) else None
+                nmen = node_of.get(queues[sm][i], f"task{i}") if i < len(queues[sm]) else f"task{i}"
+                st_ns, en_ns = tup[0], tup[1]
+                d = per.setdefault(nmen, [0, 0, 1 << 62, 0])   # tasks, busy, first start, last end
+                d[0] += 1
+                d[1] += en_ns - st_ns
+                d[2] = min(d[2], st_ns)
+                d[3] = max(d[3], en_ns)
+        if per:
+            base = min(v[2] for v in per.values())
+            rows = sorted(((v[1] / 1e3, k, v[0], (v[2] - base) / 1e3) for k, v in per.items()))
+            log("  per node (busy = summed task time, at = its first task starts):")
+            for busy, k, nt, at in rows[-12:][::-1]:
+                log(f"    {k:32s} busy {busy:7.1f} us  at +{at:6.1f} us  over {nt} tasks")
+
+if a.tpot:
+    # The TPOT a server would see: N whole steps, each timed end to end with CUDA events, so the host's launch cost is
+    # inside the number (a sum of kernel spans is not a step time). Each rep starts from an emptied L2, as the layer
+    # demos do, so the KV reads are real 32K reads and not cache hits.
+    for _ in range(2):
+        step()
+    torch.cuda.synchronize()
+    evs = []
+    for _ in range(a.tpot):
+        s_ev, e_ev = torch.cuda.Event(True), torch.cuda.Event(True)
+        # a fixed 512 MB per rep, independent of --flush-mb (that one flushes before EVERY launch, which in a TPOT
+        # run would dominate the step): the KV caches must be read from HBM, not from L2
+        _flush = torch.empty(512 << 20, dtype=torch.uint8, device=devs[0])
+        _flush.zero_()
+        del _flush
+        torch.cuda.synchronize()
+        s_ev.record()
+        step()
+        e_ev.record()
+        torch.cuda.synchronize()
+        evs.append(s_ev.elapsed_time(e_ev) * 1e3)
+    evs.sort()
+    med = evs[len(evs) // 2]
+    log(f"TPOT: {len(hs)} sublayers ({2 * len(hs)} launches a step); "
+        f"median {med:.1f} us = {med / 1000:.2f} ms  (p10 {evs[len(evs) // 10]:.1f}, p90 {evs[9 * len(evs) // 10]:.1f}), "
+        f"{1e6 / med:.0f} tok/s")
+    with open(os.path.join(a.out, "tpot.json"), "w") as fh:
+        json.dump({"layers": a.layers, "tokens": T, "mode": "async" if ASYNC_LAUNCH else "sync",
+                   "tpot_median_us": med, "p10_us": evs[len(evs) // 10], "p90_us": evs[9 * len(evs) // 10],
+                   "tok_s": 1e6 / med}, fh, indent=1)
+
 spans = step(time_it=True)
 per = {n: v for n, v in spans}
-log("medians: " + " ".join(f"{n} {v:.1f}" for n, v in spans[:6]) + (" ..." if len(spans) > 6 else ""))
+log("medians: " + " ".join(f"{n} {v:.1f}" for n, v in spans))
+log("heaviest: " + "  ".join(f"{n} {v:.1f}" for n, v in sorted(spans, key=lambda t: -t[1])[:10]))
 log(f"a step of {len(spans)} launches: sum of spans {sum(v for _, v in spans):.1f} us")
 
 if a.save_x:

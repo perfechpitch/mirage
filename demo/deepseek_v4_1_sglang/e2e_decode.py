@@ -50,6 +50,10 @@ A.add_argument("--sync-every", type=int, default=0,
                help="layers between two cross-rank barriers (0: only at the end). Each static layer's sum_store is an "
                     "all-reduce over the exchange regions, so all ranks must be in the same kernel: without a barrier "
                     "the ranks drift apart and the polls deadlock")
+A.add_argument("--spans", action="store_true",
+               help="after the timed loop, run one more step and report every launch's own span (the kernel's "
+                    "start-barrier-to-last-SM-end device time, from its stamps): sum(spans) vs the step time separates "
+                    "GPU occupancy from the host's launch gaps")
 A.add_argument("--dump", default=None,
                help="after the first step, write every layer's x_out and streams_out (bf16) and the logits to this "
                     "directory: two runs' dumps must be bit-identical (sync vs async mode proves the fast path, two "
@@ -444,5 +448,34 @@ if RANK == 0:
                "tok_s": 1e6 / med, "variants": variants[:a.layers]},
               open(os.path.join(a.out, "e2e_decode.json"), "w"), indent=1)
     log(f"wrote {os.path.join(a.out, 'e2e_decode.json')}")
+
+if a.spans:
+    # Per-launch attribution. The spans must be read AFTER the launches finish: span_us() is a host read of the
+    # kernel's own stamps, so calling it inside the loop would synchronize and destroy the very gaps being measured.
+    # Every kernel stamps [start barrier, last SM end] in globaltimer, so the values survive to be read here.
+    from mirage.mpk.static_harness import Harness
+    step()
+    torch.cuda.synchronize()
+    dist.barrier()
+    names, spans = [], []
+    for i in range(a.layers):
+        names += [f"attn{i}", f"moe{i}"]
+        spans += [Harness(attn[i].sk).span_us(), Harness(moe[i].sk).span_us()]
+    if RANK == 0:
+        tot = sum(spans)
+        for n, v in zip(names, spans):
+            print(f"[span] {n:8s} {v:8.1f} us", flush=True)
+        print(f"[span] sum {tot:.1f} us over {len(spans)} launches; the timed step was {med:.1f} us "
+              f"-> host gaps {med - tot:.1f} us ({100 * (med - tot) / med:.1f}%)", flush=True)
+        top = sorted(zip(spans, names), reverse=True)[:8]
+        print("[span] the 8 heaviest: " + "  ".join(f"{n} {v:.0f}" for v, n in top), flush=True)
+        attn_sum = sum(v for n, v in zip(names, spans) if n.startswith("attn"))
+        moe_sum = tot - attn_sum
+        print(f"[span] attention total {attn_sum:.1f} us ({100 * attn_sum / med:.0f}% of the step), "
+              f"MoE total {moe_sum:.1f} us ({100 * moe_sum / med:.0f}%)", flush=True)
+        os.makedirs(a.out, exist_ok=True)
+        json.dump({"spans_us": dict(zip(names, spans)), "sum_us": tot, "step_us_median": med},
+                  open(os.path.join(a.out, "spans.json"), "w"), indent=1)
+
 dist.barrier()
 dist.destroy_process_group()

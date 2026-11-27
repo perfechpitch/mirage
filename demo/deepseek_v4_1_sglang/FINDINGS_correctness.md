@@ -2671,3 +2671,107 @@ numpy 复刻本身也到不了任何一方的精度（MMA 的累加序不可复�
 
 **r11 结案：不是缺陷，不动作。** 若将来出于"逐位可复现某个特定引擎"的目标确实需要，唯一可行的路径是在静态核里
 按 flash_mla 的 tile/累加序重写 PV，而不是调参数逼近。
+
+## 12.42 decode TPOT 的归因：92% 是每次 launch 的固定开销，不是 32K 的计算（2026-11-27）
+
+目标从"对齐"转到"TPOT"，所以第一件事是把 32K 一步的时间**拆开**，而不是先猜优化点。全部数字都是量出来的。
+
+### 12.42.1 上下文长度几乎不影响一步的时间
+
+同一条链（swa/adam 与 21 层前缀），只改 `--pos`：
+
+| 位置 | 6 次 launch 的 span 和 | 42 次 launch 的 span 和 |
+|---|---|---|
+| 1024 | 296.6 us | 2208.4 us |
+| 8192 | 309.1 us | — |
+| 31906 | 338.0 us | 2376.6 us |
+
+**31 倍上下文，42 次 launch 只多 7.6%**（2208 -> 2377 us）。逐层看更清楚：
+
+| 变体 | 位置 1024 | 位置 31906 | 结论 |
+|---|---|---|---|
+| `swa`（attn0/1） | 44.5 / 45.1 us | 44.6 / 43.8 us | **与上下文无关** |
+| `full_r2`（attn2/8/14） | 68.0 / 65.6 / 68.3 us | 94.3 / 94.8 / 94.4 us | +26 us，**唯一随 32K 线性增长的部分** |
+| `reuse`（其余 30 层） | ~48-50 us | ~48-51 us | 与上下文无关 |
+| MoE（全部 40 层） | ~48-53 us | ~47-53 us | 与上下文无关 |
+
+所以 32K 真正多付出的只有 8 个 indexer 层（3 个 `full` + 5 个 `reindex`），合计约 400 us；
+其余 ~3.7 ms 是**每次 launch 的固定开销**，在 1K 上一样要付。
+
+这条结论直接改写了优化方向：把 32K 的 attention 算快**没有用**（它只占 8%），
+必须减少 launch 次数、或压低每次 launch 的固定开销。
+
+### 12.42.2 固定开销的构成（内核自带硬件 stamps）
+
+`full_decode.py --probe` 用 `stamp_start / start_barrier / stamp_end` 分期读出来（无需 profiler）：
+
+```
+probe attn0 (swa, pos 31906): span 42.4 us over 148 SMs
+  SMs enter the kernel over 224 us (148/148 stamped)
+  all SMs past the start barrier at +64.2 us
+  back-to-back 30x: 345.6 us a launch (device wall), of which span 42.0 us
+```
+
+- `span_us()` 的口径是"最后一个 SM 过起始栅栏 -> 最后一个 SM 结束"，**不含入核与栅栏**，
+  所以把 80 个 span 相加（4.14 ms）会**低估**一步的真实代价；8 进程服务形态实测是 8.16 ms（§12.42.4）。
+- 单进程 8 卡跑 back-to-back 是 345.6 us/次，但那是 host-reset 构建（每次 launch 前 host memset 全部 buffer），
+  **不代表服务路径**，只说明这条测量通道不可用于 TPOT。
+
+### 12.42.3 每任务成本：单 token GEMV 慢在依赖跳数，不在带宽
+
+timing build 的 per-node 汇总（attn0，32K，busy = 该 node 全部任务的耗时之和）：
+
+| node | busy | 任务数 | 单任务 |
+|---|---|---|---|
+| `wo_b_part` | 1919.5 us | 80 | 24.0 us |
+| `y_sent` | 1159.2 us | 40 | 29.0 us |
+| `oa_q` | 211.4 us | 8 | 26.4 us |
+| `wo_a_part` | 410.1 us | 16 | 25.6 us |
+| `o_q` | 164.5 us | 8 | 20.6 us |
+| `wq_b_part` | 301.1 us | 32 | 9.4 us |
+| `wq_a_part` | 192.5 us | 40 | 4.8 us |
+
+T=1 的一次 GEMV 读的权重约 5 MB，满带宽下应 ≈0.6 us，实测 20-29 us —— 差 30-50 倍。
+所以瓶颈是**跨 SM/跨 rank 的依赖跳数（计数器轮询）**，不是 HBM。一层约 8 跳，每跳几 us，凑成 ~44 us 的地板。
+
+### 12.42.4 正向对照失败：`TPB=1` 并不干净（§8.1 原来"待补跑"的那一格）
+
+§8.1 的真值表里 `TPB=1`（内核自带栅栏）一行此前是**待 GPU 空闲后补跑**。今天跑了，结果是：
+
+```
+DSV41_STATIC_TPB=1（默认），e2e_decode.py --layers 6
+[e2e] NOT FINITE in 6 sublayers, the first is attn L3: attn L3, moe L3, attn L4, moe L4, attn L5, moe L5
+```
+
+- 6 层就确定性复现，首个非有限仍是 **attn L3（第一个 `reuse` 层）**，与 `tpb0_nosync` 的位置一模一样。
+- 确认 `-DSTATIC_TP_BARRIER` **确实编进了** nvcc 命令行（`e2e_t_tpb1.log` 里 96 次出现），
+  所以不是"flag 没进去"，是**栅栏没能给出 `reuse` 层需要的那条顺序**。
+- 另外观察到 40 层 `TPB=1` 那次的挂起点在 `attn L0/L1`（`148/148 SM entered`、`task0 started 0`），
+  即卡在栅栏之后的派发上；而 6 层那次是算错不挂。同一配置两种表现 -> 仍是竞态。
+
+**含义**：`e2e_decode.py` 这条服务形态的纯静态链现在既不能用于精度验收，也不能用于 TPOT 验收。
+`full_decode.py`（单进程 host-reset，每层 host 等待）才是当前唯一"能算对"的路径，
+所以精度验收在它上面做（§12.40/12.41 的 0.87x 带就是它给的）。
+
+### 12.42.5 由此确定的优化顺序
+
+1. **先修服务形态的链**（`TPB=1` 在 `attn L3` 的 NaN）：不修就没有可信的 TPOT 与精度闭环，
+   而且 PDL 与栅栏的冲突（`tpb_flag` 的 assert）意味着现在服务端跑的 `-DSTATIC_NO_START_BARRIER + PDL` 组合
+   实际上没有任何内核内的跨 rank 顺序保证。
+2. **再压每次 launch 的固定开销**：80 次 launch，其中 ~92% 的成本与 32K 无关。
+   可动的地方按收益排序：(a) 融合 sublayer，把 80 次降下来；(b) 缩短依赖跳数（`wo_a/wo_b`、`wq_a/wq_b` 的拆分）；
+   (c) indexer 层那 8×~40 us（唯一真正的 32K 项）。
+3. **精度验收标准不变**：每一步都必须仍在参考自身带宽内（§12.40.5 的 0.87x），argmax 343 不变。
+
+### 12.42.6 复现命令（本篇的全部数字）
+
+```bash
+# 位置相关性（3 层 / 21 层，只改 --pos）
+python full_decode.py --checkpoint $CK --gpus 8 --layers 21 --pos 1024  --tpot 3 --steps 0 --out /tmp/tpot_rx1024
+python full_decode.py --checkpoint $CK --gpus 8 --layers 21 --pos 31906 --tpot 3 --steps 0 --out /tmp/tpot_rx31906
+# 分期与 per-node（无需 profiler / 需 timing build）
+python full_decode.py ... --probe --steps 0
+python full_decode.py ... --probe --profile-build --steps 0
+# 正向对照（§8.1 缺的那一格）
+DSV41_STATIC_TPB=1 DSV41_E2E_LAYERS=6 torchrun --nproc_per_node=8 e2e_decode.py ...
+```
