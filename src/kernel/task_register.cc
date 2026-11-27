@@ -6100,20 +6100,24 @@ int TaskRegister::register_kv_post_sm100_task(threadblock::Graph const &bgraph,
 int TaskRegister::register_sparse_attn_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params: {H (heads), D (head_dim), W (window), RD (rope_dim), softmax scale
-  // (fp32 bits)}. inputs: q [T, H * D] fp32 (wq_b's K parts in slots), the
-  // window cache [T, W, D + D / 32] uint8 (a kv_post node's), positions [T]
-  // int32, freqs [rows, RD / 2, 2] fp32, attn_sink [H] fp32; output: o_q
-  // [T, H * D] uint8 (its buffer: o_q, then the scale chunks). Grid (T, H /
-  // 16). With compressed KV also {NC, CAP}, and inputs the compressed cache [T,
-  // CAP, 288] uint8 and compress_idx [T, NC] int32 (read by pointer).
-  assert((params.size() == 5 || params.size() == 7) && params[0] % 16 == 0 &&
-         params[1] == 512 && params[2] == 128 && params[3] == 64);
+  // (fp32 bits)} + {NC, CAP} (0, 0 when the layer attends only its window) +
+  // BF16O (1: o written as bf16, no act_quant). inputs: q [T, H * D] fp32
+  // (wq_b's K parts in slots), the window cache [T, W, D + D / 32] uint8 (a
+  // kv_post node's), positions [T] int32, freqs [rows, RD / 2, 2] fp32,
+  // attn_sink [H] fp32; with compressed KV also the compressed cache [T, CAP,
+  // 288] uint8, compress_idx [T, NC] int32, compress_pages [T, CAP / 128]
+  // int32; output: o [T, H * D] (bf16, or uint8: o_q then the scale chunks).
+  // Grid (T, H / 16).
+  int const ntensors = (int)bgraph.operators.size();
+  assert(params.size() == 8 && (ntensors == 6 || ntensors == 8) &&
+         params[0] % 16 == 0 && params[1] == 512 && params[2] == 128 &&
+         params[3] == 64);
   return register_static_task(this,
                               TASK_SPARSE_ATTN_SM100,
                               "sparse_attn",
                               bgraph,
                               params,
-                              params.size() == 7 ? 7 : 5,
+                              ntensors == 8 ? 7 : 5,
                               params.size());
 }
 

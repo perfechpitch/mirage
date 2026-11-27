@@ -40,6 +40,10 @@ A.add_argument("--layers", type=int, default=40, help="sublayer pairs to build (
 A.add_argument("--gpus", type=int, default=8, help="the TP size: the GPUs this process drives")
 A.add_argument("--pos", type=int, default=4096, help="the position of the T tokens (the caches hold [0, pos])")
 A.add_argument("--steps", type=int, default=2, help="untimed decode steps after the first")
+A.add_argument("--greedy", action="store_true",
+               help="a real multi-token greedy decode: after each step advance the position by one AND feed that step's "
+                    "own argmax token back as the next input (SGLang's generate at temperature 0). Without it every "
+                    "--steps launch replays the same token at the same position, so the steps are identical")
 A.add_argument("--flush-mb", type=int, default=0, help="L2 emptied before each launch (0: not)")
 A.add_argument("--timeout", type=float, default=120.0, help="a launch longer than this is a hang (s)")
 A.add_argument("--out", default="/tmp/full_decode", help="the build directories")
@@ -85,6 +89,11 @@ L40 = a.layers
 os.environ.setdefault("MIRAGE_STATIC_BUILD_CACHE", "/tmp/mirage_static_cache")
 
 PRE = a.inputs_dir
+# DSV41_TEACH=1: teacher forcing. Every sublayer reads SGLang's own residual and normed x (row 0 of the step-1 dump)
+# instead of the previous kernel's output, so a dump of the run answers "which sublayer's kernel is wrong" without
+# the drift of the layers above it (cmp_out.py inverts the post to get the same answer from a normal run).
+TEACH = bool(os.environ.get("DSV41_TEACH"))
+TEACH_FROM = int(os.environ.get("DSV41_TEACH_FROM", "0") or 0)   # 0: every sublayer (plain teach); 40: none (free chain)
 META, ADDR = None, None
 if PRE:   # the dump's last prefill row is the decode step's history: the caches hold [0, pos - 1]
     META = [json.load(open(os.path.join(PRE, f"meta_rank{r:02d}.json"))) for r in range(NG)]
@@ -131,6 +140,17 @@ def pool_rows(r, L, name, row_bytes):
     if e is None:
         return None
     b = torch.from_numpy(np.fromfile(os.path.join(PRE, e["file"]), dtype=np.uint8)).to(devs[r])
+    if b.numel() % row_bytes:
+        layout = ""
+        try:
+            layout = json.load(open(os.path.join(PRE, f"meta_addr_rank{r:02d}.json")))["pool"]["kv_layout"]
+        except Exception:
+            pass
+        raise SystemExit(
+            f"L{L}.{name}: the dump's buffer is {b.numel()} bytes, not a multiple of this kernel's {row_bytes}-byte row"
+            f"{' (the dump is kv_layout ' + layout + ')' if layout else ''}. The dumps must come from SGLang run with "
+            f"SGLANG_DSV4_KV_LAYOUT=v41_new: without it the pool is the plain V4 layout (584 B/token on this model), "
+            f"whose rows the kernel does not read and whose numbers are not comparable.")
     return b.view(-1, row_bytes)
 
 
@@ -254,14 +274,19 @@ def embed_row(tok):
 
 
 def decode_token():
-    """The token the decode step feeds: the row's last prompt token (the prompt of 31906 -> position 31905 listens to 0..31904)."""
+    """The token the decode step feeds: the one the PREFILL sampled, i.e. golden's ids[0] -- not a prompt token.
+
+    dump_prefill.py prefills the whole prompt, so position len(prompt)-1 is already consumed by the prefill and the
+    first decode step sits at position len(prompt) feeding the prefill's own sampled token. (The older ids[a.pos] was
+    an off-by-one that also raised IndexError at pos == len(prompt): indices stop at len-1.)
+    Verified against /tmp/dec_coef5: step1's L00_in stream 0 equals embed.weight[4588] with maxdiff 0.0, so the input
+    really is golden's ids[0] = 4588 at position 31906, not the prompt's last token (5) at 31905."""
     if a.token is not None:
         return a.token
-    from transformers import AutoTokenizer
-    row = [json.loads(line) for f in sorted(glob.glob(a.data)) for line in open(f)][a.row]
-    ids = AutoTokenizer.from_pretrained(a.checkpoint, trust_remote_code=True).encode(row["prompt"], add_special_tokens=False)
-    log(f"row {a.row}: prompt {len(ids)} tokens, the decode step is position {a.pos} -> token {ids[a.pos]}")
-    return ids[a.pos]
+    path = a.golden or os.path.join(HERE, "golden_bench32k.jsonl")
+    g = [json.loads(l) for l in open(path)][a.row]
+    log(f"row {a.row}: the prefill sampled {g['ids'][0]} (golden ids[0]); the decode step at position {a.pos} feeds it")
+    return int(g["ids"][0])
 
 
 # ---- build the chain: attn L0 -> moe L0 -> attn L1 -> ... (each its own kernel) -------------------------
@@ -300,6 +325,61 @@ if PRE:         # the residual stream starts at the decode token's embedding (ro
         S0[r][0].copy_(e.bfloat16().repeat(HC))
 
 
+EG = [int(x) for x in cfg.get("engram_layer_ids", [])]   # [1, 14]: the layers whose residual is REPLACED by the
+# Engram before they run (deepseek_v4.py:4360), i.e. the MoE of layer L-1 must compute R'' for each of them.
+EG_SRC = {g - 1: g for g in EG}    # the MoE layer that hosts each Engram: 0 -> 1, 13 -> 14
+
+
+def engram_into(wg, d, rank, L, nxt):
+    """Layer `nxt`'s Engram in the MoE kernel of layer L (moe_demo.engram_nodes, the DSV41_ENGRAM=1 path).
+
+    Duplicated from dsv41_static_layer.engram_tensors on purpose: that module is the serving path (it asserts its own
+    env and imports the hook), and this is the same handful of weight reads. wkv is column-sharded over the TP group
+    (W = 25600 / tp rows of its (hc+1)*HID output), its 32x32 block scales chunked as gemm_fp8_tile wants, and q*k
+    multiplied in fp32 exactly as the official engram_gate does.
+    """
+    from mirage.mpk.static_megakernel import w8_scale_chunks
+    p = f"layers.{nxt}.engram."
+    wkv, sc = read(p + "wkv.weight"), read(p + "wkv.scale")
+    n = wkv.shape[0] // NG
+    assert wkv.shape[0] == (HC + 1) * HID and n % 128 == 0, f"Engram wkv {tuple(wkv.shape)}"
+    rows = slice(rank * n, rank * n + n)
+    wg.update(
+        eg_wkv=wkv[rows].contiguous().view(torch.uint8).to(d),
+        eg_wkv_scales=w8_scale_chunks(sc[rank * n // 32:(rank * n + n) // 32].contiguous()).to(d),
+        eg_qk=(read(p + "q_weight").float() * read(p + "k_weight").float()).to(d).contiguous(),
+        # the gathered n-gram rows: an INPUT, copied from the dump each step (the table lookup is SGLang's, like the KV)
+        eg_emb=torch.zeros(T, wkv.shape[1], dtype=torch.bfloat16, device=d),
+        streams_eg=torch.zeros(T, HC * HID, dtype=torch.bfloat16, device=d))
+    # NOT eg_gamma: that is the DSV41_EG_X next-input path, and engram_gate_layer's NX branch requires kv to be a
+    # GRAPH tensor ("ten", i.e. DSV41_ENGRAM=2's attention-side gather) -- with ENGRAM=1's own wkv GEMM it asserts.
+    # The next layer's x is therefore recomputed on the host from R'' (eg_next_x), which is the same quantity the
+    # kernel's combine would have produced from R'.
+
+
+def eg_rows(step, L):
+    """The dumped n-gram rows of the Engram hosted by MoE layer L at decode step `step`: [T, 6144] bf16 on each GPU.
+
+    A dump without the probe (eg_emb absent) is a hard error, not a silent zero: a zero emb makes the gate add
+    gate(0)*value to every stream, which looks like a small modelling error rather than a missing input."""
+    f = os.path.join(PRE, "layers", f"step{step}", f"L{EG_SRC[L]:02d}_eg_emb.f32")
+    if not os.path.exists(f):
+        if os.environ.get("DSV41_EG_ZERO") == "1":   # a diagnostic run that only reads the sublayers before this one
+            log(f"WARNING {f}: no Engram rows, using ZEROS (DSV41_EG_ZERO=1): layer {EG_SRC[L]} and every layer past it "
+                f"are NOT the model's -- compare only the sublayers before {EG_SRC[L]}.")
+            return [torch.zeros(T, 6144, dtype=torch.bfloat16, device=d) for d in devs]
+        raise SystemExit(f"{f}: the dump has no Engram rows. Re-dump with dump_hook.py's engram probe (11-27): layer "
+                         f"{EG_SRC[L]}'s residual is REPLACED by engram(R, hash_ids), so a chain that skips it is "
+                         f"not the same model from layer {EG_SRC[L] + 1} on.")
+    v = np.fromfile(f, dtype=np.float32)
+    out = []
+    for d in devs:
+        t = torch.zeros(T, v.size, dtype=torch.bfloat16, device=d)
+        t[0].copy_(torch.from_numpy(v).to(d).bfloat16())
+        out.append(t)
+    return out
+
+
 def kv_src(L):
     """The compressed KV (and index K) this layer reads: the last kv_source_layers entry at or below it (model.py L1172)."""
     return max(k for k in cfg["kv_source_layers"] if k <= L)
@@ -335,7 +415,14 @@ for L in range(L40):
             if ik is not None:
                 ik[..., :64].bitwise_and_(0xFE)
         mhc_into(wg, d, L, "attn", read(f"layers.{L}.ffn_norm.weight"))
-        if X is not None:
+        # Only LAYER 0's input is made here (no post precedes it). Every later sublayer's input is the previous
+        # kernel's x_out -- its post computes bf16(sum_c pre_c R) and the norm with this layer's attn_norm.weight --
+        # which is `x` (set at the end of the MoE block below). Binding X for every layer instead made all 40
+        # attention sublayers read the decode token's EMBEDDING: their residuals still tracked SGLang (the post's
+        # comb term is near-identity, so a wrong sublayer output moves R' by only post ~ 0.13), while every attention
+        # output after L0 was computed from the wrong row (verified 11-27: chain attn1_x was bit-identical to
+        # attn0_x and 85% away from SGLang's layer-1 input).
+        if L == 0 and X is not None:
             wg["x"] = X[r]
         else:
             wg["x"] = x[r] if x is not None else \
@@ -383,21 +470,28 @@ for L in range(L40):
         if last:   # (11-20, the demo adds head_nodes when "head_w" is in w)
             hw = head_demo.head_tensors(read, NG, r, d)
             wg.update({k: hw[k] for k in ("head_w", "logits", "head_ids") if k in hw})
+        if L in EG_SRC and PRE:
+            # layer L+1 owns an Engram, which SGLang applies to this MoE's output BEFORE that layer runs: the kernel
+            # computes R'' too (streams_eg) and its x_out from R'' (eg_gamma), so the chain can follow SGLang past it.
+            engram_into(wg, d, r, L, EG_SRC[L])
     sk, bufs, _ = moe_demo.build(wsm, os.path.join(a.out, f"m{L}"), extra_flags=FLAGS)
     K.append((f"moe{L}", sk, wsm, bufs))
     x = [wg["x_out"] for wg in wsm]
-    Rs = [wg["streams_out"] for wg in wsm]
+    # R'' when this layer hosts an Engram (the next layer reads it), R' otherwise
+    Rs = [wg["streams_eg"] if "streams_eg" in wg else wg["streams_out"] for wg in wsm]
     log(f"m{L}: built, {(time.perf_counter() - t0) / 60:.1f} min, "
         f"{torch.cuda.mem_get_info()[0] / 2**30:.1f} GB free")
 
 hs = [(name, Harness(sk), ws, bufs) for name, sk, ws, bufs in K]
+WS_BY = {name: ws for name, _h, ws, _b in hs}
+BUFS = {name: b for name, _h, _ws, b in hs}
 log(f"chained {len(hs)} kernels on {NG} GPUs in {(time.perf_counter() - t0) / 60:.1f} min")
 
 
 def rms_line(ws, tag):
     """The last GPU's view: the same bits on every GPU is a separate check (chain_spike's)."""
     out = []
-    for nm in ("x_out", "streams_out"):
+    for nm in ("x_out", "streams_out", "streams_eg"):
         t = ws[0].get(nm)
         if torch.is_tensor(t) and t.numel() and t.dtype == torch.bfloat16:
             f = t.float()
@@ -406,9 +500,192 @@ def rms_line(ws, tag):
     return f"[full]   {tag}: " + ", ".join(out)
 
 
-def step(time_it: bool = False):
+def feed_back(k):
+    """Carry the token step k produced into step k+1: the residual stream starts at normed_row(embed(token), 0) and at
+    the same embedding in every hc_mult stream (hc_broadcast, see the S0 setup above), so a real multi-token decode
+    rewrites both in place -- the kernels hold these tensors by reference, so a copy_ is all it takes."""
+    lg = hs[-1][2][0].get("logits")
+    if not torch.is_tensor(lg) or not lg.numel():
+        raise SystemExit("--greedy needs the head's logits: the last sublayer must build the head")
+    tok = int(lg[0].argmax().item())
+    if X is None or S0 is None:
+        raise SystemExit("--greedy needs --inputs-dir: without the prefill's state the caches are random and a "
+                         "multi-token chain is meaningless")
+    e = embed_row(tok).float()
+    x0 = normed_row(e, 0)
+    for r in range(NG):
+        X[r][0].copy_(x0)
+        S0[r][0].copy_(e.bfloat16().repeat(HC))
+    return tok
+
+
+def advance(k):
+    """Move every rank's tables one token forward: position a.pos + k, and the window rows that follow from it.
+
+    window_tables is a pure function of positions (demo.py), so the ring buffer's write slot and its read rows move
+    together; the pool's pages are the position's own (pages_for is an identity map with capacity max_pos + 2), so
+    position a.pos + 1 lands in room the tables already index. The padding rows after the real one are re-derived the
+    same way make_tables sets them (each padding token its own zero slice that never reaches token 0's real rows)."""
+    if not TAB:
+        return
+    for t in TAB:
+        p = t["positions"]
+        p[0] = a.pos + k
+        attn_demo.window_tables(t)
+        pad = torch.arange(1, T, device=p.device, dtype=torch.int32)
+        t["window_loc"][1:] = pad * attn_demo.W
+        t["window_rows"][1:] = pad[:, None] * attn_demo.W + ((p[1:, None] - torch.arange(attn_demo.W, device=p.device))
+                                                           % attn_demo.W)
+
+
+_EG_CACHE = {}
+
+
+def hc_pre(name, pre=None):
+    """A sublayer's `pre` mix, straight from the kernel that computed it (`hc_coef`'s first HC floats, fp32).
+
+    model.py Block.forward carries ONE mix across sublayers (`x, pre_mix = layer(...)`), so a sublayer's input is NOT
+    its own triplet's pre:
+        attention of L  reads  ffn_pre of L-1  applied to the residual L-1's MoE PRODUCED (R' of L-1)
+        MoE of L        reads  attn_pre of L   applied to the residual L's ATTENTION produced (R' of L)
+        attention of 0  reads  make_identity_pre_mix (stream 0 alone)
+    `pre` overrides the buffer lookup (teach mode reads the producer's kernel output; see teach_step)."""
+    if pre is not None:
+        return pre
+    for r in range(NG):
+        t = BUFS[name][r].get("hc_coef")
+        if t is not None:
+            # the buffer is bytes (uint8, T * 32 fp32 values): row 0 is the decode token's triplet
+            cf = t.contiguous().view(torch.float32).reshape(-1) if t.dtype != torch.float32 else t.reshape(-1)
+            return cf[:HC].detach().float().cpu()
+    raise RuntimeError(f"hc_pre: {name} has no hc_coef buffer (a sublayer without the mHC nodes?)")
+
+
+def apply_pre(R, pre, L, kind, d):
+    """norm(pre . R) with layers.L.{kind}_norm.weight: hc_pre (model.py) then attn_norm / ffn_norm. bf16, as the
+    kernel's hc_post_combine writes it. `pre` None = the identity mix (stream 0 alone)."""
+    v = R.float().view(HC, HID)
+    y = v[0].to(d) if pre is None else (pre.to(d)[:, None] * v.to(d)).sum(0)
+    g = read(f"layers.{L}.{kind}_norm.weight").float().to(d)
+    return (y.bfloat16().float() * torch.rsqrt(y.square().mean() + cfg["norm_eps"]) * g).bfloat16()
+
+
+def eg_next_x(Rs, L, d):
+    """The Engram layer L's attention input, from the R'' this chain's kernel just computed.
+
+    Needed because the MoE kernel of L-1 writes its x_out from R' in the same launch that produces R'' (the engram
+    gate runs after the post), so the kernel's own x_out is one step stale. The `pre` is that same kernel's ffn_pre
+    (hc_pre), NOT layer L's hc_attn pre: model.py hands the mix down (11-27: using L's own triplet here is what made
+    the Engram-hosted L1 sit at 13.6% while the whole attention core matched to 1%)."""
+    return apply_pre(Rs[0].reshape(-1), hc_pre(f"moe{L - 1}"), L, "attn", d)
+
+
+_TEACH = {}
+_TEACH_OUT = {}   # DSV41_TEACH: name -> (the sublayer's streams_out row 0, its x_out row 0), captured per launch
+
+
+def teach_row(kind, L):
+    """DSV41_TEACH's reference residual each sublayer READS.
+
+    Not the dump's `L{LL}_in`: that one is a *stale* snapshot (verified 11-27 -- for L >= 2 it equals
+    L{LL-1}_apost, one sublayer behind, and layer L's own post coefficients reconstruct L{LL}_apost from
+    L{LL}_mpost at 0.0016, not from L{LL}_in at 0.29). The chain is
+        mpost(L) --attn L--> apost(L) --moe L--> mpost(L+1)
+    so attention reads `mpost`, the MoE reads `apost`; layer 0's attention reads the embedding (`L00_in`) and an
+    Engram layer's attention reads R'' (`L{LL}_eg_y`, which equals `in` there). [HC, HID] fp32 on the CPU, read once."""
+    k = (kind, L)
+    if k not in _TEACH:
+        d = os.path.join(PRE, "layers", "step1")
+        if kind == "ffn":
+            f = os.path.join(d, f"L{L:02d}_apost.f32")
+        elif L == 0 or not os.path.exists(os.path.join(d, f"L{L:02d}_mpost.f32")):
+            f = os.path.join(d, f"L{L:02d}_{'eg_y' if os.path.exists(os.path.join(d, f'L{L:02d}_eg_y.f32')) else 'in'}.f32")
+        else:
+            f = os.path.join(d, f"L{L:02d}_mpost.f32")
+        if not os.path.exists(f):
+            raise SystemExit(f"DSV41_TEACH: {f} is missing")
+        _TEACH[k] = torch.from_numpy(np.fromfile(f, dtype=np.float32).reshape(HC, HID))
+    return _TEACH[k]
+
+
+def np_float(t):
+    """A checkpoint tensor as the fp32 CPU tensor coef_ref's formulas take."""
+    return t.detach().float().cpu()
+
+
+def _eg_step_rows(step, L):
+    """eg_rows(step, L), cached: one file read per (step, host layer), not per rank per launch."""
+    if (step, L) not in _EG_CACHE:
+        _EG_CACHE[(step, L)] = eg_rows(step, L)
+    return _EG_CACHE[(step, L)]
+
+
+def step(step_no: int = 1, time_it: bool = False):
+    """One launch of every sublayer. step_no picks the Engram rows (they are a per-token input, like the KV)."""
     spans = []
     for name, h, ws, _ in hs:
+        sub = "attn" if name.startswith("attn") else "moe"
+        L = int(name[4:] if sub == "attn" else name[3:])
+        # DSV41_TEACH_FROM=L0: force the reference residual only from layer L0 down, and let the chain run free below it.
+        # This is the attribution instrument: the chain's own error is discarded for sublayers >= L0, so whatever the
+        # final logits still miss comes from L0..39 alone. TEACH_FROM=0 is the plain teacher run (logits ~ the
+        # reference's), TEACH_FROM=40 is the free chain (identical to no TEACH at all, a control).
+        if TEACH and L >= TEACH_FROM:
+            # teacher forcing: every sublayer reads SGLang's own residual (row 0), so each kernel is compared on the
+            # model's input rather than on the drift the layers above it accumulated
+            kind = "attn" if sub == "attn" else "ffn"
+            # 11-27 FIX: this used to pass `sub` ("attn"/"moe"), but teach_row tests `kind == "ffn"` -- which "moe" never
+            # is. Every MoE therefore read `mpost(L)` where it needs `apost(L)` (relRMS between the two 0.35-0.6), and the
+            # whole teach run came out WORSE than the free chain (mean|dlogprob| 0.516/0.560 vs 0.385) -- which looked
+            # like the kernels being wrong. Pass the kind, not the sublayer's name.
+            R = teach_row(kind, L)
+            # the pre mix of the PRODUCER (see hc_pre), from its own kernel's hc_coef: moe L-1's ffn_pre for this
+            # attention, this attention's attn_pre for the MoE. Layer 0's attention is the identity mix.
+            pre = None if (sub == "attn" and L == 0) else hc_pre(f"moe{L - 1}" if sub == "attn" else f"attn{L}")
+            if os.environ.get("DSV41_TEACH_DEBUG"):
+                print(f"[teach] {name}: pre {None if pre is None else [round(float(v), 5) for v in pre]}", flush=True)
+            for r in range(NG):
+                ws[r]["streams"][0].copy_(R.reshape(-1).to(ws[r]["streams"].dtype))
+                # The FFN's input x is produced by the PREVIOUS launch (the attention's hc_post_combine writes x_out from
+                # the residual it read), so with the residual forced above, that x already comes from the golden input and
+                # forcing it again only replaces a kernel-computed quantity with a host re-derivation. Measured: on the
+                # MoE that substitution is 50-60% off and made every MoE look broken (0.24-0.60) while the free chain's
+                # own MoE sits at 1-4%; routing was unchanged, so it was the x, not the gate. DSV41_TEACH_KERNEL_X=1
+                # therefore skips the x copy for the FFN and lets the chain's own x stand (the honest per-kernel test).
+                # 11-27: the default is now the honest one (the chain's own x). With the host copy (DSV41_TEACH_KERNEL_X=0)
+                # the teach run's logits came out at mean|dlogprob| 0.516 -- WORSE than the free chain's 0.385 -- which is
+                # the signature of the substitution being wrong, not of the kernels being wrong: apply_pre re-derives what
+                # hc_post_combine had already written, and the two differ (measured 50-60% on the MoE).
+                if kind == "ffn" and os.environ.get("DSV41_TEACH_KERNEL_X", "1") != "0":
+                    continue
+                ws[r]["x"][:1].copy_(apply_pre(R, pre, L, kind, devs[r])[None])
+            if PRE and "eg_emb" in ws[0]:   # the Engram host layers (MoE 0 / 13) still need their embedding rows: the
+                rows = _eg_step_rows(step_no, L)   # kernel's own eg_kv comes from them, and the attention of L+1 reads it
+                for r in range(min(NG, len(rows))):
+                    ws[r]["eg_emb"].copy_(rows[r])
+            h.launch(FLUSH, timeout_s=a.timeout)
+            # capture NOW: each sublayer's `streams` IS the previous one's `streams_out` (the chain links the tensors by
+            # reference), so the next launch's copy overwrites the tensor this one wrote -- a dump at the end of the
+            # step would show the neighbour's input, not this sublayer's output (verified: the aliased values compared
+            # bit-identical to the reference row copied in afterwards)
+            _TEACH_OUT[name] = (ws[0]["streams_out"][0].detach().float().cpu().clone(),
+                                ws[0]["x_out"][0].detach().float().cpu().clone())
+            if time_it:
+                spans.append((name, h.span_us()))
+            if a.rms and not time_it:
+                print(rms_line(ws, name), flush=True)
+            continue
+        if PRE and "eg_emb" in ws[0]:
+            rows = _eg_step_rows(step_no, int(name[3:]))
+            for r in range(min(NG, len(rows))):
+                ws[r]["eg_emb"].copy_(rows[r])
+        elif PRE and name.startswith("attn") and int(name[4:]) in EG:
+            L = int(name[4:])
+            src = WS_BY[f"moe{L - 1}"]          # the kernel that just produced R'' (streams_eg)
+            for r in range(NG):
+                # row 0 only: x is [T, HID] and a [HID] source would broadcast over every token row (it did, and
+                # since all attention layers share this wiring it clobbered the whole chain's inputs)
+                ws[r]["x"][:1].copy_(eg_next_x(src[r]["streams_eg"], L, devs[r])[None])
         h.launch(FLUSH, timeout_s=a.timeout)
         if time_it:
             spans.append((name, h.span_us()))
@@ -420,41 +697,45 @@ def step(time_it: bool = False):
 step()                                   # warm: the caches and the code
 
 
-if a.dump_dir:                           # the chain's own numbers, every sublayer, one file each
-    os.makedirs(a.dump_dir, exist_ok=True)
+def dump_chain(where):                   # the chain's own numbers, every sublayer, one file each
+    os.makedirs(where, exist_ok=True)
     want = set(a.dump_all.split(",")) if a.dump_all else set()
+    if _TEACH_OUT:   # DSV41_TEACH: what each launch actually wrote (see _TEACH_OUT's comment)
+        for name, (out, xo) in _TEACH_OUT.items():
+            out.numpy().astype(np.float32).tofile(os.path.join(where, f"{name}_teach_out.f32"))
+            xo.numpy().astype(np.float32).tofile(os.path.join(where, f"{name}_teach_x.f32"))
     for name, _h, wsx, bufs in hs:
         # the sublayer's own input rows (not a node buffer: the caller's tensor). For a sublayer whose input is not the
         # previous sublayer's output -- layer 0's -- this is the row to compare with SGLang's normed x.
         xt = wsx[0].get("x")
         if torch.is_tensor(xt) and xt.dtype == torch.bfloat16:
             xt.detach().cpu().contiguous().view(torch.int16).numpy().tofile(
-                os.path.join(a.dump_dir, f"{name}_x.bin"))
+                os.path.join(where, f"{name}_x.bin"))
         # the mHC triplet this sublayer's post applied, straight from the kernel's hc_coef buffer: pre|post|comb|0s as
         # [T, 32] fp32. This is the one record that separates "the sublayer's output is wrong" from "the mix is wrong"
         # -- and it needs no extra node (hc_coef is in the graph already), so it never costs a rebuild.
         cf = bufs[0].get("hc_coef") if bufs else None
         if torch.is_tensor(cf) and cf.numel() >= T * 32:
             cf.detach().cpu().contiguous().view(torch.float32).numpy()[: T * 32].astype(np.float32).tofile(
-                os.path.join(a.dump_dir, f"{name}_coef.bin"))
+                os.path.join(where, f"{name}_coef.bin"))
         if name in want:                 # every graph node's buffer of the named sublayers, plus the name list: the
-            with open(os.path.join(a.dump_dir, f"{name}_nodes.txt"), "w") as f:   # only way to see inside a sublayer
+            with open(os.path.join(where, f"{name}_nodes.txt"), "w") as f:   # only way to see inside a sublayer
                 for r, b in enumerate(bufs):
                     for k, t in b.items():
                         f.write(f"{r}\t{k}\t{tuple(t.shape)}\t{t.dtype}\n")
                         t.detach().cpu().contiguous().view(torch.int16).numpy().tofile(
-                            os.path.join(a.dump_dir, f"{name}_r{r}_{k}.bin"))
+                            os.path.join(where, f"{name}_r{r}_{k}.bin"))
     for name, h, ws, _ in hs:            # (ws is the per-GPU list; rank 0's has the gather_f32 logits)
-        for nm in ("x_out", "streams_out"):
+        for nm in ("x_out", "streams_out", "streams_eg"):
             t = ws[0].get(nm)
             if torch.is_tensor(t) and t.numel():
                 t.detach().cpu().contiguous().view(torch.int16).numpy().tofile(
-                    os.path.join(a.dump_dir, f"{name}_{nm}.bin"))
+                    os.path.join(where, f"{name}_{nm}.bin"))
     last_ws = hs[-1][2]
     lg = last_ws[0].get("logits")
     if torch.is_tensor(lg) and lg.numel():
         lg.detach().float().cpu().contiguous().numpy().astype(np.float32).tofile(
-            os.path.join(a.dump_dir, "logits.bin"))
+            os.path.join(where, "logits.bin"))
     # the mHC coefficients the post step used: R'[j] = sum_i comb[i][j] R[i] + post[j] out. Dumping them is what tells a
     # wrong coefficient set (a per-stream scale/mix, which leaves the other streams right) from a wrong sublayer output
     # (which moves every stream the same way) -- the two look alike in the residuals alone. The chain's path does not
@@ -465,8 +746,12 @@ if a.dump_dir:                           # the chain's own numbers, every sublay
             t = wsx[0].get(nm)
             if torch.is_tensor(t) and t.numel():
                 t.detach().float().cpu().contiguous().view(-1).numpy().astype(np.float32).tofile(
-                    os.path.join(a.dump_dir, f"{name}_{nm}.bin"))
-    log(f"dumped {len(hs)} sublayers' x_out/streams_out, coefficients and the logits to {a.dump_dir}")
+                    os.path.join(where, f"{name}_{nm}.bin"))
+    log(f"dumped {len(hs)} sublayers' x_out/streams_out, coefficients and the logits to {where}")
+
+
+if a.dump_dir:                           # the flat directory IS decode step 1 (the layout the existing tools read)
+    dump_chain(a.dump_dir)
 
 
 def topk_line():
@@ -517,7 +802,13 @@ if a.golden:                             # the row's greedy token from the head'
         "number above is a wiring check, not a correctness check of the model.")
 
 for s in range(a.steps):
-    step()
+    if a.greedy:
+        tok = feed_back(s + 1)           # the token step s+1 emitted, now step s+2's input
+        advance(s + 1)                   # step s+2 reads position a.pos + s + 1
+        log(f"step {s + 1}: token {tok} -> step {s + 2} at position {a.pos + s + 1}")
+    step(s + 2)                          # (step 1 is the warm launch above: it fed step 1's Engram rows)
+    if a.dump_dir and a.steps > 1:       # step 1 is the flat directory written above: steps 2.. land in step2.., so
+        dump_chain(os.path.join(a.dump_dir, f"step{s + 2}"))   # --steps 9 gives step1..step10, the SGLang convention
     if a.rms:
         log(f"step {s + 1}/{a.steps} done")
 

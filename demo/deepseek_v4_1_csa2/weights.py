@@ -114,7 +114,20 @@ def layer_tensors(read, cfg: dict, layer: int, tp: int = 1, rank: int = 0, rows:
     out["wq_a_weight"], out["wq_a_scales"] = fp8("wq_a")
     out["wq_b_weight"], out["wq_b_scales"] = fp8("wq_b", rows=slice(q0, q0 + H * D))
     out["wkv_weight"], out["wkv_scales"] = fp8("wkv")
-    out["wo_a_weight"], out["wo_a_scales"] = fp8("wo_a", rows=slice(a0, a0 + G * OL))
+    if os.environ.get("DSV41_WO_A_BF16", "1") != "0" and G == 1:
+        # SGLang's wo_a: an fp8 checkpoint weight of block-32 x 32 scales is dequantized to bf16 at load
+        # (deepseek_v4.wo_a_fp8_gemm_enabled), so the GEMM is bf16 x bf16 and o is not act_quant'ed. The dequant is exact
+        # in bf16 (an e4m3 value times a power of two has at most 4 significant bits).
+        wv, sv = read(p + "wo_a.weight"), read(p + "wo_a.scale")
+        d = lambda sl: slice(None if sl.start is None else sl.start // 32, None if sl.stop is None else sl.stop // 32)
+        q0_, c0_ = a0, 0
+        w8 = wv[q0_:q0_ + G * OL].contiguous().view(torch.float8_e4m3fn).float()
+        sc = sv[d(slice(q0_, q0_ + G * OL))].float()
+        R, C = w8.shape
+        out["wo_a_weight"] = (w8.view(R // 32, 32, C // 32, 32) * sc[:, None, :, None]).reshape(R, C).bfloat16()
+        out["wo_a_scales"] = fp8("wo_a", rows=slice(a0, a0 + G * OL))[1]   # (unused in the bf16 path)
+    else:
+        out["wo_a_weight"], out["wo_a_scales"] = fp8("wo_a", rows=slice(a0, a0 + G * OL))
     out["wo_b_weight"], out["wo_b_scales"] = fp8("wo_b", cols=slice(a0, a0 + G * OL))
     out["q_norm_weight"], out["kv_norm_weight"] = read(p + "q_norm.weight"), read(p + "kv_norm.weight")
     out["attn_sink"] = read(p + "attn_sink")[H * rank:H * (rank + 1)].contiguous()

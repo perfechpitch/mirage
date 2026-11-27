@@ -73,6 +73,7 @@ def main():
         log(f"row {a.row} ({row.get('subset', '?')}), prompt {n} tokens")
     os.makedirs(a.out, exist_ok=True)
     os.environ.setdefault("DSV41_DUMP_AT", str(n - 1))   # (n is the prefilled length after --drop-last)   # the last prefill chunk's end: the pools' [0, pos] is complete
+    os.environ.setdefault("DSV41_DUMP_MODEL", a.model)   # (the Engram probe maps layer_hash_index -> layer id through config.json)
 
     from sglang.srt.entrypoints.engine import Engine
     ctx = -(-(n + a.max_new + 1024) // 1024) * 1024

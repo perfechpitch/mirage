@@ -78,12 +78,18 @@ def main():
         return
 
     layers = sorted({L for _, L, w in chain if w == "streams_out"})
+    # the reference's per-layer keys are one stage ahead of the layer they are named after: L{LL}_apost (== L{LL}_st
+    # == L{LL+1}_in) is the residual after layer LL's ATTENTION post, but L{LL}_mpost is the residual after layer
+    # LL-1's MoE post (verified 11-27 on 4-stream relRMS 0.0: L01_apost == L02_in, and the ct_post/ct_comb of L02
+    # reconstruct L02_apost from L02_mpost, not from L02_in). So the chain's moe{L} row is L{L+1}_mpost.
+    for L in layers:
+        sgl.setdefault((L, "_mpost_next"), sgl.get((L + 1, "_mpost")))
     if a.layers:
         layers = [int(x) for x in a.layers.split(",")]
     print(f"{'L':>3} {'sub':>5} {'sgl rms':>9} {'static':>9} {'relRMS':>7} {'cos':>8}  verdict")
     worst = (0.0, None)
     for L in layers:
-        for sub, suf in (("attn", "_apost"), ("moe", "_mpost")):
+        for sub, suf in (("attn", "_apost"), ("moe", "_mpost_next")):
             ps, pc = sgl.get((L, suf)), chain.get((sub, L, "streams_out"))
             if ps is None or pc is None:
                 continue

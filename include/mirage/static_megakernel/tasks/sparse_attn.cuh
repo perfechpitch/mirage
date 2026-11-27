@@ -452,7 +452,8 @@ template <int H,
           int CAP,
           bool CNODE,
           bool CCNODE,
-          int NS>
+          int NS,
+          bool BF16O>
 __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
                                                  unsigned char const *cache,
                                                  int const *wrows,
@@ -1081,6 +1082,22 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
           x[e + 1] = bf16r(__fmaf_rn(b, cr, __fmul_rn(a, ci)));
         }
       }
+      if constexpr (BF16O) {
+        // the bf16 output: o = O / denominator, the inverse RoPE, written as bf16 -- SGLang's wo_a takes o in bf16
+        // (wo_a_fp8_gemm_enabled: a checkpoint whose scale layout is not 128 x 128 dequantizes wo_a to bf16 at load, so
+        // no act_quant of o happens there). The values are the same as the quantized path's input, bit for bit.
+        if (real && st && r < HL) { // (a tile row past this task's heads: its bytes are not this token's)
+          auto p2 = [](float a, float b) {
+            return (uint32_t)__bfloat16_as_ushort(__float2bfloat16(a)) |
+                   ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(b)) << 16);
+          };
+          *reinterpret_cast<uint4 *>(out + 2 * ((size_t)t * N +
+                                                (size_t)(g * HL + r) * D + c)) =
+              make_uint4(p2(x[0], x[1]), p2(x[2], x[3]), p2(x[4], x[5]),
+                         p2(x[6], x[7]));
+        }
+        return;
+      }
       float amax = 0.f;
 #pragma unroll
       for (int e = 0; e < 8; e++) {
@@ -1355,13 +1372,15 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
     if (real) {
       SA_MARK(5)
       // the scale chunks of heads [HL g, HL g + HL) (a tile row past them: its line is not this token's)
-      if ((tid >> 2) < lnb && (XQ_LINES == 4 || (tid & 3) < XQ_LINES)) {
-        int const lc = lb0 + (tid >> 2); // head lc / 4, its 128-column block
-                                         // lc % 4
-        if (lc < NBL) {
-          uint32_t const s4 = *reinterpret_cast<uint32_t const *>(
-              es + (lc >> 2) * 16 + (lc & 3) * 4);
-          xq_scale_line(out, N, g * (HL * D / 128) + lc, t, tid & 3, s4);
+      if constexpr (!BF16O) {
+        if ((tid >> 2) < lnb && (XQ_LINES == 4 || (tid & 3) < XQ_LINES)) {
+          int const lc = lb0 + (tid >> 2); // head lc / 4, its 128-column block
+                                           // lc % 4
+          if (lc < NBL) {
+            uint32_t const s4 = *reinterpret_cast<uint32_t const *>(
+                es + (lc >> 2) * 16 + (lc & 3) * 4);
+            xq_scale_line(out, N, g * (HL * D / 128) + lc, t, tid & 3, s4);
+          }
         }
       }
     } else {
@@ -1464,6 +1483,9 @@ __device__ __forceinline__ void run_sparse_attn(Maps const &,
   constexpr int H = PARAMS::v[0], D = PARAMS::v[1], W = PARAMS::v[2],
                 RD = PARAMS::v[3], NC = param_or0<PARAMS, 5>(),
                 CAP = param_or0<PARAMS, 6>();
+  // BF16O (params 7): o written as bf16 instead of e4m3 + scale chunks -- SGLang's wo_a is a bf16 linear when the
+  // checkpoint's wo_a scales are not 128 x 128 blocks (wo_a_fp8_gemm_enabled dequantizes it at load)
+  constexpr bool BF16O = param_or0<PARAMS, 7>() != 0;
   constexpr int NS = SELF::z;
   static_assert(SELF::x == T && SELF::y * SA_HL<H> == H &&
                     (NS == 1 || (NC > 0 && NS == 1 + NC / 128)),
@@ -1510,7 +1532,8 @@ __device__ __forceinline__ void run_sparse_attn(Maps const &,
                    CAP,
                    (sa_rest_counter<4, REST...>() >= 0),
                    (sa_rest_counter<3, REST...>() >= 0),
-                   NS>(buf_at<float const>(g, Q::buf),
+                   NS,
+                   BF16O>(buf_at<float const>(g, Q::buf),
                        buf_at<unsigned char const>(g, slot_at<BUF_SLOTS, 0>()),
                        buf_at<int const>(g, slot_at<BUF_SLOTS, 4>()),
                        buf_at<int const>(g, slot_at<BUF_SLOTS, 1>()),

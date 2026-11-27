@@ -1193,8 +1193,12 @@ void Graph::register_task_for_op(KNOperator const *op,
   } else if (name == "sparse_attn") {
     int variant_id = task_register->register_sparse_attn_sm100_task(
         customized->bgraph, params);
+    // inputs: q, the window's cache/rows/positions/freqs/sink (5), then the
+    // compressed cache/ids/pages when the layer attends past its window (8
+    // tensors; 6 without). Outputs: o.
+    int const ntensors = (int)customized->bgraph.operators.size();
     task_config[op] = std::make_tuple(
-        params.size() == 7 ? 7 : 5, 1, TASK_SPARSE_ATTN_SM100, variant_id);
+        ntensors == 8 ? 7 : 5, 1, TASK_SPARSE_ATTN_SM100, variant_id);
   } else if (name == "sum_store") {
     int variant_id = task_register->register_sum_store_sm100_task(
         customized->bgraph, params);

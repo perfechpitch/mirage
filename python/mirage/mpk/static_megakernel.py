@@ -611,7 +611,9 @@ class StaticMegakernel(PersistentKernel):
         if p is None:       # tasks/act_quant.cuh reads x by pointer and waits for no node
             self._dtypes("act_quant_layer", input=(input, bfloat16), output=(output, uint8))
             buf_slots = [self._tensor_slot(input)]
-        elif p.name == "gemm_fp8_tile" and p.params[0] == COMBINE["slots"]:
+        elif p.name in ("gemm_fp8_tile", "gemm_tile") and p.params[0] == COMBINE["slots"]:
+            # a bf16 GEMM's K parts in slots too (gemm_tile: params [mode, K, N, polled], the same slots layout and the
+            # same params 0/2 act_quant.cuh reads)
             self._dtypes("act_quant_layer", input=(input, float32), output=(output, uint8))
             # the widest whole-128-block slice of K that divides it: 2048 normally, but attention's wo_a output is only
             # G OL columns (TP4 2048, TP8 1024) and tasks/act_quant.cuh runs any NC of whole 128-column blocks
@@ -619,8 +621,8 @@ class StaticMegakernel(PersistentKernel):
             buf_slots = []
             at_most_parts(p, 10)   # tasks/act_quant.cuh: at most 10 K parts
         else:
-            raise ValueError(f"act_quant_layer: x must be a graph input or a gemm_fp8_tile node's output in slots; it comes "
-                             f"from {p.name}")
+            raise ValueError(f"act_quant_layer: x must be a graph input, a gemm_fp8_tile or gemm_tile node's output in slots; "
+                             f"it comes from {p.name}")
         assert input.num_dims == 2 and output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, K)
         assert p is not None or K % 512 == 0   # tasks/act_quant.cuh: 16 columns per thread, 2 per 32-column group, whole warps
         if p is None:         # (token, column slice): slices of whole warps' 512 columns; default one per token
@@ -664,9 +666,10 @@ class StaticMegakernel(PersistentKernel):
         KA = groups * K   # x_q's width
         from .compiler import graph_nodes, producer_of
         p = producer_of(input, graph_nodes(self))
-        # fused act_quant: x is a gemm_fp8_tile node's K parts in slots (fp32, wo_a's before wo_b): each task adds and
-        # quantizes its own K slice of x (tasks/gemm_fp8_tile.cuh fp8_fused_act) instead of an act_quant node
-        fused = p is not None and p.name == "gemm_fp8_tile" and p.params[0] == COMBINE["slots"]
+        # fused act_quant: x is a GEMM node's K parts in slots (fp32, wo_a's before wo_b; gemm_fp8_tile's, or gemm_tile's when
+        # wo_a runs in bf16 -- §10 of FINDINGS_correctness.md, the same [K parts][T][N] fp32 layout and the same params[0]/[2]):
+        # each task adds and quantizes its own K slice of x (tasks/gemm_fp8_tile.cuh fp8_fused_act) instead of an act_quant node
+        fused = p is not None and p.name in ("gemm_fp8_tile", "gemm_tile") and p.params[0] == COMBINE["slots"]
         self._dtypes("gemm_fp8_tile_layer", input=(input, float32 if fused else uint8), weight=(weight, uint8),
                      weight_scales=(weight_scales, uint8), output=(output, int64 if combine == "add" else float32))
         assert N % 128 == 0 and K % 256 == 0 and K >= 512, "128-row tasks; K in stages of 2 tiles of 128, at least 2 per task"
@@ -676,8 +679,9 @@ class StaticMegakernel(PersistentKernel):
         # the same output layout; the width: act_quant's and q_norm's params[0], sparse_attn's H D (tasks/gemm_fp8_tile.cuh);
         # fused: the GEMM's N
         width = {"act_quant": lambda: p.params[0], "q_norm": lambda: p.params[0],
-                 "sparse_attn": lambda: p.params[0] * p.params[1], "gemm_fp8_tile": lambda: p.params[2]}
-        if p is None or p.name not in width or (p.name == "gemm_fp8_tile" and not fused) or width[p.name]() != KA:
+                 "sparse_attn": lambda: p.params[0] * p.params[1], "gemm_fp8_tile": lambda: p.params[2],
+                 "gemm_tile": lambda: p.params[2]}   # bf16 wo_a's K parts: the same params[0]/[2] meanings
+        if p is None or p.name not in width or (p.name in ("gemm_fp8_tile", "gemm_tile") and not fused) or width[p.name]() != KA:
             raise ValueError(f"gemm_fp8_tile_layer: x_q must be an act_quant, q_norm or sparse_attn node's output of width {KA}, "
                              f"or a gemm_fp8_tile node's K parts in slots; it comes from {p.name if p else 'the graph inputs'}")
         assert tap is None or (fused and tap.num_dims == 1 and tap.dim(0) == zq_bytes(T, KA)), \
@@ -801,7 +805,12 @@ class StaticMegakernel(PersistentKernel):
         positions: DTensor,     # [T] int32: each token's position
         freqs: DTensor,         # [rows, RD / 2, 2] fp32: this layer's RoPE table (cos, sin per pair), freqs_cis as real
         attn_sink: DTensor,     # [H] fp32
-        output: DTensor,        # o_q [T, H * D] e4m3 bytes (uint8)
+        output: DTensor,        # o [T, H * D]: bf16 values (output_bf16), or e4m3 bytes (uint8) + its scale chunks
+        output_bf16: bool = False,       # write o as plain bf16 instead of act_quant's e4m3 + scale chunks: SGLang's wo_a
+                                          # is a bf16 linear when the checkpoint's wo_a scale layout is not 128 x 128
+                                          # (wo_a_fp8_gemm_enabled dequantizes wo_a to bf16 at load), so o is not
+                                          # quantized there; the quantized path loses ~1.7% of |o| (3.8% of the sublayer
+                                          # output) against SGLang
         window_rows: DTensor = None,      # [T, W] int32: the rows of window_cache (as one list) of positions p, p - 1, ..: a
                                           # graph tensor, set before the launch
         compress_cache: DTensor = None,   # [T, CAP, 288] uint8: the group's compressed KV, per row 512 e2m1 (low nibble
@@ -834,7 +843,8 @@ class StaticMegakernel(PersistentKernel):
         T, N, H = self._tokens(q.dim(0)), q.dim(1), attn_sink.dim(0)
         self._dtypes("sparse_attn_layer", q=(q, float32), window_cache=(window_cache, uint8),
                      positions=(positions, int32),
-                     freqs=(freqs, float32), attn_sink=(attn_sink, float32), output=(output, uint8))
+                     freqs=(freqs, float32), attn_sink=(attn_sink, float32),
+                     output=(output, bfloat16 if output_bf16 else uint8))
         D, W, RD = N // H, window_cache.dim(1), 2 * freqs.dim(1)
         HL = min(H, 16)   # heads per task: the MMA tile's 16 rows, of which H may be 8 (TP8; sparse_attn.cuh SA_HL)
         assert q.num_dims == 2 and N == H * D and H % HL == 0 and attn_sink.num_dims == 1
@@ -844,7 +854,9 @@ class StaticMegakernel(PersistentKernel):
         self._dtypes("sparse_attn_layer", window_rows=(window_rows, int32))
         assert positions.num_dims == 1 and positions.dim(0) == T and freqs.num_dims == 3 and freqs.dim(2) == 2
         assert output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, N)
-        extra, slots, ctensors = [], [], []
+        # params [H, D, W, RD, scale] + [NC, CAP, BF16O]: always 3, so BF16O keeps its index 7
+        bfo = 1 if output_bf16 else 0
+        extra, slots, ctensors = [0, 0, bfo], [], []
         counters, concurrent, splits = 1, None, 1
         if compress_cache is not None or compress_idx is not None:
             assert compress_cache is not None and compress_idx is not None, "the compressed cache and its ids together"
@@ -854,7 +866,7 @@ class StaticMegakernel(PersistentKernel):
             assert compress_idx.num_dims == 2 and compress_idx.dim(0) == T and NC % 128 == 0 and 0 < NC <= 512
             assert compress_pages is not None and (compress_pages.dim(0), compress_pages.dim(1)) == (T, CAP // 128)
             self._dtypes("sparse_attn_layer", compress_pages=(compress_pages, int32))
-            extra, slots = [NC, CAP], [self._tensor_slot(compress_cache), self._tensor_slot(compress_idx),
+            extra, slots = [NC, CAP, bfo], [self._tensor_slot(compress_cache), self._tensor_slot(compress_idx),
                                        self._tensor_slot(compress_pages)]
             ctensors = [compress_cache, compress_idx]   # inputs: a node that writes them this launch is waited for
             nodes = graph_nodes(self)
@@ -882,7 +894,7 @@ class StaticMegakernel(PersistentKernel):
                        [(0, 1, -1), (0, -1, -1), (0, -1, -1), (-1, -1, -1), (-1, -1, -1)]
                        + [(0, -1, -1)] * len(ctensors) + [(0, 1, -1)],
                        [H, D, W, RD, float_bits(D ** -0.5)] + extra,
-                       out_buffer=lambda n: (zq_bytes(T, N), -1, False), counters=counters,
+                       out_buffer=lambda n: (T * N * 2 if output_bf16 else zq_bytes(T, N), -1, False), counters=counters,
                        concurrent_along_axis=concurrent,
                        buf_slots=[self._tensor_slot(window_cache), self._tensor_slot(positions), self._tensor_slot(freqs),
                                   self._tensor_slot(attn_sink), self._tensor_slot(window_rows)] + slots,

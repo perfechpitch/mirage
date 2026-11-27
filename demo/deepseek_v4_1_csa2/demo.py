@@ -187,11 +187,18 @@ def build_graph(mpk: StaticMegakernel, w: dict, variant: str, ratio: int, csrc: 
                                candidates_out=a("candidates") if csrc else None)
     if compressed:
         cx = {"compress_cache": a("compress_cache"), "compress_idx": a("compress_idx"), "compress_pages": a("compress_pages")}
-    o_q = nt((T, NQ), uint8, "o_q")
+    # wo_a in bf16 (SGLang's path whenever the checkpoint's wo_a scales are not 128 x 128 blocks -- wo_a_fp8_gemm_enabled
+    # dequantizes wo_a to bf16 at load -- so o is NOT act_quant'ed there). Grouped wo_a (G > 1, TP4 and below) still uses
+    # the fp8 node: gemm_tile has no groups.
+    wo_a_bf16 = w["wo_a_weight"].dtype == torch.bfloat16 and G == 1
+    o_q = nt((T, NQ), bfloat16 if wo_a_bf16 else uint8, "o_q")
     mpk.sparse_attn_layer(q=wq_b_part, window_cache=a("window_cache"), positions=pos, freqs=freqs, attn_sink=a("attn_sink"),
-                          output=o_q, window_rows=a("window_rows"), **cx)   # q from wq_b's K parts (its RoPE done there)
+                          output=o_q, window_rows=a("window_rows"), output_bf16=wo_a_bf16, **cx)   # q from wq_b's K parts (its RoPE done there)
     wo_a_part = nt((T, G * OL), float32, "wo_a_part")
-    mpk.gemm_fp8_tile_layer(input=o_q, weight=a("wo_a_weight"), weight_scales=a("wo_a_scales"), output=wo_a_part, groups=G)
+    if wo_a_bf16:
+        mpk.gemm_tile_layer(input=o_q, weight=a("wo_a_weight"), output=wo_a_part)
+    else:
+        mpk.gemm_fp8_tile_layer(input=o_q, weight=a("wo_a_weight"), weight_scales=a("wo_a_scales"), output=wo_a_part, groups=G)
     # fused only when each of wo_b's 4 K parts (hand_grids) is at most half the ring's stages (T <= 16: 5, 32: 4, 64: 3):
     # TP4 (K 2048) at T <= 32, not TP2 / TP1
     fused = variant in OA_Q_FUSED_IN and G * OL // 4 // 256 <= ring_stages(T) // 2
@@ -268,6 +275,9 @@ def hand_plan(mpk: StaticMegakernel, heads: int, cap: int, cmp_rows: int, sms: i
     so that a task's 1024 K of weights fit its ring before o_q is there; x's act_quant in 2 column slices per token). The same
     lists on every GPU (sum_store_layer with num_gpus > 1 needs that)."""
     nodes = compiler.graph_nodes(mpk)
+    bad = [(n.name, len(n.inputs), len(n.outputs), [compiler.tname(mpk, t) for t in n.inputs]) for n in nodes if not n.outputs]
+    if bad:
+        raise ValueError(f"hand_plan: nodes with no outputs: {bad}")
     names = {n.graph_idx: compiler.tname(mpk, n.outputs[0]) for n in nodes}
     grid = hand_grids(heads, cap, cmp_rows)
     grid["o_q"] = next(n.grid for n in nodes if n.name == "sparse_attn")   # (T, heads / 16, 1 or a task per pair: the layer's)
@@ -295,7 +305,10 @@ def hand_plan(mpk: StaticMegakernel, heads: int, cap: int, cmp_rows: int, sms: i
     tasks = [(idx, (x, y, z)) for idx in sorted(grids) for x in range(grids[idx][0]) for y in range(grids[idx][1])
              for z in range(grids[idx][2])]
     tasks = sorted(tasks, key=lambda tk: (tk[0], tk[1][1], tk[1][0], tk[1][2]) if tk[0] in conc else (tk[0],) + tk[1])
-    sa = next(idx for idx, name in names.items() if name == "o_q")
+    sa = next((idx for idx, name in names.items() if name == "o_q"), None)
+    if sa is None:
+        raise ValueError(f"hand_plan: no sparse_attn node (its output named o_q); the graph's tensors: {sorted(names.values())}; "
+                         f"nodes: {[(n.name, [compiler.tname(mpk, t) for t in n.outputs]) for n in nodes]}")
     own = [tk for tk in tasks if tk[0] == sa]
     before = sorted((tk for tk in tasks if tk[0] < sa), key=lambda tk: BEFORE.index(names[tk[0]]))
     mix = [tk for tk in tasks if names[tk[0]] == "hc_mix"]

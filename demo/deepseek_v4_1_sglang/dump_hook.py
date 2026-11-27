@@ -32,6 +32,22 @@ _step = [0]      # decode forwards seen so far (host side, so every rank's layer
 _AT = int(os.environ.get("DSV41_DUMP_AT", "0"))
 
 
+_CAP = [False]   # set for the whole of a graph capture (any stream), see _install_cap_flag
+
+
+def _capturing() -> bool:
+    """True inside a CUDA-graph capture region. A `.cpu()` there (or any allocation) invalidates the capture --
+    "operation failed due to a previous error during capture" -- and SGLang builds its decode graphs by replaying
+    these very layers, so every probe must be a no-op while capturing."""
+    if _CAP[0]:      # a capture in progress ANYWHERE, not just on the current stream (see _install_cap_flag)
+        return True
+    try:
+        import torch
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
 def _is_decode(fb) -> bool:
     m = getattr(fb, "forward_mode", None)
     try:
@@ -160,6 +176,123 @@ def _dump_meta(mr, fb) -> None:
           f"{len(out.get('page_table', []))} pages)", flush=True)
 
 
+_ATTN_IO = os.environ.get("DSV41_DUMP_ATTN_IO", "0") != "0"
+# DSV41_DUMP_ATTN_IO: also record the attention's INSIDE, per layer per rank, for decode step 1:
+#   o_rope  `o` as the attention core hands it back (rope space, per-rank heads) -- what the chain's attention writes
+#   o_inv   the same buffer after `_project_wo_a`'s in-place inverse RoPE: the wo_a input (== the chain's `o_q`)
+#   oa      `_project_wo_a`'s return, [T, G, R] bf16: the wo_b input (the chain's `oa_q` before act_quant)
+#   y_part  `_project_wo_b`'s return with the all-reduce deferred: this rank's UNREDUCED bf16 partial
+# Without `o_inv` and `oa` the last bit of L0 cannot be attributed: the chain's `o` differs from the reference's by
+# 0.08 bf16 ulp, and the wo path then turns that into 0.44-0.58, with no way to tell which side owns it.
+# The writes are plain .bin files (bf16 raw, [T, ...]) under DIR/layers/step1/io/, one name per layer and rank.
+
+
+def _attn_io_writer():
+    """(name, tensor) -> None, writing DIR/layers/step{N}/io/L{LL}_r{rank:02d}_{name}.bin as bf16 raw."""
+    import numpy as np
+    import torch
+
+    _said = [0]
+
+    def write(name, t, lid=None) -> None:
+        if not (torch.is_tensor(t) and t.numel()):
+            return
+        if _capturing():
+            if _said[0] < 3:      # say it once, so a run that records nothing explains itself
+                _said[0] += 1
+                print(f"[dump] attn IO: skipping {name} during a graph capture "
+                      f"(the recorded step must be a real forward)", flush=True)
+            return
+        step = _step[0]
+        if not (0 < step <= _STEPS):
+            return
+        if lid is None:
+            lid = int(getattr(t, "_dsv41_lid", -1))
+        if lid < 0:
+            return
+        # a decode step is one token per sequence; a prefill's tensor is many rows long
+        if t.shape[0] != 1:
+            return
+        d = os.path.join(_DIR, "layers", f"step{step}", "io")
+        os.makedirs(d, exist_ok=True)
+        r = int(t.device.index if t.device.index is not None else torch.cuda.current_device())
+        b = t.detach().float().cpu().contiguous().numpy().astype(np.float32)
+        # bf16 raw, so the file is exactly the values the kernel produced (an fp32 widening is lossless)
+        b.astype(np.float32).view(np.uint32).__rshift__(16).astype(np.uint16).tofile(
+            os.path.join(d, f"L{lid:02d}_r{r:02d}_{name}.bin"))
+
+    return write
+
+
+def _install_attn_io() -> None:
+    import numpy as np
+    import torch
+    from sglang.srt.models import deepseek_v4 as _v4
+
+    write = _attn_io_writer()
+    cls = _v4.MQALayer            # (not MqaAttentionBase: the wo_a/wo_b projections live on the subclass)
+
+    _owa = cls._project_wo_a
+
+    def _project_wo_a(self, o, *a, **kw):
+        lid = int(getattr(self, "layer_id", -1))
+        try:
+            write("o_rope", o, lid)                       # before: the core's output, still in rope space
+        except Exception:
+            pass
+        out = _owa(self, o, *a, **kw)
+        try:
+            # `fused_rope_inplace` mutates o[..., -64:] in place, so the SAME buffer is now the wo_a input
+            write("o_inv", o, lid)
+            write("oa", out, lid)                         # [T, G, R] bf16, or an (fp8, scale) pair on the fp8 path
+        except Exception:
+            pass
+        return out
+
+    _owb = cls._project_wo_b
+
+    def _project_wo_b(self, o, *a, **kw):
+        lid = int(getattr(self, "layer_id", -1))
+        out = _owb(self, o, *a, **kw)
+        try:
+            v = out.data if hasattr(out, "data") else out     # mhc.AttnOutput wraps the unreduced partial
+            write("y_part", v, lid)
+        except Exception:
+            pass
+        return out
+
+    cls._project_wo_a, cls._project_wo_b = _project_wo_a, _project_wo_b
+
+    try:      # the decode step's logits: the goal's last requirement, which no dump has ever recorded
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        _lp = LogitsProcessor.forward
+
+        def _lp_fwd(self, input_ids, hidden_states, lm_head, logits_metadata, *a, **kw):
+            out = _lp(self, input_ids, hidden_states, lm_head, logits_metadata, *a, **kw)
+            try:
+                step = _step[0]
+                lg = getattr(out, "logits", None)
+                # `_capturing()` is not optional here: the row-bucket graph captures the logits step too, and a `.cpu()`
+                # inside it invalidates the capture ("operation failed due to a previous error during capture"),
+                # which takes the whole engine down rather than just this record.
+                if 0 < step <= _STEPS and not _capturing() and torch.is_tensor(lg) and lg.shape[0] >= 1:
+                    d = os.path.join(_DIR, "layers", f"step{step}")
+                    os.makedirs(d, exist_ok=True)
+                    row = lg.detach().float().cpu().reshape(lg.shape[0], -1)[-1]
+                    row.numpy().astype(np.float32).tofile(os.path.join(d, "logits.f32"))
+                    print(f"[dump] decode step {step}: logits {tuple(row.shape)} written", flush=True)
+            except Exception as e:
+                print(f"[dump] logits record failed: {type(e).__name__}: {e}", flush=True)
+            return out
+
+        LogitsProcessor.forward = _lp_fwd
+    except Exception as e:
+        print(f"[dump] logits hook failed: {type(e).__name__}: {e}", flush=True)
+
+    print(f"[dump] attn IO hook installed (DSV41_DUMP_ATTN_IO) -> {_DIR}/layers/step*/io", flush=True)
+
+
 def _install() -> None:
     import torch   # (module scope has no torch: only the functions below imported it, so the layer hook below used to
                    # raise NameError into its own except and record nothing -- the dump it wrote never existed)
@@ -185,7 +318,7 @@ def _install() -> None:
         from sglang.srt.models import deepseek_v4_mhc as _mhc
 
         def _record_post(r, suffix):
-            if not _LAYERS or _gate["lid"] < 0:
+            if not _LAYERS or _gate["lid"] < 0 or _capturing():
                 return
             v = getattr(r, "streams", None)
             if not (torch.is_tensor(v) and v.dim() >= 2):
@@ -219,7 +352,7 @@ def _install() -> None:
             paths (the fused collective and the plain one) build their coefficients in, and a layer whose post is fused
             into the next layer's boundary never reaches run_moe_post at all."""
             t = _oct(*p, **k)
-            if _LAYERS and _gate["lid"] >= 0:
+            if _LAYERS and _gate["lid"] >= 0 and not _capturing():
                 # The residual the coefficients were computed FROM. Recording it is what makes the triplet unambiguous:
                 # the coefficient is a pure function of this tensor, so a fingerprint says which dumped residual
                 # (`_in`, `_apost`, the previous layer's...) SGLang actually used -- instead of inferring it from the
@@ -244,13 +377,38 @@ def _install() -> None:
         if _oct is not None:
             _mhc._compute_triplet = _triplet
 
+        def _as_tensor(out):
+            """The sublayer output as one tensor. The MoE hands the post its PIECES unmerged (`leave_output_sum=True`:
+            the boundary owns the TP reduction and the replicated shared add), so its routes/outputs are nested
+            objects, not a tensor -- trying the known accessors in order is what makes the FFN's own output
+            recordable at all."""
+            if torch.is_tensor(out):
+                return out
+            for get in ("get_merged", "merged"):
+                f = getattr(out, get, None)
+                if callable(f):
+                    try:
+                        v = f()
+                    except Exception:
+                        continue
+                    if torch.is_tensor(v):
+                        return v
+            for name in ("shared", "routed", "partial"):
+                v = getattr(out, name, None)
+                if torch.is_tensor(v):
+                    return v
+            return None
+
         def _record_out(out, suffix):
             """The sublayer's own output, i.e. the `x` the post mixes in: R'[i] = post[i] x + sum_j comb[j][i] R[j].
             This is the quantity the static chain's kernel computes internally and does not expose as a node buffer for
             the MoE (its sum_store is fused with the post), so recording it here is the only way to compare it."""
-            if not (_LAYERS and _gate["lid"] >= 0 and torch.is_tensor(out) and out.numel()):
+            if not (_LAYERS and _gate["lid"] >= 0) or _capturing():
                 return
-            row = out.detach().float().reshape(out.shape[0], -1)[-1]
+            t = _as_tensor(out)
+            if not (torch.is_tensor(t) and t.numel()):
+                return
+            row = t.detach().float().reshape(t.shape[0], -1)[-1]
             if _gate["pref"]:
                 _rec["layers"][f"{_gate['lid']}{suffix}"] = row.cpu()
             elif _gate["step"]:
@@ -283,7 +441,7 @@ def _install() -> None:
             def _bc(x, hc_mult, *ba, **bk):
                 y = _ob(x, hc_mult, *ba, **bk)
                 _bcn[0] += 1
-                if _bcn[0] <= 2:
+                if _bcn[0] <= 2 and not _capturing():
                     try:
                         import numpy as _np
                         print(f"[dump] hc_broadcast#{_bcn[0]} x={tuple(x.shape)} y={tuple(y.shape)} "
@@ -299,6 +457,76 @@ def _install() -> None:
             _mhc.hc_broadcast = _bc
         except Exception as e:
             print(f"[dump] hc_broadcast hook failed: {type(e).__name__}: {e}", flush=True)
+
+        try:      # (11-27) the Engram at layers 1 and 14: it REPLACES the residual before the layer runs
+            from sglang.srt.layers.engram import Engram as _Engram   # (deepseek_v4.py:4360), so the chain cannot
+            _oe = _Engram.forward                                    # follow SGLang past L1 without it. Record what it
+            _egn = [0]                                               # consumes: x (the residual it gates), the hash ids
+            _EG_LID = {}                                             # and the gathered rows (its two inputs), and its
+            try:                                                     # output (to validate an off-line gate).
+                _mp = os.environ.get("DSV41_DUMP_MODEL")
+                if _mp:
+                    _tc = json.load(open(os.path.join(_mp, "config.json"))).get("text_config", {})
+                    for _i, _l in enumerate(_tc.get("engram_layer_ids", [])):
+                        _EG_LID[_i] = int(_l)
+            except Exception as _e:
+                print(f"[dump] engram layer ids unavailable ({_e}); keys will use the hash index", flush=True)
+            # The rows forward actually feeds to wkv, not a second gather: calling embed_rows() again after the fact
+            # does NOT return the same rows (measured 11-27: the re-gathered emb reproduces neither the model's R''
+            # nor, fed back through wkv, anything correlated with y - x). Patching the method that produces them is
+            # the only way to be sure the recorded rows are the ones the GEMM saw.
+            _orows, _EG_EMB = _Engram.embed_rows, {}
+            def _egrows(self, hash_ids, fb, cp, *ba, **bk):
+                out = _orows(self, hash_ids, fb, cp, *ba, **bk)
+                if _egn_in_forward[0]:
+                    _EG_EMB["e"] = out
+                return out
+            _Engram.embed_rows = _egrows
+            _egn_in_forward = [False]
+            def _egf(self, x, hash_ids, *a, **kw):                   # output (to validate an off-line gate).
+                _egn_in_forward[0] = True
+                try:
+                    y = _oe(self, x, hash_ids, *a, **kw)
+                finally:
+                    _egn_in_forward[0] = False
+                _egn[0] += 1
+                gi = int(getattr(self, "layer_hash_index", -1))
+                lid = _EG_LID.get(gi, gi)     # the LAYER number, not the hash index: a dump file named by the
+                                              # hash index would be L00 for layer 1, which nothing else reads that way
+                if (_LAYERS or _SHAPES) and not _capturing():
+                    try:
+                        import numpy as _np
+                        fb = a[0] if a else kw.get("forward_batch")
+                        cp = bool(kw.get("cp_all_tokens", False))
+                        emb = _EG_EMB.pop("e", None)      # the rows forward used (see embed_rows' patch)
+                        if emb is None:
+                            print("[dump] engram: forward did not call embed_rows; recording no rows", flush=True)
+                            return y
+                        if _egn[0] <= 2:
+                            print(f"[dump] engram#{_egn[0]} hidx={gi} x={tuple(x.shape)} ids={tuple(hash_ids.shape)} "
+                                  f"emb={tuple(emb.shape)} x_rms={float(x.detach().float().pow(2).mean().sqrt()):.5f} "
+                                  f"y_rms={float(y.detach().float().pow(2).mean().sqrt()):.5f}", flush=True)
+                        row = lambda t: t[-1].detach().float().cpu().reshape(-1).clone()
+                        # keys "N_eg_x"/"N_eg_y"/"N_eg_emb" land as L{N:02d}_eg_x.f32 ... next to layer N (the
+                        # writers' _key/_suf split on the first "_"), by LAYER number. The hash ids are only printed:
+                        # they exceed fp32's exact range and nothing downstream needs them once the rows are here.
+                        rec = {"x": row(x), "y": row(y), "emb": row(emb.reshape(emb.shape[0], -1))}
+                        if _egn[0] <= 2:
+                            print(f"[dump] engram ids (first 8): {hash_ids[-1].detach().cpu().reshape(-1)[:8].tolist()}",
+                                  flush=True)
+                        if _gate["pref"]:
+                            for k, v in rec.items():
+                                _rec["layers"][f"{lid}_eg_{k}"] = v
+                        elif _gate["step"]:
+                            for k, v in rec.items():
+                                _step_rec["rows"][f"{lid}_eg_{k}"] = v
+                    except Exception as e:
+                        print(f"[dump] engram record failed: {type(e).__name__}: {e}", flush=True)
+                return y
+
+            _Engram.forward = _egf
+        except Exception as e:
+            print(f"[dump] engram hook failed: {type(e).__name__}: {e}", flush=True)
 
         _orig_layer = _v4.DeepseekV4CudaDecoderLayer.forward
         _rec = {"layers": {}}       # the prefill's last position, written once
@@ -318,6 +546,8 @@ def _install() -> None:
                               and not _rec.get("done", False),
                          step=_step[0] if (dec0 and 0 < _step[0] <= _STEPS) else 0)
             if not _gate["pref"] and not _gate["step"]:
+                return _orig_layer(self, *args, **kw)
+            if _capturing():      # never touch the batch or copy to host inside a capture region
                 return _orig_layer(self, *args, **kw)
             pre = None    # the residual the layer READS, taken before it runs: layer 0's is the embedding in every
             precoef = {}  # stream (hc_broadcast), so it is the input the chain must start from
@@ -381,7 +611,7 @@ def _install() -> None:
                 # replays (a prefill chunk ending at _AT) and the real decode steps, and nothing else.
                 dec = _is_decode(fb)
                 last = _last_pos(kw, args)
-                if dec and 0 < _step[0] <= _STEPS:   # a decode step: every layer's row, in full
+                if dec and 0 < _step[0] <= _STEPS and not _capturing():   # a decode step: every layer's row, in full
                     try:
                         r = _step_rec["rows"]
                         for suf, v in pair.items():
@@ -392,7 +622,8 @@ def _install() -> None:
                             r.clear()
                     except Exception as e:
                         print(f"[dump] step record failed {type(e).__name__}: {e}", flush=True)
-                elif not dec and last is not None and (_AT <= 0 or last == _AT) and not _rec.get("done", False):
+                elif not dec and last is not None and (_AT <= 0 or last == _AT) and not _rec.get("done", False) \
+                        and not _capturing():
                     try:                             # the prefill chunk holding the chain's position: the last row
                         for suf, v in pair.items():
                             if v is not None:
@@ -442,8 +673,46 @@ def _install() -> None:
     _mr.ModelRunner.forward = forward
 
 
+def _install_cap_flag() -> None:
+    """Mark the WHOLE capture as capturing, not just the current stream.
+
+    `torch.cuda.is_current_stream_capturing()` answers for one stream. SGLang captures the row-bucket graph while the
+    layers' work can run on an alternate stream (TBO / `alt_streams`), so a `.cpu()` from a hook there sees "not
+    capturing" and invalidates the capture -- the engine then dies at the next `torch.empty` with
+    "Invalid stream capture status", which is how the first DSV41_DUMP_ATTN_IO run died. A global flag closes that
+    hole regardless of which stream the hook happens to run on.
+    """
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        breakable_cuda_graph as _bcg,
+    )
+
+    cls = _bcg.BreakableCUDAGraphCapture
+    _ent, _ext = cls.__enter__, cls.__exit__
+
+    def enter(self, *a, **kw):
+        _CAP[0] = True
+        return _ent(self, *a, **kw)
+
+    def exit_(self, *a, **kw):
+        try:
+            return _ext(self, *a, **kw)
+        finally:
+            _CAP[0] = False
+
+    cls.__enter__, cls.__exit__ = enter, exit_
+
+
 if _DIR:
     try:
         _install()
     except Exception as e:      # never break the engine
         print(f"[dump] hook not installed: {type(e).__name__}: {e}", flush=True)
+    if _ATTN_IO:
+        try:
+            _install_cap_flag()
+        except Exception as e:
+            print(f"[dump] capture flag not installed: {type(e).__name__}: {e}", flush=True)
+        try:
+            _install_attn_io()
+        except Exception as e:
+            print(f"[dump] attn IO hook not installed: {type(e).__name__}: {e}", flush=True)
