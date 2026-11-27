@@ -51,6 +51,11 @@ A.add_argument("--dump-dir", default=None, metavar="DIR",
                     "DIR/layer{L:02d}_{x_out|streams_out}.bin and DIR/logits.bin: the chain's per-sublayer output to "
                     "compare against a reference offline. Written after the first step (the warm one), so a run costs "
                     "one extra step's wait, and no launch.")
+A.add_argument("--dump-all", default=None, metavar="NAMES",
+               help="a comma list of sublayers (attn0,moe0,...): also dump every graph node's buffer under DIR as "
+                    "NAMES_r{rank}_{node}.bin, with NAMES_nodes.txt giving each one's shape and dtype. The node buffers "
+                    "the launch already writes, so nothing is rebuilt -- it is how to see inside a sublayer, whose only "
+                    "other numbers are its residual outputs.")
 A.add_argument("--golden", default=None, help="a golden jsonl (golden_bench32k.jsonl): the row to compare with")
 A.add_argument("--row", type=int, default=0, help="with --golden: the row index")
 A.add_argument("--inputs-dir", default=None, metavar="DIR",
@@ -265,19 +270,34 @@ WSD = {}        # layer -> its attention ws (a Reuse / Reindex layer reads the s
 x = None        # the previous sublayer's x_out, per GPU (None: the first layer's x is random)
 Rs = None       # the previous sublayer's streams_out, per GPU
 TAB = [make_tables(r) for r in range(NG)] if PRE else None
+def normed_row(e, L):
+    """The first sublayer's input, SGLang's combine with no pre-mix (deepseek_v4_mhc._combine: `if apply_pre is None:
+    return norm(x[:, 0, :])`), whose kernel is hc_combine_norm: value = bf16(sum_c pre_c x_c) -- one-hot on stream 0,
+    so just the embedding -- then bf16(value rsqrt(mean value^2 + eps) * gamma) with gamma = layers.L.attn_norm.weight.
+
+    The chain has to make this row itself: the NORM inside hc_post_combine produces every *later* sublayer's x from the
+    previous post, and there is no post before layer 0. Without the gamma the attention reads the raw embedding -- the
+    scale is harmless (act_quant is per-32-group) but the gamma is elementwise: its 12% spread makes x differ from
+    SGLang's by ~12% in direction, which is the size of the layer-0 attention error."""
+    g = read(f"layers.{L}.attn_norm.weight").float()
+    v = e.float().bfloat16().float()          # the unfused combine stores bf16 before the norm reads it
+    return (v * torch.rsqrt(v.square().mean() + cfg["norm_eps"]) * g).bfloat16()
+
+
 X = None
 S0 = None
 if PRE:         # the residual stream starts at the decode token's embedding (row 0); SGLang's padding rows stay 0
     tok = decode_token()
     X = [torch.zeros(T, HID, dtype=torch.bfloat16, device=d) for d in devs]
-    e = embed_row(tok)
+    e = embed_row(tok).float()
+    x0 = normed_row(e, 0)
     for r in range(NG):
-        X[r][0].copy_(e)
+        X[r][0].copy_(x0)
     # hc_broadcast (deepseek_v4_1's hc_broadcast): the initial mHC residual is the embedding in EVERY hc_mult stream,
     # not zeros -- zeros would make the first layer's post mix 4 empty streams and the whole chain start wrong
     S0 = [torch.zeros(T, HC * HID, dtype=torch.bfloat16, device=d) for d in devs]
     for r in range(NG):
-        S0[r][0].copy_(e.repeat(HC))
+        S0[r][0].copy_(e.bfloat16().repeat(HC))
 
 
 def kv_src(L):
@@ -402,6 +422,28 @@ step()                                   # warm: the caches and the code
 
 if a.dump_dir:                           # the chain's own numbers, every sublayer, one file each
     os.makedirs(a.dump_dir, exist_ok=True)
+    want = set(a.dump_all.split(",")) if a.dump_all else set()
+    for name, _h, wsx, bufs in hs:
+        # the sublayer's own input rows (not a node buffer: the caller's tensor). For a sublayer whose input is not the
+        # previous sublayer's output -- layer 0's -- this is the row to compare with SGLang's normed x.
+        xt = wsx[0].get("x")
+        if torch.is_tensor(xt) and xt.dtype == torch.bfloat16:
+            xt.detach().cpu().contiguous().view(torch.int16).numpy().tofile(
+                os.path.join(a.dump_dir, f"{name}_x.bin"))
+        # the mHC triplet this sublayer's post applied, straight from the kernel's hc_coef buffer: pre|post|comb|0s as
+        # [T, 32] fp32. This is the one record that separates "the sublayer's output is wrong" from "the mix is wrong"
+        # -- and it needs no extra node (hc_coef is in the graph already), so it never costs a rebuild.
+        cf = bufs[0].get("hc_coef") if bufs else None
+        if torch.is_tensor(cf) and cf.numel() >= T * 32:
+            cf.detach().cpu().contiguous().view(torch.float32).numpy()[: T * 32].astype(np.float32).tofile(
+                os.path.join(a.dump_dir, f"{name}_coef.bin"))
+        if name in want:                 # every graph node's buffer of the named sublayers, plus the name list: the
+            with open(os.path.join(a.dump_dir, f"{name}_nodes.txt"), "w") as f:   # only way to see inside a sublayer
+                for r, b in enumerate(bufs):
+                    for k, t in b.items():
+                        f.write(f"{r}\t{k}\t{tuple(t.shape)}\t{t.dtype}\n")
+                        t.detach().cpu().contiguous().view(torch.int16).numpy().tofile(
+                            os.path.join(a.dump_dir, f"{name}_r{r}_{k}.bin"))
     for name, h, ws, _ in hs:            # (ws is the per-GPU list; rank 0's has the gather_f32 logits)
         for nm in ("x_out", "streams_out"):
             t = ws[0].get(nm)

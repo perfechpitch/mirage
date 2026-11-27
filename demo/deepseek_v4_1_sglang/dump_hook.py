@@ -219,7 +219,19 @@ def _install() -> None:
             paths (the fused collective and the plain one) build their coefficients in, and a layer whose post is fused
             into the next layer's boundary never reaches run_moe_post at all."""
             t = _oct(*p, **k)
-            if _LAYERS and _gate["lid"] >= 0 and isinstance(t, (tuple, list)) and len(t) == 3:
+            if _LAYERS and _gate["lid"] >= 0:
+                # The residual the coefficients were computed FROM. Recording it is what makes the triplet unambiguous:
+                # the coefficient is a pure function of this tensor, so a fingerprint says which dumped residual
+                # (`_in`, `_apost`, the previous layer's...) SGLang actually used -- instead of inferring it from the
+                # post equation, which has several plausible readings once the layers' posts are fused.
+                if len(p) > 1 and torch.is_tensor(p[1]) and p[1].numel():
+                    res = p[1].detach().float().reshape(p[1].shape[0], -1)[-1]
+                    fp = torch.cat([res.reshape(-1, res.numel() // 4).norm(dim=-1), res[:8]])
+                    key = f"{_gate['lid']}_ct_resid_fp"
+                    if _gate["pref"]:
+                        _rec["layers"][key] = fp.cpu()
+                    elif _gate["step"]:
+                        _step_rec["rows"][key] = fp.cpu()
                 for nm, v in zip(("pre", "post", "comb"), t):
                     if torch.is_tensor(v) and v.numel():
                         row = v.detach().float().cpu().reshape(-1)
@@ -232,12 +244,28 @@ def _install() -> None:
         if _oct is not None:
             _mhc._compute_triplet = _triplet
 
+        def _record_out(out, suffix):
+            """The sublayer's own output, i.e. the `x` the post mixes in: R'[i] = post[i] x + sum_j comb[j][i] R[j].
+            This is the quantity the static chain's kernel computes internally and does not expose as a node buffer for
+            the MoE (its sum_store is fused with the post), so recording it here is the only way to compare it."""
+            if not (_LAYERS and _gate["lid"] >= 0 and torch.is_tensor(out) and out.numel()):
+                return
+            row = out.detach().float().reshape(out.shape[0], -1)[-1]
+            if _gate["pref"]:
+                _rec["layers"][f"{_gate['lid']}{suffix}"] = row.cpu()
+            elif _gate["step"]:
+                _step_rec["rows"][f"{_gate['lid']}{suffix}"] = row.cpu()
+
         def _attn_post(*p, **k):
+            if len(p) > 1:
+                _record_out(p[1], "_apost_x")
             r = _oap(*p, **k)
             _record_post(r, "_apost")
             return r
 
         def _moe_post(*p, **k):
+            if len(p) > 1:
+                _record_out(p[1], "_mpost_x")
             r = _omp(*p, **k)
             _record_post(r, "_mpost")
             return r
