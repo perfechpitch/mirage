@@ -3392,3 +3392,202 @@ kernel 自身多出来的执行时间吃掉了——它的 map 数（48 vs 28+21
 
 所以这条路的账要按层型算：**它主要在 attention 较重的层（full/reindex）上赚钱**，在小层上是零甚至微负。这也
 是为什么下一步必须是整步实测，而不是拿单层乘 40。
+
+## 12.51 融合 kernel 的第二个 parity blocker：`act_quant` 读 x 时没等生产者（2026-11-28）
+
+§12.50 证明了单层融合在 L0/L2/L3/L8 上逐位一致，但那是**单层对单层**的比较：那里的 MoE 的 x 是 `attach_input`
+的桩。整链（40 层）一跑就散，本节和 12.52 是把它修到逐位的那两刀。
+
+### 12.51.1 现象（L0，融合 vs 两 kernel，同一个 dec_io2 输入）
+
+    attn00_x_out / streams_out / h_pre / hc_coef / hc_mix    100.000% 逐位相同
+    moe00_buf_x_q                                             79.4%（全 0 的行 20320/25600 字节）
+    moe00_buf_routed_rows / sd_part / sgu_part / h_q            0-15%（全 0）
+    moe00_x_out                                              100%（因为它是空的：0 个非零字节）
+
+也就是：**attention 侧全对，MoE 侧读到了一个还没被写的 `x_out`**。`moe00_buf_x_q` 里只有 5280 个字节非零、其余
+全是 0，正是"量化了一整块 0"的指纹。
+
+### 12.51.2 根因
+
+`tasks/act_quant.cuh` 的 `run_act_quant` 分三支：x 是 GEMM 的 K 份（slots）、x 是 graph input、x 是 SwiGLU 的
+gate|up。**只有 `gemm_tile` 那一支在 `gemm_tile.cuh:343` 对输入的生产者 `cnt_wait` 了**，act_quant 的
+"graph input" 支直接按指针读。融合后这条支的 `X` 不再是 `StaticNode<0,0,0>`（桩），而是 attention 的
+`hc_post_combine` 的真实节点：
+
+    case 58: run_act_quant<StaticNode<1,1,1,256,31>, StaticParams<5120>, StaticBufSlots<26>, StaticMapSlots<>,
+                           StaticNode<4,1,1,224,-1,5120,4,1,507307272>>(...)
+                                                                            ^^^ 一个真的生产者
+
+编译器把依赖边建对了（`PRODUCER_ALIAS`），但**读者没有那条边的等待**——边在，语义没实现。
+
+### 12.51.3 修法（生成的代码对两 kernel 的构建零变化）
+
+```cpp
+} else if constexpr (X::buf < 0) {           // a graph tensor's bytes
+  constexpr bool POLL_X = param_or<PARAMS, 3, 0>() == 1;
+  if constexpr (!POLL_X && X::x > 0 && X::counter >= 0) {   // 真的是个节点，不是桩
+    if (threadIdx.x == 0) {
+      cnt_wait(cnt_now(g) + X::counter, X::x * X::y * X::z);
+    }
+    __syncthreads();
+  }
+  act_quant_task<...>(...);
+```
+
+`X::x > 0` 这个条件是关键：graph input 的生产者是 `StaticNode<0,0,0>`，`if constexpr` 把它整段丢掉，所以两
+kernel 的 40 层链编出来的 kernel 一字未变（`/tmp/tpot40` 与 `/tmp/tpot_base2` 的 `layer.cu` 相同哈希）。
+
+## 12.52 第三个 blocker：两个 sublayer 的 scratch 缓冲按名字撞了（同一层内 1 ulp，层间放大到 3%）
+
+L0 修完后，**L0 全对、L1 的 `moe01_x_out` 88.33%（relRMS 2.1e-3）、L2 崩到 50%**。这个"上一层全对、下一层
+1 ulp、再下一层崩"的形状是"某个读者拿到了一份不完整的结果"。
+
+### 12.52.1 定位（先给每层加上"被 launch 时的 x / R" 的 dump）
+
+`--dump` + `DSV41_E2E_DUMPX=1` 现在会把每层**被发射时的 `(x, R)`** 也写进 dump（`in{L:02d}_x.bin` /
+`in{L:02d}_R.bin`）。第一次出现差异的位置因此可以直接读出来，而不是靠下游反推：
+
+    in00_x 100.000%   in01_x 100.000%   in02_x  88.33%   in03_x 49.02%
+    in00_R 100.000%   in01_R 100.000%   in02_R 100.000%   in03_R 65.07%
+
+**R 一直全对，x 在 L1→L2 之间开始差**。x 是上一层 MoE 的 `hc_post_combine` 的 NORM 输出，而 R 是它的
+residual 输出——同一个 task 里两条路径，一条对一条不对，指向 NORM 独有的那段：`hc_ssq`（token 内各 part 的
+平方和交换）。
+
+### 12.52.2 根因
+
+`host.cuh build_bufs` 是按 **名字** 把 `buf.N` 解析到给定 tensor 的：
+
+    auto it = given.find(name);          // "hc_ssq"
+
+而 `_Scoped` 只给 **tensor** 名字加了前缀（`a.` / `m.`）。`_scratch("hc_ssq", T*parts*4, reset=0xFF)` 的名字
+是 layer 方法里的字面量，**两个 sublayer 各建一个 `hc_ssq`，进到同一个 kernel 后按名字解析成同一个 16 字节
+缓冲**。于是 attention 的 post 和自己的 4 个 part 交换平方和，MoE 的 post 也交换，两层的 4+4 个 part 写进同一块
+`ssq[T*4]`：MoE 的 post 读到的是"attention 那份已经写好的"，`rsqrtf(all / H + eps)` 里 `all` 是 4 个 part 中
+的一部分 → 归一化的 rsqrt 差 1 ulp → `x_out` 差 1 ulp → L2 的 indexer（对 1 ulp 极敏感）在后面放大到 3%。
+
+**为什么恰好是 L1 开始**：L0 的 attention 和 MoE 在这里的 part 数/时序刚好错开，L1 的 `hc_ssq` 先被 attention
+写完、MoE 再来读就已经是"有效"值。这类 bug 只在融合里存在，两 kernel 的构建永远各有一份。
+
+### 12.52.3 修法
+
+`_Scoped` 现在也拦截 `_new_buf`：`kind == "scratch"` 的名字加同样的前缀（`a.hc_ssq` / `m.hc_ssq`），
+`_scratch_slot` 的名字匹配改为后缀匹配（兼容不加前缀的路径）。另外把 fresh 缓冲的初值从 `torch.zeros` 改成
+**`layer.cu` 声明里的 reset 字节**——polled scratch 的"还没写"语义是 `0xFF`，填 0 等于告诉读者"已经写好了"，
+这和上面是同一类错误。
+
+### 12.52.4 结果：40 层逐位
+
+    /tmp/fuse40_dump vs /tmp/e2e_chain2（同参数的两 kernel 链）
+      40 层 x 4 个数据流张量（attn/moe 的 x_out、streams_out，加 streams_eg）
+      160 / 160 逐位相同，0 处不同
+
+层级别记分卡（`cmp_band.py`，同一 77 行、同一 band）**逐行完全相同**：
+
+    两 kernel 链   64/77 inside，最差 3.62（L2 apost）
+    融合链         64/77 inside，最差 3.62（L2 apost）      74 行 0 行不同
+
+logits：
+
+    vs /tmp/dec_io2    relRMS 5.05e-2 = 1.12x band     argmax 343
+    vs /tmp/dec_io3    relRMS 3.91e-2 = 0.87x band     argmax 343
+    top-5 与 dec_io3 集合相同 {343, 764, 14667, 16062, 37481}
+
+### 12.52.5 第四个 blocker：`hc_coef` 的 residual 平方和在"等生产者"之前就读了（`HC_RES_LATE`）
+
+同一类错误的第三处，形状更难看出来：**读者自己是有等待的**，但等待之前已经读了一半。
+
+`hc_coef_task` 干两件事：(1) 把 mixes GEMM 写好的那一行 bf16 系数读进来（**有 poll**：`ldf4_poll` 循环到
+`validf4`），(2) 算 `residual` 的平方和（**没有 poll**，直接 `ld16_relaxed` 读）。两 kernel 时 `res` 是 graph
+input（上一层 launch 已写），(2) 先读无所谓；融合后 `res` 是本层 attention 的 `streams_out`，由 4 个
+`hc_post_combine` CTA 写，而 (2) 在 (1) 的 poll 之前——**那条 poll 是这个 task 唯一的排序点**，它却排在读之后。
+
+实测指纹很干净：`moe00_hc_coef` 的 mixes 部分与两 kernel **逐位相同**，只有 `pre` 那 4 个 fp32 差
+（`pre = 1e-6`，因为读到的是上一轮 launch 留下的旧 residual，rms ≈ 0，sigmoid 饱和）。这比"整块差"难查得多：
+一个 task 里只有它的第一个输出差。
+
+修法：`HC_RES_LATE` 编译期开关（只有融合构建定义它）——把平方和挪到 poll 之后，并且让**每个线程**先自己
+poll 一个 float4：平方和要经 `__shfl_xor_sync` 归约，每个 lane 的值都会被跨 warp 汇总，所以每个线程都得先
+到那个点，而不是"大部分线程碰巧到了"。
+
+```cpp
+#ifdef HC_RES_LATE
+  { int const pp2 = threadIdx.x / Q, q2 = threadIdx.x % Q;
+    if (pp2 < KS) { ... float4 v = ldf4_poll(r2); while (!validf4(v)) v = ldf4_poll(r2); }
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    float const ssq = res_ssq();
+    if (lane == NMIX / 4) a.x += ssq; }
+#else
+  float const ssq = res_ssq();
+  ...
+#endif
+```
+
+`HC_RES_LATE` 不定义时，生成的代码与两 kernel 的构建**一字不变**（`ifndef` 包住原路径）。
+
+## 12.53 第一步实测：4.95 → 4.79 ms（209 tok/s），空隙 38.5% → 29.7%，但 kernel span 涨了 +340 µs
+
+同一台机器、同一天、同一个 dec_io2 输入、`--reps 20 --warmup 3`、instrumentation 全关、背靠背两次：
+
+| | 中位数 | p10 | 吞吐 | 80/40 次 launch 的 span 合计 | 核间空隙 | host/步 |
+|---|---|---|---|---|---|---|
+| 两 kernel（80 launch） | 4952.0 µs | 4932.0 | 202 tok/s | 3067.6 µs | 1923.7 µs（38.5%） | 1388 µs |
+| **融合（40 launch）** | **4785.1 µs** | 4754.7 | **209 tok/s** | 3407.5 µs | **1439.1 µs（29.7%）** | **745 µs** |
+
+三件事各自成立：**launch 减半把空隙砍掉 485 µs、host 砍掉 46%**（1388 → 745 µs，因为每层只有一次 `run`）。
+净收益 −145 µs。但 **span 反而 +340 µs**，吃掉了其中 2/3。
+
+### 12.53.1 逐层归因（`--spans`，同一天的两次运行）
+
+| 层 | attn | moe | 两 kernel 合计 | 融合 | delta |
+|---|---|---|---|---|---|
+| L0（swa，Engram host） | 29.8 | 45.6 | 75.4 | 91.9 | +16.5 |
+| L1（swa，Engram host） | 28.2 | 35.4 | 63.6 | 84.2 | +20.6 |
+| L2（full_r2） | 60.6 | 35.0 | 95.6 | 96.2 | +0.6 |
+| L3（reuse） | 33.4 | 34.3 | 67.7 | 78.6 | +10.9 |
+| L20（indexer） | 84.0 | 35.2 | 119.2 | 117.7 | −1.5 |
+| L32（indexer） | 69.8 | 36.2 | 106.0 | 119.4 | +13.4 |
+| 40 层合计 | 1605 | 1463 | 3068 | **3408** | **+340** |
+
+规律很清楚：**attention 越轻的层，融合越吃亏**（33 µs 的层 +7~+11，60~84 µs 的层 +0~+1.5）。这不是"融合的算术
+变慢了"，而是**融合后 MoE 的起始变成错峰的**：两 kernel 时 MoE kernel 有它自己的 start barrier，148 个 SM 同时
+开工；融合后每个 SM 的列表是"attn 任务 + moe 任务"首尾相接，MoE 的第一个任务既要做完本 SM 的 attention 队列，
+又要等全局的 `hc_post_combine`（只有 4 个 CTA，且排在它所在 SM 的队尾）。attention 轻的层里，这个"错峰 + 等
+post"占的比例更大。
+
+**注意 12.53.1 里 L0/L1 的 MoE 是 45.6 µs**（Engram host 的 MoE 要跑 `engram_gate` + `allreduce_send`），
+这也是为什么这两个层 delta 最大。
+
+### 12.53.2 下一步（按 ROI 排）
+
+1. **让 post 更早**：把 `hc_post_combine` 的 4 个 task 排到"attention 最空闲的那几个 SM 的队首"，或用 `hand_plan`
+   显式给它 4 个专门的 SM。现在它排在队尾，是 MoE 起始的全局串行点。
+2. **让不依赖 x 的 MoE 任务先跑**：MoE 的 `hc_mix` GEMM 和 `hc_coef` 读的是 `streams`（本层输入）——只有
+   `hc_coef` 的 residual 那份是 attention 的输出。若把 `hc_mix` 排到队首，能填掉每个 SM 的尾部空洞。
+3. **kernel 的 prologue**：融合 kernel 的 reset 缓冲是两层的并集，prologue（start barrier 之前）变长；`--skew`
+   正在量 entry→barrier 与 barrier→end 的拆分，量出来再决定。
+
+### 12.53.3 `--skew` 把这 1439 µs 的空隙拆开了：prologue 5.9、dispatch 12、**host 抖动 ~690**
+
+同一个融合链加 `--skew`（每层每 rank 打 entry / start_barrier / end 三个时间戳）：
+
+    sum(barrier->end)           3409.1 us            （= 12.53.1 的 span 合计）
+    entry->barrier              236.8 us / 40 = 5.9 us/launch   p50 5.0  p90 7.8  max 15.3
+    prev end -> this barrier      p50 12.0  p90 14.8  mean 30.9  max 374.4
+    ends 的 skew（max-min）       0.0 us              （8 个 rank 同时结束：TP 是锁步的）
+
+两件事因此被排除：
+
+* **prologue 不是问题**。`entry->barrier` 包含 40 层那份 reset 并集（~50 个缓冲）和 8 rank 的 TP start
+  barrier，一共只 5.9 µs。12.45.5 里"每次 launch 的 prologue + barrier 会合"的猜测，在融合 kernel 上被量化
+  否定了。
+* **dispatch 也不是问题**。`prev end -> barrier` 的 p50 是 **12.0 µs**，40 次 = 480 µs。
+
+但 mean 30.9、max 374.4：**分布是长尾**。40 × 12 = 480（典型）+ 237（prologue）= 717，实测空隙 1408，所以
+**~690 µs 在尾部**——不是每次 launch 都贵，而是少数几次卡了几百微秒。这与 §12.45.5 记的"host 里 0.8 ms 是
+2 次 Engram 的真 `cuda.synchronize`"对得上：那两个同步点（`e2e_decode._hc_pre` 里的 `.cpu()`，Engram 层要重算
+`x`）正好是每步 2 次、每次几百微秒的**唯一**同步点。
+
+所以下一步的优先级改了：不是"把 post 提前"，而是**把 Engram 的 host 重算搬进 kernel**（`DSV41_EG_X=1`，让
+MoE 的 post 直接从 R'' 归一化出下一层的 `x`，第 1 次就没有同步点，顺带解锁 CUDA graph）。

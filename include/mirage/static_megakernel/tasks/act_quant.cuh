@@ -424,8 +424,24 @@ __device__ __forceinline__ void run_act_quant(Maps const &,
         g.cnt + SELF::counter,
         tk.x,
         warm STAGE_STAMP_ARG(L.stage_stamps));
-  } else if constexpr (X::buf < 0) { // x: a graph input (POLL: params[3] = 1)
-    act_quant_task<K, K / SELF::y, param_or<PARAMS, 3, 0>() == 1>(
+  } else if constexpr (X::buf < 0) { // a graph tensor's bytes (POLL: params[3] = 1)
+    // (FUSED SUBLAYERS, FINDINGS 12.51) x is not always a graph INPUT here: the
+    // fused build binds the MoE's x to the attention's post, so X is a real node
+    // of this same kernel (StaticNode<4,1,1,counter,...>) and these reads must
+    // wait for its count first -- as gemm_tile does for its activation (line
+    // 343). A graph input's producer is StaticNode<0,0,0> (x = 0): nothing to
+    // wait for, so the two-kernel builds compile the same code they always did.
+    // Measured without it: the fused layer's x_q came out quantized STALE bytes
+    // (all zeros when the buffer was) while the attention's own x_out was
+    // bit-exact -- the write was right, this reader was early.
+    constexpr bool POLL_X = param_or<PARAMS, 3, 0>() == 1;
+    if constexpr (!POLL_X && X::x > 0 && X::counter >= 0) {
+      if (threadIdx.x == 0) {
+        cnt_wait(cnt_now(g) + X::counter, X::x * X::y * X::z);
+      }
+      __syncthreads(); // (the count's acquire, then every thread's loads)
+    }
+    act_quant_task<K, K / SELF::y, POLL_X>(
         buf_at<__nv_bfloat16 const>(g, slot_at<BUF_SLOTS, 0>()),
         buf_at<unsigned char>(g, SELF::buf),
         g.cnt + SELF::counter,

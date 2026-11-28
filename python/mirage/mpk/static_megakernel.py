@@ -1635,9 +1635,12 @@ class StaticMegakernel(PersistentKernel):
         return p
 
     def _scratch_slot(self, node, name: str) -> int:
-        """Return the buffer slot of the scratch buffer `name` of `node` (_scratch)."""
+        """Return the buffer slot of the scratch buffer `name` of `node` (_scratch). A fused build prefixes a
+        sublayer's scratch names ("a.hc_ssq": two sublayers' scratch must not collide, FINDINGS 12.52), so the name
+        is matched as a suffix too."""
         for i, b in enumerate(self._bufs):
-            if b["kind"] == "scratch" and b["name"] == name and b.get("node") == node.graph_idx:
+            if b["kind"] == "scratch" and b.get("node") == node.graph_idx and \
+                    (b["name"] == name or b["name"].endswith("." + name)):
                 return i
         raise ValueError(f"node {node.graph_idx} ({node.name}) has no scratch buffer {name}")
 

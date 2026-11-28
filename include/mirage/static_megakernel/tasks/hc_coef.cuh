@@ -56,27 +56,37 @@ __device__ HC_TASK_INLINE void hc_coef_task(float const *mix,
     base = hc_small[ci];
     scale = hc_small[NMIX + (lane < CB ? 2 : (lane < CB + HC ? 0 : 1))];
   }
-  // R[t]'s sum of squares, 80 values per thread (the official mean over HC H)
-  float ssq = 0.f;
+  // R[t]'s sum of squares, 80 values per thread (the official mean over HC H). HC_RES_LATE (a fused sublayer): it runs
+  // AFTER the mixes' poll below, because that poll is this task's only ordering point behind the producer of the
+  // residual. In a layer of its own the residual is a graph input and nothing can be stale; fused behind the sublayer
+  // that writes it (mHC's post: FINDINGS 12.50) an un-ordered read here takes whatever the previous launch left --
+  // measured: pre = 1e-6 (sigmoid saturated by rms ~ 0) while the mixes, whose GEMM does wait, were bit-identical.
+  auto res_ssq = [&] {
+    float s = 0.f;
 #pragma unroll 1
-  for (int i = 0; i < (HC * H) / 256 / 8; i++) {
-    uint4 const v = ld16_relaxed(reinterpret_cast<unsigned char const *>(
-        res + (size_t)t * (HC * H) + threadIdx.x * ((HC * H) / 256) + 8 * i));
-    float2 const f0 = __bfloat1622float2(
-                     *reinterpret_cast<__nv_bfloat162 const *>(&v.x)),
-                 f1 = __bfloat1622float2(
-                     *reinterpret_cast<__nv_bfloat162 const *>(&v.y)),
-                 f2 = __bfloat1622float2(
-                     *reinterpret_cast<__nv_bfloat162 const *>(&v.z)),
-                 f3 = __bfloat1622float2(
-                     *reinterpret_cast<__nv_bfloat162 const *>(&v.w));
-    ssq += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y +
+    for (int i = 0; i < (HC * H) / 256 / 8; i++) {
+      uint4 const v = ld16_relaxed(reinterpret_cast<unsigned char const *>(
+          res + (size_t)t * (HC * H) + threadIdx.x * ((HC * H) / 256) + 8 * i));
+      float2 const f0 = __bfloat1622float2(
+                       *reinterpret_cast<__nv_bfloat162 const *>(&v.x)),
+                   f1 = __bfloat1622float2(
+                       *reinterpret_cast<__nv_bfloat162 const *>(&v.y)),
+                   f2 = __bfloat1622float2(
+                       *reinterpret_cast<__nv_bfloat162 const *>(&v.z)),
+                   f3 = __bfloat1622float2(
+                       *reinterpret_cast<__nv_bfloat162 const *>(&v.w));
+      s += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y +
            f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
-  }
+    }
 #pragma unroll
-  for (int o = 1; o < 32; o <<= 1) {
-    ssq += __shfl_xor_sync(0xffffffffu, ssq, o);
-  }
+    for (int o = 1; o < 32; o <<= 1) {
+      s += __shfl_xor_sync(0xffffffffu, s, o);
+    }
+    return s;
+  };
+#ifndef HC_RES_LATE
+  float const ssq = res_ssq();
+#endif
   // thread p = K part p / Q, float4 p % Q of the mixes: the row's bf16 part
   // of fn (rows 4 q ..) + the rest (rows NMIX + 4 q ..); the rows above NMIX
   // and the K parts past KS: nothing. A slot is re-armed by this one reader.
@@ -100,9 +110,32 @@ __device__ HC_TASK_INLINE void hc_coef_task(float const *mix,
       }
     }
   }
+#ifdef HC_RES_LATE
+  // (HC_RES_LATE) The mixes above have landed -- the threads whose columns carry the coefficients polled them, and the
+  // producer of the mixes counted its tasks, which it did after waiting for the producer of this task's residual. The
+  // sum of squares below is read by ALL the threads, and its reduction spreads every lane's value across the warp, so
+  // every thread has to reach that point: each one polls its own float4 of the same (K part, token) row first (the
+  // mixes are written whole, so any 16 B of the row says the producer is past it).
+  {
+    int const pp2 = threadIdx.x / Q, q2 = threadIdx.x % Q;
+    if (pp2 < KS) {
+      float const *const r2 = mix + ((size_t)pp2 * T + t) * 128 + 4 * q2;
+      float4 v = ldf4_poll(r2);
+      while (!validf4(v)) {
+        v = ldf4_poll(r2);
+      }
+    }
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");   // acquire: what that producer wrote is visible below
+    float const ssq = res_ssq();
+    if (lane == NMIX / 4) { // entry NMIX of the row: the warp's sum of squares
+      a.x += ssq;
+    }
+  }
+#else
   if (lane == NMIX / 4) { // entry NMIX of the row: the warp's sum of squares
     a.x += ssq;
   }
+#endif
 #pragma unroll
   for (int o = Q; o < 32; o <<= 1) {
     a = f4_add(a, f4_shfl_xor(a, o));

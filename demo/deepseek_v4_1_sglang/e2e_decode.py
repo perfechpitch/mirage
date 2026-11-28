@@ -50,8 +50,10 @@ A.add_argument("--warmup", type=int, default=3)
 A.add_argument("--out", default="/tmp/e2e_decode")
 A.add_argument("--pdl", type=int, default=0)
 A.add_argument("--pool-mb", type=float, default=8.0, help="the exchange pool's region size (the largest layer's)")
+A.add_argument("--fuse-sublayers", action="store_true",
+               help="one kernel a layer instead of two (FINDINGS 12.50): the attention and its MoE in one static "
+                    "megakernel, built from the two layers' own graphs and schedules (bit-identical, 40 launches a step)")
 A.add_argument("--sync-every", type=int, default=0,
-
                help="layers between two cross-rank barriers (0: only at the end). Each static layer's sum_store is an "
                     "all-reduce over the exchange regions, so all ranks must be in the same kernel: without a barrier "
                     "the ranks drift apart and the polls deadlock")
@@ -172,6 +174,10 @@ CHAINDUMP = os.environ.get("DSV41_E2E_CHAINDUMP", "")
 # (core.cuh kernel_begin: gen at g.gen_ptr, dbuf_par -> rg_set()'s exchange set) reaching a different fixed point
 # once the host stops pacing the ranks between launches. Left in the tree as the harness for that work.
 GRAPH = os.environ.get("DSV41_E2E_GRAPH", "0") != "0"
+# DSV41_E2E_FUSE: one kernel a layer (FINDINGS 12.50) -- the attention and its MoE fused into one static megakernel,
+# 40 launches a step instead of 80. Built from the two layers' own graphs and their own verified schedules, so the
+# arithmetic is bit-identical (5 consecutive launches on four layer variants) and only the launch count changes.
+FUSE = os.environ.get("DSV41_E2E_FUSE", "0") != "0" or a.fuse_sublayers
 # DSV41_E2E_SIG: print a bitwise fingerprint of the logits after every step (rank 0). Every step repeats the same
 # token at the same position, so any change between steps is a replay that is not idempotent -- the reset protocol
 # question (core.cuh kernel_begin). Diagnosis only.
@@ -391,7 +397,7 @@ log(f"decode token {dec_tok}{' (golden ids[0])' if dec_tok != ids[-1] else ''}; 
     f"x0 norm {X0.float().norm():.3f} (normed), stream0 norm {emb.float().norm():.3f}")
 
 # one region per layer kernel (attention, MoE) that has an exchange; the first take sets the slot size
-pool = Lm.ExchangePool(GROUP, dev, 2 * a.layers + 4)
+pool = Lm.ExchangePool(GROUP, dev, 2 * a.layers + 4 + (a.layers + 2 if FUSE else 0))
 pool.take(int(a.pool_mb * 2**20))
 
 attn, moe = [], []
@@ -432,6 +438,19 @@ for L in range(a.layers):
         f"{torch.cuda.mem_get_info()[0] / 2**30:.1f} GB free")
 log(f"built {a.layers} layers in {(time.perf_counter() - t0) / 60:.1f} min on rank {RANK}")
 
+# ---- one kernel a layer (--fuse-sublayers) -------------------------------------------------------------------
+# Built AFTER the two-kernel layers: each fused kernel is the two layers' own graphs on one mpk, planned by their own
+# verified schedules. It reads and writes their tensors, so the fill below (and the caches it fills) is what it reads.
+fused = []
+if FUSE:
+    t0 = time.perf_counter()
+    for L in range(a.layers):
+        fl = Lm.StaticFusedLayer(attn[L], moe[L], pool, WORLD, RANK, dev, out_root=a.out)
+        fused.append(fl)
+        log(f"L{L} {variants[L]}: fused attn+MoE built, {len(fl.info['grids'])} nodes, {(time.perf_counter() - t0) / 60:.1f} min")
+    log(f"built {len(fused)} fused layers in {(time.perf_counter() - t0) / 60:.1f} min on rank {RANK}")
+
+
 # The caches are either the prefill's real bytes (--inputs-dir) or, with no prefill, the layer demos' random fill.
 #
 # ORDER MATTERS, and it was the whole of attn L3's 0x7fff. The serving build (STATIC_RESET_IN_KERNEL) memsets every
@@ -439,7 +458,7 @@ log(f"built {a.layers} layers in {(time.perf_counter() - t0) / 60:.1f} min on ra
 # that once. Done AFTER a fill, it wipes the bytes just loaded and the first launch reads a NaN window; L3 is the
 # first Reuse layer, its caches are the ones re-armed by its own reader, and it was the first layer to show it.
 # So: prime EVERY layer first (the post-build sentinel state, as the host reset path leaves it), then fill.
-for sa in attn:
+for sa in attn + fused:
     try:
         sa.sk.rebind("@prime", 0)
     except Exception as e:
@@ -601,6 +620,8 @@ _G = []             # one graph per segment (see _segments)
 _SEGS = []
 _SX = _SR = None    # the [T, HID] x and the [T, HC, HID] residual the next sublayer reads
 SUB = []            # per layer: (attn, R view, x_out, moe, R'' view or None, x_out or None)
+FSUB = []           # (--fuse-sublayers) per layer: (fused, R'' view, x_out or None)
+XIN = []            # (--dump + DSV41_E2E_DUMPX) per layer: the (x, R) it was launched with, for the divergence hunt
 
 
 def _prepare_sublayers() -> None:
@@ -621,6 +642,11 @@ def _prepare_sublayers() -> None:
         mR = (moe[i].w["streams_eg"] if "streams_eg" in moe[i].w else moe[i].w["streams_out"]).view(T, HC, HID)
         mX = moe[i].w.get("x_out")
         SUB.append((attn[i], aR, aX, moe[i], mR, mX))
+    FSUB.clear()
+    for i in range(len(fused)):
+        # the same two addresses the two-kernel path reads, from the fused kernel's MoE (which is the same w dict): R''
+        # when this layer hosts the Engram, x_out when its post made the next attention's input (None on an Engram host)
+        FSUB.append((fused[i], fused[i].out_streams().view(T, HC, HID), moe[i].w.get("x_out")))
 
 
 def _sublayer(i: int) -> None:
@@ -636,8 +662,34 @@ def _sublayer(i: int) -> None:
     Host-only instrumentation is therefore gated on _CAP rather than left in: a torch.cuda.synchronize() inside a
     capture is an error, and a dist.barrier() is worse."""
     global _SX, _SR
-    ai, aR, aX, mi, mR, mX = SUB[i]
     xx, R = _SX, _SR
+    if a.dump and os.environ.get("DSV41_E2E_DUMPX") and not _CAP and len(XIN) <= i:
+        # (the divergence hunt, --dump + DSV41_E2E_DUMPX: the x and R each layer is LAUNCHED with, so the first
+        #  layer whose input differs from the other chain's is named instead of inferred. First step only.)
+        XIN.append((xx.detach().clone(), None if R is None else R.detach().clone()))
+    if FUSE:
+        # --fuse-sublayers: the same layer in ONE launch. Positions go through the shared table set the same way (my
+        # run() reads sa.w["positions"], the tensor every attention layer was rebound to), and the MoE's x is the
+        # attention's x_out by a real graph edge, so nothing is rebound between the two halves.
+        fl, mR, mX = FSUB[i]
+        if not _CAP and DEBUG:
+            print(f"[e2e] rank {RANK} launch fused L{i} ({variants[i]})", flush=True)
+        _t0 = time.perf_counter() if (HOSTT and not _CAP) else 0.0
+        fl.run(xx, p, R, emb=EG_EMB.get(i))
+        if not _CAP:
+            _wait(fl, f"fused L{i}")
+            _sync()
+            if HOSTT:
+                _HW["fused"] = _HW.get("fused", 0.0) + time.perf_counter() - _t0
+        R = mR
+        # (norm_next) the next attention's x; an Engram host writes no x_out (EG_LAYERS follows every host with its
+        # own layer, which overwrites xx from R'' first) -- the same two lines as the two-kernel path below.
+        xx = mX if not (EG_ON and i in EG_HOST) else xx
+        if not _CAP and a.sync_every and (i + 1) % a.sync_every == 0 and i + 1 < a.layers:
+            _sync()
+        _SX, _SR = xx, R
+        return
+    ai, aR, aX, mi, mR, mX = SUB[i]
     if not _CAP:
         if DEBUG:                            # every rank, so a rank that never reaches the launch is visible
             print(f"[e2e] rank {RANK} launch attn L{i} ({variants[i]})", flush=True)
@@ -879,8 +931,9 @@ def _wait(layer, tag: str, timeout: float = None):
         torch.cuda.synchronize()
     fired.append(1)
     if _os.environ.get("DSV41_E2E_ASYNC", "0") == "0":
-        xo = layer.w.get("x_out")
-        so = layer.w.get("streams_out")
+        wl = getattr(layer, "sm", layer).w      # (a fused layer's own w is prefixed: its MoE's is the same dict the
+        xo = wl.get("x_out")                    #  two-kernel path reads here)
+        so = wl.get("streams_out")
         log(f"  ok {tag}: x_out norm {xo.float().norm():.4g} rms {xo.float().square().mean().sqrt():.4g}"
             + (f", streams_out rms {so.float().square().mean().sqrt():.4g}" if so is not None else ""))
 
@@ -1044,13 +1097,30 @@ if a.dump:
     os.makedirs(a.dump, exist_ok=True)
     for i in range(a.layers):
         for name, lay in (("attn", attn[i]), ("moe", moe[i])):
-            for t in ("x_out", "streams_out"):
+            for t in ("x_out", "streams_out", "streams_eg", "h_pre"):
                 v = lay.w.get(t)
                 if v is not None:
-                    v.detach().cpu().contiguous().numpy().tofile(
-                        os.path.join(a.dump, f"{name}{i:02d}_{t}.bin"))
+                    # numpy has no bf16: the raw bits (the CHAINDUMP block does the same)
+                    w = v.detach().contiguous().cpu()
+                    w = w.view(torch.uint16) if w.dtype == torch.bfloat16 else w
+                    w.numpy().tofile(os.path.join(a.dump, f"{name}{i:02d}_{t}.bin"))
+            for t, v in ((lay.bufs or [{}])[0] or {}).items():
+                if not torch.is_tensor(v) or v.numel() == 0:   # (a node's own buffers: the Engram re-derivation
+                    continue                                   #  reads hc_coef; a census is what localizes a break)
+                w = v.detach().contiguous().cpu()
+                w = w.view(torch.uint16) if w.dtype == torch.bfloat16 else w
+                if w.dtype in (torch.int64, torch.float64):
+                    w = w.view(torch.uint8) if w.dtype == torch.int64 else w
+                w.numpy().tofile(os.path.join(a.dump, f"{name}{i:02d}_buf_{t}.bin"))
     if moe[-1].head and "logits" in moe[-1].w:
         moe[-1].w["logits"].detach().cpu().contiguous().numpy().tofile(os.path.join(a.dump, "logits.bin"))
+    for i, (xv, rv) in enumerate(XIN):        # (DSV41_E2E_DUMPX) the launch inputs: the first divergence, layer by layer
+        for tag, v in (("x", xv), ("R", rv)):
+            if v is None:
+                continue
+            w = v.detach().contiguous().cpu()
+            w = w.view(torch.uint16) if w.dtype == torch.bfloat16 else w
+            w.numpy().tofile(os.path.join(a.dump, f"in{i:02d}_{tag}.bin"))
     log(f"dumped {a.layers} layers' x_out/streams_out and the logits to {a.dump}")
 
 if os.environ.get("DSV41_E2E_ONE", "0") != "0":
@@ -1061,6 +1131,8 @@ if os.environ.get("DSV41_E2E_ONE", "0") != "0":
     os._exit(0)
 
 if GRAPH:
+    assert not FUSE, ("--fuse-sublayers with DSV41_E2E_GRAPH: a captured graph is not idempotent here (FINDINGS 12.44) "
+                      "and the fused path is the one being measured; time it uncaptured")
     capture_graph()
 
 for _ in range(a.warmup):
@@ -1087,8 +1159,9 @@ for _ in range(a.reps):
     evs.append(start.elapsed_time(end) * 1e3)
     if HOSTT and RANK == 0:
         at, mo = _HW.get("attn", 0.0) * 1e6, _HW.get("moe", 0.0) * 1e6
-        log(f"  host per step: attn {at:.0f} us, moe {mo:.0f} us, total {at + mo:.0f} us "
-            f"of a {evs[-1]:.0f} us step ({100 * (at + mo) / evs[-1]:.0f}%)")
+        fu = _HW.get("fused", 0.0) * 1e6            # (--fuse-sublayers: one launch a layer, attn and moe above are 0)
+        log(f"  host per step: attn {at:.0f} us, moe {mo:.0f} us, fused {fu:.0f} us, total {at + mo + fu:.0f} us "
+            f"of a {evs[-1]:.0f} us step ({100 * (at + mo + fu) / evs[-1]:.0f}%)")
 evs.sort()
 med = evs[len(evs) // 2]
 if _prof is not None:
@@ -1139,9 +1212,14 @@ if a.spans:
     torch.cuda.synchronize()
     dist.barrier()
     names, spans = [], []
-    for i in range(a.layers):
-        names += [f"attn{i}", f"moe{i}"]
-        spans += [Harness(attn[i].sk).span_us(), Harness(moe[i].sk).span_us()]
+    if FUSE:                       # one kernel a layer: the fused launch's own span (the two sublayers' kernels did not run)
+        for i in range(a.layers):
+            names.append(f"fused{i}")
+            spans.append(Harness(fused[i].sk).span_us())
+    else:
+        for i in range(a.layers):
+            names += [f"attn{i}", f"moe{i}"]
+            spans += [Harness(attn[i].sk).span_us(), Harness(moe[i].sk).span_us()]
     if RANK == 0:
         tot = sum(spans)
         for n, v in zip(names, spans):
@@ -1172,8 +1250,11 @@ if a.skew:
     torch.cuda.synchronize()
     dist.barrier()
     lay = []
-    for i in range(a.layers):
-        lay += [(f"attn{i}", attn[i].sk), (f"moe{i}", moe[i].sk)]
+    if FUSE:
+        lay = [(f"fused{i}", fused[i].sk) for i in range(a.layers)]
+    else:
+        for i in range(a.layers):
+            lay += [(f"attn{i}", attn[i].sk), (f"moe{i}", moe[i].sk)]
     rows = []   # (name, [(entry, barrier, end) per GPU])
     for nm, sk in lay:
         lay_d = sk.layout()
@@ -1238,7 +1319,7 @@ if a.skew:
         print("[skew] the 6 costliest barriers: " + "  ".join(f"{n} {v:.0f}" for v, n in wb), flush=True)
         print("[skew] the 6 most skewed ends:  " + "  ".join(f"{n} {v:.0f}" for v, n in ws), flush=True)
         # one layer in full: the distribution across the 8 ranks
-        for nm in ("attn0", "moe0", "attn20", "moe20"):
+        for nm in (("fused0", "fused20") if FUSE else ("attn0", "moe0", "attn20", "moe20")):
             k = [i for i, (n, _) in enumerate(rows) if n == nm][0]
             per = rows[k][1]
             print(f"[skew] {nm:6s} entry->barrier per GPU " + " ".join(f"{c:.1f}" for c in bc[k]) +

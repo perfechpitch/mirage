@@ -637,6 +637,7 @@ class StaticAttn(MhcMixin):
             else:
                 os.environ["SA_DRY"] = sa_dry
         self.w = w
+        self.out, self.flags, self.csrc = out, flags, csrc   # (StaticFusedLayer builds its graph from these)
         if SHARE:
             self._init_binds(w, self.shared)
         if self.engram:   # the gathered kv's multicast address (the stand-in's slot)
@@ -902,6 +903,297 @@ class StaticMoE(MhcMixin):
         if SHARE:
             v._init_binds(self.w, v.shared)
         return v
+
+
+_FUSED_MK = {}
+
+
+def fused_megakernel(*args, **kw):
+    """A StaticMegakernel whose buffer/map/counter ceilings have a FLOOR while the two sublayers' graphs are being built
+    (FINDINGS 12.50).
+
+    dsv41_mhc_nodes sets max_bufs to 64 and then to the slots in use when it returns; called once per sublayer, that
+    lowers the ceiling under the first sublayer's slots before the second one allocates. The floor holds the ceiling
+    up until both graphs are in, then it is dropped so the #defines carry the exact counts (each extra slot costs
+    every launch).
+
+    Built here, not at module import: the demos' own modules are chosen by T (see layer_module), and a base class would
+    have to be one of them."""
+    if "cls" not in _FUSED_MK:
+        from mirage.mpk.static_megakernel import StaticMegakernel
+
+        class FusedMK(StaticMegakernel):
+            def _floor(self, key: str, minimum: int) -> None:
+                self.__dict__["_floor_" + key] = minimum
+
+            def _get(self, key: str, dflt: int) -> int:
+                return max(self.__dict__.get("_limit_" + key, 0) or 0,
+                           self.__dict__.get("_floor_" + key, 0) or 0) or dflt
+
+            def _set(self, key: str, v: int) -> None:
+                self.__dict__["_limit_" + key] = v
+
+            max_bufs = property(lambda s: s._get("bufs", 24), lambda s, v: s._set("bufs", v))
+            max_maps = property(lambda s: s._get("maps", 32), lambda s, v: s._set("maps", v))
+            max_counter_lines = property(lambda s: s._get("counter_lines", 16), lambda s, v: s._set("counter_lines", v))
+
+        _FUSED_MK["cls"] = FusedMK
+    return _FUSED_MK["cls"](*args, **kw)
+
+
+class _Scoped:
+    """Prefix every graph tensor the sublayer being built declares, so the two sublayers' names stay distinct (the same
+    names would otherwise collide in one kernel's tensor map). record: name -> DTensor for every attach_input, so a tensor
+    a node writes through a buffer slot (hc_post_combine's x_out, the next sublayer's input) can be looked up."""
+
+    def __init__(self, mpk, tag: str, record: dict = None):
+        self.mpk, self.tag, self.record = mpk, tag, record
+
+    def __enter__(self):
+        mpk = self.mpk
+        self.old = (mpk.attach_input, mpk.new_tensor, mpk._new_buf)
+        old_attach, old_new, old_buf = self.old
+
+        def attach(*args, **kw):
+            kw["name"] = self.tag + kw["name"]
+            t = old_attach(*args, **kw)
+            if self.record is not None:
+                self.record[kw["name"]] = t
+            return t
+
+        def new(*args, **kw):
+            kw["name"] = self.tag + kw["name"]
+            return old_new(*args, **kw)
+
+        def new_buf(entry):
+            # A SCRATCH buffer's name comes from a literal in a layer method (_scratch), not from a tensor, so without
+            # this the two sublayers' scratch collide: build_bufs resolves a buf.N by NAME, so "hc_ssq" of the
+            # attention's post and of the MoE's post became ONE 16-byte buffer, and each post's poll of the other's
+            # sums of squares found it already valid (measured at L1: the MoE's norm used the attention's ssq, x_out
+            # 1 ulp off on 3 of 4 parts, and L2's indexer diverged behind it). FINDINGS 12.52.
+            if entry.get("kind") == "scratch" and "name" in entry and not entry["name"].startswith(self.tag):
+                entry = dict(entry, name=self.tag + entry["name"])
+            return old_buf(entry)
+
+        mpk.attach_input, mpk.new_tensor, mpk._new_buf = attach, new, new_buf
+        return self
+
+    def __exit__(self, *exc):
+        self.mpk.attach_input, self.mpk.new_tensor, self.mpk._new_buf = self.old
+        return False
+
+
+class StaticFusedLayer:
+    """One layer's attention and its MoE in ONE static megakernel (FINDINGS 12.50): 40 launches a step instead of 80.
+
+    Built from the two layers the chain already built. Their `w` dicts are this kernel's tensors -- the fused kernel
+    reads and writes the same buffers, so its output is comparable to the two kernels' with no copy, and the KV caches
+    the harness fills are the ones it reads -- and their own verified schedules are the plan: a synthesized plan does
+    not compile, because each task's grid is coupled to its split (act_quant's NC = K / grid.y) and the task checks
+    that itself.
+
+    The mHC post is one per layer, not one per sublayer: the attention's post writes x_out, and the MoE's act_quant
+    reads that tensor with a real dependency edge (PRODUCER_ALIAS + build_graph's bind=, not an attach_input stub).
+    Every value is bit-identical to the two kernels' (FINDINGS 12.50, 5 consecutive launches on four layer variants).
+    """
+
+    def __init__(self, sa: StaticAttn, sm: StaticMoE, exchange_pool: ExchangePool, tp: int, rank: int, dev,
+                 out_root: str = None):
+        import copy
+        import re
+        from mirage.mpk import compiler
+        from mirage.mpk.static_schedule import generate_code
+        self.layer, self.pdl, self.steps, self.binds, self.absent = sa.layer, sa.pdl, 0, {}, set()
+        self.sa, self.sm, self.T = sa, sm, T
+        assert not XFLAG, "DSV41_X_FLAG: the fused layer's MoE reads the attention's x through a graph edge, not a flag"
+        sms = torch.cuda.get_device_properties(dev).multi_processor_count - int(os.environ.get("STATIC_FREE_SMS_ATTN", 0))
+        mpk = fused_megakernel(num_gpus=tp, num_sms=sms)
+        mpk._floor("bufs", 96)            # the two sublayers' slots together (config.cuh's 24 is one sublayer's)
+        mpk._floor("maps", 96)            # (config.cuh's 32 is one sublayer's)
+        mpk._floor("counter_lines", 48)   # (config.cuh's 16 is one sublayer's)
+        mpk.moe_rows_poll = "-DMOE_ROWS_POLL" in sm.flags
+        captured = {}
+        # the attention's graph, with the flags its own build chose (IS_TCGEN05, I1C_*, SA_DRY): the fused layer must run
+        # the same arithmetic, and a flag that changes a task body changes the bits
+        sa_dry = os.environ.get("SA_DRY")
+        if os.environ.get("DSV41_SA_DRY_IDX", "0") != "0" and sa.variant in ("full_r2", "full_r1", "reindex"):
+            os.environ["SA_DRY"] = "1"
+        os.environ["HC_DRY"] = os.environ.get("HC_DRY_ATTN", "0")
+        try:
+            with _Scoped(mpk, "a.", captured):
+                attn_demo.build_graph(mpk, sa.w, sa.variant, sa.ratio, sa.csrc, 64 // tp)
+        finally:
+            if sa_dry is None:
+                os.environ.pop("SA_DRY", None)
+            else:
+                os.environ["SA_DRY"] = sa_dry
+        # The attention's post writes x_out and streams_out through buffer slots, so nothing in its own graph depends on
+        # them (the next layer's KERNEL reads them). The MoE reads BOTH: its x is the post's x_out, and its residual is
+        # the attention's streams_out -- the same two tensors the two-kernel chain passes (e2e's _sublayer: R = aR
+        # before mi.run). Both must be the graph's tensors, not stubs: producer_of then finds the post node and the MoE's
+        # front waits for it. (An alias only for x_out leaves the MoE reading the caller's stale residual: measured, L0's
+        # post came out 71% different while the attention's was identical.)
+        x_out, a_streams = captured["a.x_out"], captured["a.streams_out"]
+        compiler.PRODUCER_ALIAS[x_out.guid] = a_streams.guid
+        # the MoE's graph, its x and residual bound to those tensors
+        os.environ["HC_DRY"] = os.environ.get("HC_DRY_MOE", "1")
+        mpk.max_bufs = 96                 # (dsv41_mhc_nodes lowered it to the slots in use: the second sublayer needs it back)
+        with _Scoped(mpk, "m.", captured):
+            moe_demo.build_graph(mpk, sm.w, bind=lambda k, t: x_out if k == "x" else (a_streams if k == "streams" else None))
+        # PRODUCER_ALIAS stays until this layer is compiled: the compiler resolves each node's producers then
+        # (compiler.gpu_tasks), so clearing it here leaves the MoE's act_quant reading x_out with no producer -- no
+        # counter wait, and it takes whatever the previous launch left (measured: that task's dependency list came out
+        # empty). moe_demo.build clears it after compile_static, for the same reason.
+        for k in ("bufs", "maps", "counter_lines"):
+            mpk.__dict__.pop("_floor_" + k, None)
+        mpk.max_bufs, mpk.max_maps = len(mpk._bufs), len(mpk._maps)
+        mpk.max_counter_lines = mpk._counter_lines   # (a fused graph's 34th counter would write past config.cuh's 16)
+        nodes = compiler.graph_nodes(mpk)
+        # ---- the plan: the two sublayers' OWN verified schedules, concatenated per SM -----------------------------
+        merged, per_sm = {}, [[] for _ in range(sms)]
+        for tag, out in (("a.", sa.out), ("m.", sm.out)):
+            d = json.load(open(os.path.join(out, "schedules", "schedule_gpu0.json")))
+            sub = sorted((int(k), v["name"]) for k, v in d["nodes"].items())
+            fused = [n.graph_idx for n in nodes if compiler.tname(mpk, n.outputs[0]).startswith(tag)]
+            assert [nm for _, nm in sub] == [n.name for n in nodes if n.graph_idx in fused], \
+                f"{tag}: the fused graph's nodes are not the built layer's (order differs)"
+            nid = dict(zip([i for i, _ in sub], fused))
+            for i, nm in sub:
+                merged[nid[i]] = tuple(d["nodes"][str(i)]["grid"])
+            for sm_, q in enumerate(d["worker_task_queues"]):
+                per_sm[sm_] += [(nid[d["all_tasks"][t]["node"]], tuple(d["all_tasks"][t]["pos"])) for t in q]
+        plan = {"grids": merged, "lists": [copy.deepcopy(per_sm) for _ in range(tp)]}
+        # each rank its own directory: 8 nvcc runs in one directory clobber each other
+        self.out = os.path.join(out_root or os.path.dirname(os.path.dirname(sa.out)), f"rank{rank}", f"fused{self.layer}")
+        os.makedirs(self.out, exist_ok=True)
+        paths, self.info = compiler.compile_plan(mpk, plan, os.path.join(self.out, "schedules"), validate_grids=False)
+        # ---- the buffers, from the kernel's OWN declaration --------------------------------------------------------
+        # The generated layer.cu names every buffer of every GPU ("buf.N", "<kind> <name> <bytes> <reset> <by_reader>").
+        # A fused graph gets two buffer slots under one tensor name more readily than one sublayer does (a GEMM's
+        # K-parts slot and its [T, N] view), so a name-keyed dict built from the nodes can hand the kernel a buffer of
+        # the wrong size -- and its init memsets that size into it. The declaration is what the kernel will do.
+        os.makedirs(os.path.join(self.out, "build"), exist_ok=True)
+        cu = os.path.join(self.out, "build", "layer.cu")
+        with open(cu, "w") as f:
+            f.write(generate_code(mpk, [json.load(open(p)) for p in paths], False))
+        decl, kinds = {}, {}
+        fill = {}                     # the declaration's reset BYTE: what the harness memsets into a new buffer
+        for m in re.finditer(r'"buf\.\d+", "(out|tensor|exchange|scratch) ([^" ]+) (\d+) (-?\d+)', open(cu).read()):
+            kinds[m.group(2)] = m.group(1)
+            decl[m.group(2)] = max(decl.get(m.group(2), 0), int(m.group(3)))
+            fill[m.group(2)] = max(int(m.group(4)), -1)   # (0xFF where a polled sentinel is expected)
+        self.w = {**{f"a.{k}": v for k, v in sa.w.items()}, **{f"m.{k}": v for k, v in sm.w.items()}}
+        # The two layers' own NODE buffers too, by their own names: the fused kernel must write where the harness reads.
+        # e2e's Engram re-derivation (eg_next_x) reads the MoE's hc_coef through sm.bufs -- a node output, not a w
+        # tensor -- so a fresh buffer of the fused kernel's own would leave the host reading the two-kernel kernel's
+        # stale value (measured: L0's x_out identical, L1 on 15% different). Same tensor, same bytes: the two chains
+        # then write the same memory.
+        named = {**{f"a.{k}": v for k, v in (sa.bufs[0] or {}).items()},
+                 **{f"m.{k}": v for k, v in (sm.bufs[0] or {}).items()}}
+        for nm, t in named.items():
+            if nm not in self.w and torch.is_tensor(t):
+                self.w[nm] = t
+        nb = lambda t: t.numel() * t.element_size()
+        fresh = {}
+        for nm, nbytes in decl.items():
+            if kinds[nm] == "tensor":     # read by pointer: must be the graph's tensor (the kernel ignores the size)
+                assert nm in self.w, f"fused L{self.layer}: graph tensor {nm} is not one of the two layers'"
+                continue
+            if nm in self.w and nb(self.w[nm]) == nbytes:
+                continue                  # a node's output that the two layers read: the same buffer, same bytes
+            # THE FILL BYTE IS PART OF THE KERNEL'S CONTRACT: a polled scratch (hc_ssq, the GEMM K-parts rings) is
+            # "not written yet" only while its bytes are 0xFF, and a reader that finds 0x00 accepts it at once. A
+            # zeroed fresh buffer therefore feeds a PARTIAL sum of squares (measured at L1: the MoE's post normalised
+            # with a 1-ulp-different rsqrt, parts 1..3 of 4, x_out 88% equal, and L2 diverged behind it). The
+            # declaration's own reset byte is what the two-kernel fills use -- use it here too.
+            fresh[nm] = (torch.full((nbytes,), fill[nm], dtype=torch.uint8, device=dev) if fill.get(nm, 0) > 0
+                         else torch.zeros(nbytes, dtype=torch.uint8, device=dev))
+        missing = sorted(set(decl) - set(self.w) - set(fresh))
+        assert not missing, f"fused L{self.layer}: buffers the declaration names but nothing provides: {missing}"
+        self.bufs = [fresh]
+        self.fresh_names = sorted(fresh)
+        if os.environ.get("DSV41_FUSE_LOG"):
+            print(f"[fuse] L{self.layer}: {len(decl)} buffers; FRESH (not the two layers'): {sorted(fresh)}", flush=True)
+        # ---- compile and load ------------------------------------------------------------------------------------
+        flags = ["-DSTATIC_RESET_IN_KERNEL"] + os.environ.get("DSV41_STATIC_FLAGS", "").split()
+        tpb_flag(flags, tp, self.pdl, f"the fused L{self.layer} build")
+        for extra in sa.flags + sm.flags:      # the sublayers' own graph-selecting flags, once each
+            if extra not in flags and not extra.startswith("-DSTATIC_PDL_TRIGGER"):
+                flags.append(extra)
+        # the MoE's mHC reads its residual from the attention's post in this same kernel: hc_coef's sum of squares must
+        # run after the mixes' poll (tasks/hc_coef.cuh HC_RES_LATE), and the GEMM in front of it needs the fence the
+        # head's build uses (its TMA reads of the post's generic stores)
+        flags += ["-DHC_RES_LATE", "-DGEMM_ACT_PROXY_FENCE"]
+        self.flags = flags
+        self.sk = mpk.compile_static(paths, gpu_tensors=[{**self.w, **fresh}], out_dir=os.path.join(self.out, "build"),
+                                     extra_flags=flags, device=dev.index, rank=rank,
+                                     exchange=exchange_pool.take(mpk.exchange_region_bytes()))
+        compiler.PRODUCER_ALIAS.pop(x_out.guid, None)   # (compiled: the alias was for the compiler's dependency pass)
+        torch.cuda.synchronize(dev)
+        try:
+            self.sk.rebind("@prime", 0)        # (the same one-shot re-arm the layers get: before the caches are filled)
+            self.primed = True
+        except KeyError:
+            self.primed = False
+        self.enabled = True
+
+    # ---- the launch, the same shape as StaticAttn.run / StaticMoE.run ---------------------------------------------
+
+    def _rb(self, name: str, ptr: int) -> None:
+        """Rebind one of the fused kernel's graph tensors (the sublayer's name, prefixed). A name this graph does not
+        read is remembered, not retried (the demo reads a tensor conditionally: e.g. eg_emb only with rows)."""
+        if name in self.absent or self.binds.get(name) == ptr:
+            return
+        try:
+            self.sk.rebind(name, ptr)
+        except KeyError:
+            self.absent.add(name)
+            return
+        self.binds[name] = ptr
+
+    def run(self, x: torch.Tensor, positions: torch.Tensor = None, R: torch.Tensor = None, emb: torch.Tensor = None,
+            ids: torch.Tensor = None) -> torch.Tensor:
+        """One decode step of this layer in one launch: the attention, then its MoE (which also runs the Engram node or
+        the head when the layer has one). Returns the next sublayer's x [T, HID] bf16."""
+        sa, sm = self.sa, self.sm
+        self.rows = n = x.shape[0]
+        ok = x.is_contiguous() and x.dtype == torch.bfloat16 and x.shape[1:] == (HID,) and \
+            (n == T or (0 < n < T and backed(x, T)))
+        if not ok:
+            sa.w["x"][:n].copy_(x)
+        self._rb("a.x", x.data_ptr() if ok else sa.w["x"].data_ptr())
+        if positions is not None and not getattr(sa, "tables_shared", False):
+            # (DSV41_E2E_SHARE_TABLES) one table set for every layer, filled once in step(): the kernel was built and
+            # rebound on that tensor, so there is nothing to copy here -- StaticAttn.run's own branch
+            sa.w["positions"].copy_(positions.view(-1))
+            attn_demo.window_tables(sa.w)
+        if sa.w.get("positions") is not None:
+            self._rb("a.positions", sa.w["positions"].data_ptr())
+        if R is not None:
+            assert R.is_contiguous() and R.dtype == torch.bfloat16 and R.shape[1:] == (HC, HID) and 0 < R.shape[0] <= T
+            ptr = R.data_ptr() if (R.shape[0] == T or backed(R, T)) else None
+            if ptr is None:
+                sa.w["streams"].view(T, HC, HID)[:R.shape[0]].copy_(R)
+                ptr = sa.w["streams"].data_ptr()
+            # the ATTENTION's residual only: the MoE's is the attention's own streams_out, a graph edge (see __init__),
+            # so there is no "m.streams" to rebind
+            self._rb("a.streams", ptr)
+        if emb is not None:                # (Engram) the next layer's n-gram rows, the MoE's gather wrote them
+            self.eg_emb_ref = emb
+            self._rb("m.eg_emb", emb.data_ptr())
+            self._rb("a.eg_emb", emb.data_ptr())
+        if ids is not None:                # (DSV41_EG_ROWS=1) the Engram layer's hash ids
+            self.eg_ids_ref = ids
+            self._rb("a.eg_ids", ids.data_ptr())
+            self._rb("m.eg_ids", ids.data_ptr())
+        _launch(self)
+        self.steps += 1
+        return sm.w["x_out"][:n] if "x_out" in sm.w else sm.w["y"][:n]
+
+    def out_streams(self) -> torch.Tensor:
+        """The residual the next sublayer reads (R'' when this layer hosts the Engram, R' otherwise)."""
+        w = self.sm.w
+        return w["streams_eg"] if "streams_eg" in w else w["streams_out"]
 
 
 class StaticHead:
