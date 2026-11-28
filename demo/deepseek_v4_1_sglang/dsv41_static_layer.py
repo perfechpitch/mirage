@@ -442,6 +442,26 @@ class StepTables:
             pages[:, :m].copy_(e[:, :m])
 
 
+def _launch(layer) -> None:
+    """One sublayer's launch, for every class (StaticAttn, StaticMoE, StaticHead).
+
+    A serving build (-DSTATIC_RESET_IN_KERNEL) queues the launch on the caller's stream; the kernels keep the ranks
+    together through core.cuh's TP start barrier. A host-reset build (DSV41_STATIC_SERVING=0) has no launch_stream at
+    all: it memsets its buffers from the host before each launch and then waits, which is the "TPB=0 + a host barrier
+    per sublayer" configuration FINDINGS 8.1 records as the finite baseline -- e2e_decode's _sync() then supplies the
+    barrier. Which one is in use is read from the build (layout()["serving"]), never from the environment, so a flag
+    and an env var that disagree cannot dispatch the wrong way.
+    """
+    sk = layer.sk
+    if not hasattr(layer, "_serving"):
+        layer._serving = bool(sk.layout().get("serving"))
+    if layer._serving:
+        sk.launch_stream(torch.cuda.current_stream().cuda_stream, layer.pdl)
+        return
+    sk.launch()
+    sk.wait()
+
+
 def tpb_flag(flags: list, tp: int, pdl: bool, what: str) -> None:
     """-DSTATIC_TP_BARRIER into a serving build's flags, or a failure if the build cannot honour it.
 
@@ -578,7 +598,8 @@ class StaticAttn(MhcMixin):
 
     def _launch(self):
         self._own()
-        self.sk.launch_stream(torch.cuda.current_stream().cuda_stream, self.pdl)
+        _launch(self)
+
 
     def bind_pools(self, pool):
         """The caches are SGLang's: its pools' rows have the kernels' bytes and stride (the module comment)."""
@@ -801,7 +822,7 @@ class StaticMoE(MhcMixin):
             if self.binds.get("eg_emb") != emb.data_ptr():
                 self._rb("eg_emb", emb.data_ptr())
         self._own()
-        self.sk.launch_stream(torch.cuda.current_stream().cuda_stream, self.pdl)
+        _launch(self)
         self.steps += 1
         return self.w["y"][:self.rows]
 
@@ -860,6 +881,6 @@ class StaticHead:
         assert out.is_contiguous() and out.dtype == torch.float32 and tuple(out.shape) == tuple(self.w["logits"].shape)
         self._bind("x", x)
         self._bind("logits", out)
-        self.sk.launch_stream(torch.cuda.current_stream().cuda_stream, self.pdl)
+        _launch(self)
         self.steps += 1
         return out

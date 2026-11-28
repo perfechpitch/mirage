@@ -105,6 +105,10 @@ MHC = os.environ.get("DSV41_E2E_MHC", "1") != "0"   # 0 is a diagnosis only: the
 # layer: DSV41_E2E_NOSYNC=1 reproduces it on purpose.
 TPB = os.environ.get("DSV41_STATIC_TPB", "1") != "0"
 NOSYNC = os.environ.get("DSV41_E2E_NOSYNC", "0") != "0"
+# The in-kernel TP barrier is meant to make the host barrier unnecessary. This forces BOTH, on a build that has the
+# in-kernel one: clean -> the exchange protocol and the resets are sound and the in-kernel barrier alone is what fails;
+# still NaN -> the defect is not the barrier's reach (see FINDINGS 12.42.4).
+FORCE_BAR = os.environ.get("DSV41_E2E_FORCE_BARRIER", "0") != "0"
 assert T == int(os.environ["STATIC_TOKENS"])
 cfg = Lm.attn_weights.model_config(a.checkpoint)
 variants = [Lm.attn_weights.variant_of(cfg, L) for L in range(40)]
@@ -257,7 +261,7 @@ def _sync():
     # CTAs never end). The barrier is what launch_func does host-side for a one-process run.
     # With -DSTATIC_TP_BARRIER the kernel does this itself (core.cuh kernel_begin, before the resets), so the host
     # round trip is only paid when the build has no kernel barrier -- the timed path stays pure otherwise.
-    if NOSYNC or TPB:
+    if NOSYNC or (TPB and not FORCE_BAR):
         return
     dist.barrier()
 
@@ -337,6 +341,18 @@ if RANK == 0:
                 log(f"  same bits elsewhere in the tensor: {cnt}")
         # The shared tensors: a `reuse` layer reads the source layer's compress_cache/compress_idx by reference, so a
         # reset protocol that fires in the source's launch is visible here. 0xFF is the not-written-yet sentinel.
+        # WHICH BUFFER first went non-finite: x_out is the last thing the kernel writes, so a NaN there says nothing
+        # about where it started. Every other float tensor this sublayer (and the one before it) wrote is checked, so
+        # the first bad value names the node instead of leaving it to inference.
+        for L in (max(0, (idx or 0) - 1), idx or 0):
+            src = attn if L < (idx or 0) else (attn if who == "attn" else moe)
+            lay2 = src[L]
+            for nm2, t2 in (lay2.w or {}).items():
+                if not torch.is_tensor(t2) or t2.numel() == 0 or not t2.is_floating_point():
+                    continue
+                nf = int((~torch.isfinite(t2.detach().flatten())).sum())
+                if nf:
+                    log(f"  {type(lay2).__name__} L{L}.{nm2} {tuple(t2.shape)} {t2.dtype}: {nf}/{t2.numel()} not finite")
         for nm in ("compress_cache", "compress_idx", "candidates", "index_k"):
             for L in (max(0, (idx or 0) - 1), idx or 0):
                 tt = (attn[L].w or {}).get(nm) if L < len(attn) else None
