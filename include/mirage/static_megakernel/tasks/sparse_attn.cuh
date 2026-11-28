@@ -958,6 +958,17 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
           rs[4 * r + 2] = __fadd_rn(sr, expf(__fsub_rn(snk, mr))); // the last
                                                                    // pair's
         }
+#ifdef DSV41_SA_NANDBG
+        // Diagnosis only: say why the sum blew up. mr still -1e30 after the pairs = every block was skipped
+        // (window li < lo, compressed id -1); sum0 0 with mr finite = the exp() underflowed. S0/S7 are the raw
+        // logits of this thread's first 8 positions (a NaN there says q or K is NaN, not the softmax).
+        if (real && (tid & 15) == 0 && !(sr < 1e30f)) {
+          float const *const sv = ss + r * SA_SLD + base;
+          printf("[sa_nan] t %d g %d r %d p %d lo %d NC %d npair %d split %d: mr %.9g sr %.9g sum0 %.9g "
+                 "sum1 %.9g m1 %.9g m2 %.9g snk %.9g S0 %.9g S7 %.9g\n",
+                 t, g, r, p, lo, NC, npair, SPLIT ? 1 : 0, mr, sr, sum0, sum1, m1, m2, snk, sv[0], sv[7]);
+        }
+#endif
       }
       __syncthreads();
       if (real && pr == 0) {
@@ -1086,6 +1097,18 @@ __device__ SA_TASK_INLINE void sparse_attn_task(float const *q,
         // the bf16 output: o = O / denominator, the inverse RoPE, written as bf16 -- SGLang's wo_a takes o in bf16
         // (wo_a_fp8_gemm_enabled: a checkpoint whose scale layout is not 128 x 128 dequantizes wo_a to bf16 at load, so
         // no act_quant of o happens there). The values are the same as the quantized path's input, bit for bit.
+#ifdef DSV41_SA_NANDBG
+        if (real && st && tid < 4) {   // the store's own gate, said out loud: why o_q stays 0xFF is one of these
+          // sink[0] is the layer's fingerprint that does not move with g or tid (attn_sink differs per layer); the
+          // block id says which grid position this store came from, so a short count is attributable.
+          int nqn = 0;
+          for (int k = 0; k < 8; k++) {
+            if (!(fabsf(__bfloat162float(qs[k])) <= 3.4e38f)) nqn++;
+          }
+          printf("[sa_out] s0 %.6g bx %d by %d bz %d tid %d row %d c %d x0 %.6g den %.6g nqn %d\n",
+                 sink[0], (int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z, (int)tid, r, c, x[0], den, nqn);
+        }
+#endif
         if (real && st && r < HL) { // (a tile row past this task's heads: its bytes are not this token's)
           auto p2 = [](float a, float b) {
             return (uint32_t)__bfloat16_as_ushort(__float2bfloat16(a)) |

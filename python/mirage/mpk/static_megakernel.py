@@ -194,6 +194,23 @@ class StaticMegakernel(PersistentKernel):
     def _new_buf(self, entry: dict) -> int:
         mb = getattr(self, "max_bufs", MAX_BUFS)   # a graph may raise it (the generated layer then defines STATIC_MAX_BUFS)
         assert len(self._bufs) < mb, f"more than {mb} buffer slots (StaticMegakernel.max_bufs, config.cuh MAX_BUFS)"
+        if "fill" in entry:
+            # A reader-re-armed fill ("by_reader", the reader writes the 0xFF back for the next launch) is emitted as a
+            # kernel-reset one: config.cuh REARM is off because its one-reader assumption is not enforceable (the split
+            # combine, the q slots and mHC all have several consumers, and a re-arm that lands during another reader's
+            # load turns its input into NaN). kernel_begin then fills the buffer before the start barrier, which is the
+            # semantics the host-reset build was validated with -- same bytes, one memset per launch, no host work.
+            f = entry["fill"]
+
+            def _fill(n, f=f, kind=entry.get("kind")):
+                nbytes, value, reader = f(n)
+                # Only the scratch buffers (sparse_attn's split partials: every split task reads the other shares' and
+                # re-arms them -- several readers, which REARM's one-reader contract forbids). Output slots keep it: the
+                # exchange ones must (a local kernel_begin fill would wipe a peer's already-landed contribution), and
+                # the "out" slots measured no corruption with it.
+                return (nbytes, value, reader if kind != "scratch" else False)
+
+            entry = dict(entry, fill=_fill)
         self._bufs.append(entry)
         return len(self._bufs) - 1
 

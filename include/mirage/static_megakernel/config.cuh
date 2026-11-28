@@ -138,7 +138,19 @@ constexpr int STAMP_START = 0, STAMP_TASK0 = 1, STAMP_TASK1 = 2, STAMP_END = 3,
 // kernel_begin resets this GPU's other buffers. Off: the host resets all before
 // a launch
 #ifdef STATIC_RESET_IN_KERNEL
+// REARM (the reader re-arms its own 0xFF-polled slots for the next launch) assumes each such buffer has EXACTLY ONE
+// reader in the launch. That is not enforceable: sparse_attn's split combine has every task read the other NS - 1
+// shares' partials (and re-arm them), the q slots are read by all NS tasks, and mHC/hc and the exchange have several
+// consumers as well. A re-arm that lands while another consumer is still reading turns its input into NaN (0xFF) --
+// measured: STATIC_RESET_IN_KERNEL with REARM off keeps the same launch finite end to end, with it on attn L3 (the
+// first Reuse layer) is NaN over all 8192 bytes of o_q. So the default is the semantics the host-reset build has
+// been validated with: kernel_begin resets every such buffer before the start barrier, once per launch.
+// STATIC_REARM opts the old protocol back in (single-reader graphs only).
+#if defined(STATIC_REARM)
 constexpr bool REARM = true;
+#else
+constexpr bool REARM = false;
+#endif
 #else
 constexpr bool REARM = false;
 #endif

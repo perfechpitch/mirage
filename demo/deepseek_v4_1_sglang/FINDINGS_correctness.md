@@ -2775,3 +2775,264 @@ python full_decode.py ... --probe --profile-build --steps 0
 # 正向对照（§8.1 缺的那一格）
 DSV41_STATIC_TPB=1 DSV41_E2E_LAYERS=6 torchrun --nproc_per_node=8 e2e_decode.py ...
 ```
+
+## 12.43 服务形态 `attn L3` 的 NaN 结案：`sparse_attn` split 组合的 partial 违反单读者契约（2026-11-28）
+
+§12.42.5 第 1 条（"先修服务形态的链"）已修。根因不是 KV、不是 attention 算术、也不是 `wo_a`，而是
+**`REARM`（读者把 0xFF sentinel 写回去给下一次 launch）的单读者假设在 split 组合里不成立**。
+
+### 12.43.1 先排掉的（都是可复现的否证，不是推断）
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| KV cache 被 0xFF 污染 | `DSV41_E2E_ZERO_KV=1`（`compress_cache`/`index_k`/`window_cache` 的值与 scale 全清零） | L3 仍 NaN → 否证 |
+| `wo_a` GEMM 少算/漏算 | 指针普查：`o_q`(0x…6000) 与 `wo_a_part`(0x…8000) 相邻但**不重叠**，全层无地址别名 | 否证（此前的"别名覆盖"猜测不成立） |
+| `o_q` 被重置成 0xFF | 生成代码声明表：`buf.31 out o_q 8192 reset -1 reader 0` → 既不被 kernel 重置也不被读者 re-arm | 否证 |
+| in-kernel memset 本身 | **`REARM` 关掉、in-kernel reset 保留**（`-DSTATIC_NO_REARM`） | `all 4 attn + 4 moe x_out finite` → memset 无辜 |
+
+关键观测：L3 launch 结束后 `o_q` 是 **8192/8192 字节全 0xFF**（bf16 全 `0xFFFF`，即 -NaN），
+而 L2 只有 11 字节。`o_q` 没有任何重置路径，所以这是 `sparse_attn` 真的把 NaN 写满了 4096 个值。
+
+### 12.43.2 违反契约的那一处
+
+`sparse_attn` 的 split（`NS = 1 + NC/128 = 5`，`full_r2` 与 `reuse` 都是）里，每个 task `(t,g,s)`
+轮询其余 `NS-1` 个 share 的 O partial，**然后各自把读过的那些 re-arm 回 0xFF**
+（`sparse_attn.cuh:1430-1443`；q 的那份在 1445-1453 同理）。于是一个 `sparse_attn_part` 槽位有
+**5 个读者、5 个写者**共用同一个 0xFF sentinel，`config.cuh` 的 `REARM` 契约（"each byte's ONE reader
+re-arms it"）被违反：某个 task 的 re-arm 落在另一个 task 还没读完的时候，后者拿到的就是 0xFF → NaN。
+
+这解释了为什么只有 reuse 层必现、full 层（L2）反而不炸：两者模板参数只有 producer 描述符不同
+（`reuse` 无 `ckv_post`/`indexer_topk`），launch 更短、5 个 task 起跑更同步，竞态因此必现而不是偶发。
+`full_decode.py`（host-reset，`REARM` 恒 false）一直干净，与此一致。
+
+### 12.43.3 修法
+
+`REARM` 的语义改为"**kernel_begin 在 start_barrier 之前重置**"——这正是 `full_decode` 已验证过的语义，
+只是把 memset 从 host 搬进 kernel（服务形态仍然一次 launch 跑完，不需要 host 插手）：
+
+- `python/mirage/mpk/static_megakernel.py`：`kind == "scratch"` 的 buffer（即 `sparse_attn_part`）声明成
+  `by_reader=False`，进 kernel 的 reset 列表；
+- `include/mirage/static_megakernel/config.cuh`：`REARM` 默认 false（`STATIC_REARM` 可opt-in回旧协议）；
+- **交换缓冲（`y_sent` 等 `exchange=True`）保持 `by_reader`**：它们的写者是别的 GPU，本地 kernel_begin
+  去填会把 peer 已经落地的贡献抹掉——实测直接挂死（不是 NaN）。
+
+### 12.43.4 验收
+
+- 4 层（`DSV41_E2E_LAYERS=4 DSV41_E2E_ONE=1`）：`all 4 attn + 4 moe x_out finite`
+### 12.43.5 验收结果（全部实测）
+
+| 检查 | 结果 |
+|---|---|
+| 4 层 finiteness | `all 4 attn + 4 moe x_out finite` |
+| 40 层 finiteness | `all 40 attn + 40 moe x_out finite, logits (1, 129280) finite` |
+| L3 的 buffer 普查 | `o_q` 8192/8192 → **7/8192** 字节 0xFF；`wo_a_part` 6144/8192 → **24/8192**（L2 是 19/8192，同量级）|
+| 跨 launch 稳定性 | 4 层 `reps=1` vs `reps=3`：`x_out`/`streams_out` **逐位 100% 相同**（relRMS 0）|
+| 与 host-reset 形态一致 | 4 层 serving vs `DSV41_STATIC_SERVING=0`：`x_out`/`streams_out` **逐位 100% 相同**（relRMS 0）|
+
+最后一条是关键：修法没有改动任何算术，服务形态现在与 `full_decode` 那条已被 §12.40 验证过的路径**逐位一致**，
+所以 §12.40.5 的 0.87x 带与 argmax 343 可以直接继承，不需要重新对 SGLang 建带。
+
+复现：
+```bash
+# 服务形态 vs host-reset 的逐位对比（4 层）
+DSV41_E2E_DUMP_LOGITS=out_s1.pt torchrun --nproc_per_node=8 e2e_decode.py ... --layers 4 --reps 1 --warmup 1
+DSV41_STATIC_SERVING=0 DSV41_E2E_DUMP_LOGITS=out_h1.pt torchrun ... --layers 4 --reps 1 --warmup 1
+```
+
+### 12.43.6 修完之后的第一份可信耗时（serving，position 31906）
+
+`--spans` 的 4 层：median step **1.09 ms**，8 次 launch 的 span 合计 238 us，**host gap 850 us（78%）**；
+`attn3`（reuse）27.7 us 与 `attn1` 22.8 us 同级 —— 修 NaN 没有引入额外代价。
+
+（注意：`--reps 1` 单样本会给出 29.9 ms 这种假数，`--reps 5` 起才有意义。）
+
+40 层（position 31906，`--reps 5 --warmup 2 --spans`，这是修完之后第一份可信的 32K decode 数）：
+
+| 项 | 值 |
+|---|---|
+| median step | **9186.8 us = 9.19 ms**（p10 7902, p90 24076）|
+| 吞吐 | **109 tok/s** |
+| 80 次 launch 的 kernel span 合计 | 3067 us（attention 1606 = 17%，MoE 1461 = 16%）|
+| **launch 之间的 host gap** | **6120 us = 66.6%** |
+
+p90 24 ms 的抖动来自同机共跑的其它训练进程（`nvidia-smi` 上 8 卡恒 100%），不是链本身。
+
+**结论**：32K 下 kernel 真正在算的只有 3.07 ms，**6.12 ms（2/3）花在 80 次 launch 之间的 host 间隙**。
+所以 TPOT 的主攻方向不是内核算术，而是 §12.42.5 第 2 条说的 launch 次数与 host 侧开销：
+(a) 融合 sublayer 把 80 次降下来；(b) 缩短 host 侧的每-launch 固定成本（当前 ~76 us/次）。
+`attn` 最重的 8 个（attn20/24/28/32/36 等 indexer 层，60-85 us）合计才 500 us，即使全砍掉也只有 5% 收益。
+
+## 12.44 TPOT 第一刀：host 侧重复计算 window tables（2026-11-28，9.19 → 5.05 ms，1.82x）
+
+§12.43.6 指出 66% 在 launch 之间的间隙。这一节把它量到底并砍掉。
+
+### 12.44.1 归因（三次否证，最后落在 host 的 Python 上）
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| 间隙是 `dist.barrier()` | 读 `_sync()`：`TPB` 默认 1 | barrier 根本没执行 → 否 |
+| 间隙是 kernel 内的跨 rank 等待 | span 的定义就是"最后一个 SM 过 start barrier"到"最后一个 SM 结束" | 跨 rank 等待已含在 span 内 → 否 |
+| 就是 host 发不出去 | `DSV41_E2E_HOSTT=1` 逐层计时 | **host 6.2 ms / 8.2 ms step = 75%** → 是 |
+
+再细到 per-launch：**attn 135 µs/次，MoE 只有 20 µs/次**，而 attn 的 kernel 只要 40 µs。
+cProfile（`DSV41_E2E_PROFILE=1`）指名：`window_tables` **105 µs/次**，每层调一次。
+
+### 12.44.2 根因
+
+```python
+def window_tables(w: dict):          # demo/deepseek_v4_1_csa2/demo.py:128
+    p, t = w["positions"].long(), torch.arange(T, device=w["positions"].device)
+    w["window_loc"].copy_(t * W + p % W)
+    w["window_rows"].copy_(t[:, None] * W + (p[:, None] - torch.arange(W, device=p.device)) % W)
+```
+
+它是 **positions 的纯函数**，而一个 decode step 里 40 个 attention 层的 positions 完全相同 ——
+同样的 132 个 int32 值被算了 40 遍，每遍 6 个 tiny CUDA op（每次 ~7 µs 的 host dispatch）。
+这是纯 host 开销，不含任何算术：kernel 一侧毫无变化。
+
+### 12.44.3 修法（用框架自己的机制，不改生成代码）
+
+- `StepTables`（`dsv41_static_layer.py:397`）本来就是这个设计："one set for all the attention layers"，
+  只是 e2e 这条路径没用。现在把 `positions` / `window_loc` / `window_rows` 一份共享，
+  逐层用 `StaticAttn._rb()`（`bind_pools` 用的同一机制）重绑到共享 buffer；
+- `run()` 里对 `tables_shared` 的层跳过那次重算（x 的拷贝保留：x 每层不同）；
+- `step()` 每个 step 只调一次 `window_tables`。
+
+开关 `DSV41_E2E_SHARE_TABLES`（默认开）。
+
+### 12.44.4 验收
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| 4 层 step | 1087.7 us | **891.8 us** |
+| 40 层 step（pos 31906）| 9186.8 us | **5051.0 us** |
+| 吞吐 | 109 tok/s | **198 tok/s** |
+| host per step | 6.2 ms（75%）| **1.79 ms（35%）**|
+| attn 的 host 侧 | 135 us/launch | **26 us/launch** |
+| kernel span 合计 | 3067 us | 3073 us（不变，符合预期）|
+
+正确性：
+- 4 层 `x_out` / `streams_out` 与修前 **逐位 100% 相同**（relRMS 0，`/tmp/e2e_share/out_share.pt` vs `/tmp/e2e_fx3/out_s1.pt`）；
+- 40 层 `all 40 attn + 40 moe x_out finite, logits (1, 129280) finite`，**argmax 343 = golden**（§12.40 的验收标准）。
+
+### 12.44.5 顺带修掉的工程坑
+
+`MIRAGE_STATIC_BUILD_CACHE` 之前没设，导致每次跑都把同一批层重编译 **640 次**（8 rank × 80 层，无共享），
+单次运行要等 9 分钟。现在统一用 `/opt/dlami/nvme/saboxu/static_cache`：同一层只编一次，其余 rank 命中缓存。
+
+### 12.44.6 下一刀（剩余 5.05 ms 的构成）
+
+- kernel span 3073 µs（61%）：attention 1609 + MoE 1465
+- host 1785 µs（35%）：attn 26 µs + MoE 18 µs，每次 launch 的 Python/CUDA 固定成本
+- 结论：**host 已从瓶颈变成次要项，kernel 重新成为主导**。再往下要么走 CUDA graph 抹掉这 ~1.8 ms
+  的 per-launch 成本，要么融合 sublayer 减少 launch 次数（80 次）。
+
+## 12.45 e2e_decode 的 Engram 层是错的（已修）；CUDA graph 逐位正确但**不幂等**（2026-11-28）
+
+这一节有两个结论，第二个是否定的。先说不利观感的那一半容易读错的地方：**§12.40 那条 logits 0.87x 是
+`full_decode` 的链，不是 `e2e_decode` 的**。e2e 的链当时是 1.35x，带外。审这一节的时候不要把它们混起来。
+
+### 12.45.1 缺陷：Engram 层只换了 x，没换 R
+
+`engram_gate` 会把一层残差**整体替换**（§12.31）。所以 layer L 的 attention 读的是 R''（kernel 的
+`streams_eg`），不是 R'（`streams_out`）。`full_decode.py` 两处都做了：
+
+    Rs = [wg["streams_eg"] if "streams_eg" in wg else wg["streams_out"] for wg in wsm]   # :498
+    ws[r]["x"][:1].copy_(eg_next_x(src[r]["streams_eg"], L, devs[r])[None])              # :731
+
+`e2e_decode` 只做了第二件（host 重算 x），**第一件一直用 `streams_out`**。后果是确定的、不是噪声：
+
+| 层 | e2e vs 参考 | chain_ok vs 参考 | 判定 |
+|---|---|---|---|
+| L0 | 2.647e-03 | 2.647e-03 | 逐位相同（L0 无 Engram） |
+| L1（第一个 Engram 层的 attention） | **5.594e-01** | 9.186e-03 | e2e 差 60 倍 → 错的是 e2e |
+| L1 的 moe | **5.413e-01** | 1.394e-02 | 同上 |
+
+修法一行（`e2e_decode.py`，`moe[i].run` 之后）：
+
+    R = (moe[i].w["streams_eg"] if "streams_eg" in moe[i].w else moe[i].w["streams_out"]).view(T, HC, HID)
+
+修后**L0–L19 与 `chain_ok` 逐位相同（relRMS = 0）**。L20 起有 4e-3–8e-2 的差，那是两条链在混沌区的合法散布，
+不是缺陷：L20–L39 上 e2e 反而比 chain_ok 更贴近参考（0.87–0.95x，见 §12.45.3）。
+
+### 12.45.2 e2e 自己是可重复的（这条要单独验证，否则上面的对比没有意义）
+
+同一配置两次独立启动（`/tmp/e2e_chain2`、`/tmp/e2e_chain3`）：**160 个 `x_out`/`streams_out` 全部逐位相同，
+logits 逐位相同**。所以 §12.45.1 的差异是两条链的差，不是同一条链的抖。
+
+### 12.45.3 层级别：修后与已验证的链**评分完全相同**
+
+`cmp_band.py`（3 次参考自建带，`--slack 1.5`），只取两边都有的 77 行（apost + mpost）：
+
+    chain        inside   最差有限比率
+    chain_ok     64/77    3.62（L2 apost）
+    e2e（修后）  64/77    3.62（L2 apost）
+
+**逐行一致到最差那行都相同**，所以 e2e 现在与 `chain_ok` 在层级别等价；`e2e_chain` 的 64/77 与
+`chain_ok` 的 101/117 不是同一分母（e2e 的 dump 没有 `_apost_x` 那份记录），不要拿来互相比较。
+
+logits：修前 **1.35x（带外）**，修后 **1.12x**，argmax 343，top-3 = [343, 764, 14662] 与参考一致。
+参考的带只有 2 个样本（4.493e-02），由参考自己的第 4/5 名在跳（§12.40.5）可知这条带偏窄，
+所以 1.12x 与 0.87x 是同一个量级的抽样差，不是质量差。
+
+### 12.45.4 CUDA graph：单次 replay 逐位正确，**多次 replay 不是**（否定结论）
+
+`DSV41_E2E_GRAPH=1`：把一步拆成每段一个 graph（在 2 个 Engram 层断开，因为那里的 host 重算需要真同步），
+实测 **4.49 ms / 223 tok/s**（40 层，pos 31906），对比 launch 链的 **5.01 ms / 200 tok/s**。
+
+单次 replay 的等价性是**逐位验证过的**：160 个 `x_out`/`streams_out` + logits 与 launch 链完全相同
+（`/tmp/e2e_graph` vs `/tmp/e2e_chain2`）。但**第 2/3 次 replay 起不再相同**：
+
+    非 graph，13 步          13/13 逐位相同（logits 指纹全同）
+    graph，13 步             第 3 步起漂移，logits 1.12x -> 2.76x
+    graph，4 层             只有最后一层差，且第 2..7 步彼此完全相同
+
+最后一行是关键判据：4 层下**第 2 步之后完全稳定**，说明不是一个累积误差，而是进了**另一个不动点**；
+40 层下「首次漂移出现在第几步」还随 warmup 数变（warmup=3 时第 3 步、warmup=1 时第 2 步），所以这是
+**竞态**，不是 §12.43 那种确定的奇偶错误。
+
+嫌疑集中在 reset 协议里那些**每次 launch 变化**的设备端状态：`core.cuh kernel_begin` 的 `gen`
+（读 `g.gen_ptr`、写 `dbuf_par`）与由它派生的 `rg_set()`（交换区第 n%2 套）。host 逐个 launch 时，
+host 的 ~20 µs 间隔在给 rank 排序；graph 把整段一次提交，排序只剩 kernel 内那个 `>= gen` 的 TP barrier，
+于是各 rank 可以稳定地停在另一个不动点上。
+
+**所以 graph 不进主线**：默认关，代码里与这里都写成"实验性、不幂等，别引用它的数字"。
+要救它，方向是让每次 replay 的 launch 序号归零（显式 `cudaMemsetAsync(gen_ptr, 0)` 每段一次），
+这样每次 replay 与第一次逐位相同；但 `gen_ptr` 在模块内部（`g_st[0]`），Python 侧够不到，需要加一个导出。
+
+### 12.45.5 剩下的 5.01 ms 是什么
+
+    kernel span 合计   3076 µs（61%）：attention 1609 + MoE 1465
+    核间空隙           1935 µs（39%）：80 次 launch，每次 ~24 µs
+
+graph 只买下 516 µs，说明**空隙不是 host 提交慢**（host 已降到 ~1.0 ms，其中 0.8 ms 是 2 次 Engram 的真
+`cuda.synchronize`，那两次 graph 也装不进去）。空隙是 GPU 侧的：每次 launch 的 prologue + 8 rank 在
+TP barrier 上的会合。要再往下要么做 sublayer 融合（把 80 次 launch 变少），要么让 TP barrier 的会合更便宜；
+**PDL 不能用来填这个空**——它与 TP start barrier 在设计上互斥（`dsv41_static_layer.tpb_flag` 里是硬断言：
+barrier 的正确性前提就是 stream 串行）。
+
+### 12.45.6 验收
+
+| 项 | 值 |
+|---|---|
+| 40 层干净基线（instrumentation 全关） | **5.01 ms / 200 tok/s** |
+| 层级别证书（vs chain_ok，同一 77 行） | **64/77 逐行相同，最差 3.62** |
+| L0–L19 vs chain_ok | **逐位相同（relRMS 0）** |
+| logits | 1.12x（2 样本带），argmax **343** |
+| e2e 自身重复性 | 160/160 逐位相同，logits 逐位相同 |
+| CUDA graph | 4.49 ms，单次逐位正确，**多次 replay 不幂等 → 不进主线** |
+
+### 12.45.7 `step()` 的重构是逐位中性的（否则上面所有数字都不可信）
+
+为了做 graph，`step()` 被拆成 `_sublayer(i)`（纯发射）+ `_segments()` + `capture_graph()`。这条重构必须证明
+它没有动算术，判据是：**重构后的非 graph 链，与重构前那条 40 层链逐位相同**（`/tmp/e2e_refac` vs
+`/tmp/e2e_chain2`）：
+
+    160 个 x_out / streams_out            0 个不同
+    logits                                逐位相同
+    argmax                                343
+    层级别证书（cmp_band，同一 77 行）      64/77，最差 3.62（与重构前逐行相同）
+    40 层 step                            5.01 ms -> 4.99 ms（200 tok/s，在抖动内）
+
+`DSV41_E2E_SIG`（默认关）保留在树里：它每一步对每层的输出做一次 bit 指纹，是"这一步和上一步是不是同一个
+计算"的唯一便宜判据——§12.45.4 靠它定位到 `attn3.x_out`。

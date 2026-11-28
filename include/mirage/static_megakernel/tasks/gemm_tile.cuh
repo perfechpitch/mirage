@@ -239,6 +239,14 @@ __device__ __forceinline__ void run_gemm_tile(
   }
   constexpr int pieces = K / 128 / SELF::y; // K tiles of 128 per task
   constexpr int ROWS = N / SELF::x;
+#ifdef DSV41_GEMM_DBG
+  // Diagnosis only: which task of which node actually ran. SELF::buf names the node's own buffer slot (the layer
+  // declares them: buf.31 o_q, buf.32 wo_a_part, buf.34 wo_b_part ...), so a census is attributable.
+  if (threadIdx.x == 0) {
+    printf("[gemm_task] buf %d N %d K %d x %d y %d sx %d sy %d rows %d pieces %d bx %d\n", (int)SELF::buf, N, K,
+           tk.x, tk.y, (int)SELF::x, (int)SELF::y, ROWS, pieces, (int)blockIdx.x);
+  }
+#endif
   static_assert(ROWS * SELF::x == N && (ROWS == 128 || ROWS == 64),
                 "128 or 64 weight rows per task");
   static_assert(mode == COMBINE_SLOTS || mode == COMBINE_ADD ||

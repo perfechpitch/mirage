@@ -641,8 +641,12 @@ class StaticAttn(MhcMixin):
         else:
             assert self.rows == T, "a step of fewer rows: the pools bound (DSV41_STATIC_POOL=1)"
             self.w["x"].copy_(x)
-            self.w["positions"].copy_(positions.view(-1))
-            attn_demo.window_tables(self.w)
+            if not getattr(self, "tables_shared", False):
+                # tables_shared: this step's positions and window tables are ONE set for every attention layer, filled
+                # once by the caller and rebound into each layer (window_tables is a pure function of positions, so a
+                # per-layer call writes the same 132 values 40 times: measured 105 us of host time each).
+                self.w["positions"].copy_(positions.view(-1))
+                attn_demo.window_tables(self.w)
         if R is not None:
             self.bind_streams(R)
         if emb is not None:   # (DSV41_ENGRAM=2) the next layer's n-gram rows, [T, 6144] bf16 (SGLang's gather)
