@@ -87,6 +87,14 @@ positions = torch.full((T,), pos, dtype=torch.int32, device=dev)
 
 # ---- the two layers exactly as the 40-layer chain builds them (their own w dicts, mHC on: the model has hc_mult = 4) ----
 t0 = time.perf_counter()
+# a "reuse"/"reindex" layer reads its KV/top-k from an earlier layer's tensors (Sources): those layers must be built
+# here first, in order, exactly as the 40-layer chain builds them (the group is replaced together)
+warm = {}
+if os.environ.get("FUSE_WARM", "1") != "0":
+    for l in range(L):
+        v = Lm.attn_weights.variant_of(cfg, l)
+        warm[l] = Lm.StaticAttn(l, CK, RANK, WORLD, dev, a.out, pos + 8, sources, False, pool, None,
+                                mhc=True, stats=False, engram_kv=None, weights_from=None)
 sa = Lm.StaticAttn(L, CK, RANK, WORLD, dev, a.out, pos + 8, sources, False, pool, None,
                    mhc=True, stats=False, engram_kv=None, weights_from=None)
 sm = Lm.StaticMoE(L, CK, RANK, WORLD, dev, a.out, False, pool, norm_next=True, mhc=True, stats=False,
