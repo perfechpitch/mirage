@@ -182,6 +182,12 @@ THREADS = 256   # one CTA of 256 threads per SM (runtime.cuh: the warp roles)
 MAX_TASKS_PER_SM = 64   # entries of an SM's task table (config.cuh): its list, then an end entry
 STAGE_SLOT = 1 + THREADS // 32   # timing build, per list entry: start, each warp's end, then 2 stage stamps (KernelLocals::stage_stamps)
 TIME_SLOTS = STAGE_SLOT + 2
+# STATIC_MAPS_PTR: the kernel takes the tensor maps as a POINTER to a device copy instead of `__grid_constant__ Maps` by
+# value. The maps are the launch's parameter block: MAX_MAPS (52 on a fused layer) x 128 B, i.e. 6.6 KB copied into the
+# command buffer on every cudaLaunchKernelEx -- measured 17 us a launch of host time, 53% of the 852 us gap between 40
+# launches (FINDINGS 12.56). A pointer is 8 B; the TMA instructions read the map from global memory instead of the
+# parameter space (both are legal operands of cp.async.bulk.tensor, and the maps are read-only after init).
+MAPS_PTR = os.environ.get("STATIC_MAPS_PTR", "0") != "0"
 
 
 def config_checks(used: List[str], tokens: int = 8, max_bufs: Optional[int] = None,
@@ -358,10 +364,15 @@ def kernel_code(nodes: Dict[str, dict], profile: bool = False) -> List[str]:
                   "asm volatile(\"mov.u64 %0, %%globaltimer;\" : \"=l\"(t)); return t; }",
                   f"#define STATIC_TIME(ti) (static_times + ((size_t)blockIdx.x * (static_mk::MAX_TASKS_PER_SM) + (ti)) * {TIME_SLOTS})"]
     extra = ", unsigned long long *static_times" if profile else ""
-    lines += [f"__global__ void __launch_bounds__({THREADS}, 1) layer_kernel(const __grid_constant__ static_mk::Maps maps, static_mk::G g, "
+    maps_param = "static_mk::Maps const *static_maps" if MAPS_PTR else "const __grid_constant__ static_mk::Maps maps"
+    lines += [f"__global__ void __launch_bounds__({THREADS}, 1) layer_kernel({maps_param}, static_mk::G g, "
               f"StaticTask const *static_tasks{extra}) {{",
-              "  static_mk::KernelLocals L; static_mk::kernel_begin(g, L);",
-              "  StaticTask const *my = static_tasks + blockIdx.x * (static_mk::MAX_TASKS_PER_SM);"]
+              "  static_mk::KernelLocals L; static_mk::kernel_begin(g, L);"]
+    if MAPS_PTR:
+        # (STATIC_MAPS_PTR) the task code below is unchanged: every task takes `Maps const &`, and the maps are in device
+        # memory (static_maps_upload, refreshed on a rebind) instead of in the launch's parameter block.
+        lines.append("  static_mk::Maps const &maps = *static_maps;")
+    lines.append("  StaticTask const *my = static_tasks + blockIdx.x * (static_mk::MAX_TASKS_PER_SM);")
     lines += [f"  bool warm_{idx} = false;   // a task of node {idx} ran on this SM: its code is in the instruction cache"
               for idx, node in sorted(nodes.items(), key=lambda kv: int(kv[0])) if node["dry"]]
     lines += [
@@ -424,7 +435,9 @@ def host_code(pk, schedules: List[dict], profile: bool = False) -> List[str]:
         "@CLUSTER@": str(cluster_size(schedules)),
         "@INIT@": f"static_host_init(g_ctx, std::map<std::string, std::string>{{{args_code}}});",
         "@ARGS@": f"std::map<std::string, std::string>{{{args_code}}}",
-        "@LAUNCH_ARGS@": "static_host::g_gpus[gpu].maps, static_host::g_gpus[gpu].g",
+        "@LAUNCH_ARGS@": "g_st[gpu].maps_dev, static_host::g_gpus[gpu].g" if MAPS_PTR
+                         else "static_host::g_gpus[gpu].maps, static_host::g_gpus[gpu].g",
+        "@MAPS_PTR@": "true" if MAPS_PTR else "false",
         "@THREADS@": str(THREADS), "@SMEM@": "STATIC_SMEM_BYTES",
         "@TASKS@": ", ".join(f"static_tasks_gpu{g}" for g in range(num_gpus)),
         "@MAX_TASKS@": "static_mk::MAX_TASKS_PER_SM",
@@ -470,12 +483,17 @@ HOST_CODE = r"""
   } while (0)
 static StaticTask const *const static_tasks_of[static_mk::GPUS] = {@TASKS@};
 static int const *const static_list_begin[static_mk::GPUS] = {@BEGINS@};
+// (STATIC_MAPS_PTR) the device copy of the maps the kernel reads, per GPU, and its dirty flag: a rebind that changes a
+// tensor map re-uploads it (one 6.6 KB H2D on that GPU's stream, before the next launch -- rebinds are not per step).
+static bool const static_maps_ptr = @MAPS_PTR@;
 struct StaticGpu {
   cudaStream_t stream = nullptr;
   cudaEvent_t start = nullptr;                // recorded right before the kernel (static_elapsed)
   cudaEvent_t end = nullptr;                  // recorded after the kernel (static_wait, static_done, static_elapsed)
   StaticTask *tasks = nullptr;                // the per-SM task table on the GPU
   unsigned long long *times = nullptr;        // timing build: the per-task times
+  static_mk::Maps *maps_dev = nullptr;        // (STATIC_MAPS_PTR) the device copy of the maps
+  bool maps_dirty = false;
 };
 #define STATIC_PROFILE @PROFILE@
 #if STATIC_PROFILE
@@ -488,6 +506,34 @@ static std::vector<StaticGpu> g_st;
 static StaticContext g_ctx;
 static unsigned long long g_launches = 0;
 static int g_dev0 = 0;   // the CUDA device of GPU 0 (set_device_func; GPU g = device g_dev0 + g)
+
+// (STATIC_MAPS_PTR) the maps the kernel reads: one device copy per GPU, uploaded after init and again before the next
+// launch after a rebind (a rebind that changes a tensor map is rare: it is the step's own tensors being handed over).
+static void static_maps_alloc() {
+  if (!static_maps_ptr) return;
+  using namespace static_host;
+  for (size_t g = 0; g < g_st.size(); g++) {
+    ST_CK(cudaSetDevice(g_dev0 + (int)g));
+    ST_CK(cudaMalloc(reinterpret_cast<void **>(&g_st[g].maps_dev), sizeof(static_mk::Maps)));
+    ST_CK(cudaMemcpy(g_st[g].maps_dev, &g_gpus[g].maps, sizeof(static_mk::Maps), cudaMemcpyHostToDevice));
+    g_st[g].maps_dirty = false;
+  }
+}
+static void static_maps_dirty() {
+  if (!static_maps_ptr) return;
+  for (size_t g = 0; g < g_st.size(); g++) g_st[g].maps_dirty = true;
+}
+static void static_maps_flush() {
+  if (!static_maps_ptr) return;
+  using namespace static_host;
+  for (size_t g = 0; g < g_st.size(); g++) {
+    if (!g_st[g].maps_dirty) continue;
+    ST_CK(cudaSetDevice(g_dev0 + (int)g));
+    ST_CK(cudaMemcpyAsync(g_st[g].maps_dev, &g_gpus[g].maps, sizeof(static_mk::Maps), cudaMemcpyHostToDevice,
+                          g_st[g].stream));
+    g_st[g].maps_dirty = false;
+  }
+}
 
 // local GPU g (device g_dev0 + g) running GPU `lists`' task lists: a stream, two events, the kernel's shared memory size, the
 // per-SM task table on the GPU (max_tasks entries per SM: the SM's list, then node = -1); the view the host code gets (its
@@ -539,6 +585,7 @@ static void static_init(std::vector<std::map<std::string, void *>> const &tensor
   g_ctx.gpus.assign(n, StaticGpuView());
   for (int g = 0; g < n; g++) static_setup_gpu(g, g, tensors[g]);
   @INIT@
+  static_maps_alloc();
   static_alloc_times();
 }
 
@@ -557,6 +604,7 @@ static void static_init_rank(int rank, std::map<std::string, void *> const &tens
   g_ctx.gpus.assign(1, StaticGpuView());
   static_setup_gpu(0, rank, tensors);
   static_host_init_rank(g_ctx, @ARGS@, rank, mc, rv, peers);
+  static_maps_alloc();
   static_alloc_times();
 }
 
@@ -566,6 +614,7 @@ static void static_init_rank(int rank, std::map<std::string, void *> const &tens
 // static_host_prelude), then event, kernel, event (the events time the launch as a server sees it: static_elapsed)
 static void static_launch(size_t flush_bytes) {
   int const n = (int)g_st.size();
+  static_maps_flush();   // (STATIC_MAPS_PTR) a rebind since the last launch, on each GPU's own stream
   for (int g = 0; g < n; g++) {
     StaticGpu &s = g_st[g];
     ST_CK(cudaSetDevice(g_dev0 + g));
@@ -605,6 +654,7 @@ static const char *static_launch_stream(cudaStream_t stream, bool pdl) {
   int const gpu = 0;
   StaticGpu &s = g_st[0];
   ST_CK(cudaSetDevice(g_dev0));
+  static_maps_flush();
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(static_mk::NSM);
   cfg.blockDim = dim3(@THREADS@);
@@ -814,6 +864,7 @@ static PyObject *py_rebind(PyObject *self, PyObject *args) {
     PyErr_Format(PyExc_KeyError, "rebind: no buffer slot or tensor map reads graph tensor %s", name);
     return NULL;
   }
+  static_maps_dirty();
   Py_RETURN_NONE;
 }
 static PyObject *py_launch_stream(PyObject *self, PyObject *args) {
