@@ -3323,3 +3323,50 @@ indexer 的打分路径，`act_quant`/`sparse_attn` 的数值不变（`IS_TCGEN0
 **空隙的归属再确认一次**：serve 形态下 `_launch` 只是 `sk.launch_stream(stream, pdl)`（`static_harness.py`），
 没有 host 侧对齐；80 次 launch 的 1.24 ms 空隙（4.32 - 3.08）因此全在 GPU 侧：CTA teardown + 下一次的 grid
 分发 + 6.3 µs 的入口 barrier。所以"减少 launch 数"是唯一的路，融合的纸面收益仍是 ~40 × 17 µs ≈ 680 µs。
+
+### 12.50 融合跑通了：一层 attn+MoE 一个 kernel，**bit-identical**，每层省 14.5 µs
+
+`fused_layer.py`（新文件，torchrun 8 进程、真实权重、mHC 开）在 L8 `full_r2` 上把 attention 和它的 MoE 合成
+一个静态 megakernel 并跑通。12.49 列的四个阻塞点是前提；这一节记的是把它真正跑起来之后剩下的**三个**问题，
+以及实测。
+
+**结构账**（实测打印）：45 slots / 28 maps = attention 一个子层；融合后 **65 slots / 56 maps / 34 nodes /
+716 tasks / 4.8 tasks 每 SM**（表容量 62）。两个 plan 就是两个子层**自己已经验证过的 schedule**
+（`attn8_t1/schedules/schedule_gpu0.json` 与 `moe8_t1/...`），按 SM 拼接、graph_idx 按**顺序**重映射
+（子层的 idx 不是 0..n-1，taps 和 scratch 夹在中间）。
+
+**第一个问题：MoE 的 x 不是图输入。** `act_quant_layer` 只接受"图输入"或"slots GEMM 的 K parts"；mHC 打开时
+MoE 的 x 是 attention 的 `hc_post_combine` 输出（bf16 [T,K] 的普通 store）。它的 p-is-None 分支本来就是**按指针
+读**，所以修法不是新 kernel 能力，而是把条件从"p 为 None"放宽成"不是 slots-GEMM"：依赖边由输入 map 的切片
+（grid 切 token）自动导出，`dry`/`cost_inputs` 只在 slots 路径上。这一条让 MoE 的头节点真的等 attention 的 post。
+
+**第二个问题：缓冲要按 kernel 自己的声明分配。** 融合图里同一个张量名会挂两个 buffer slot（GEMM 的 K parts
+槽 + 它的 [T,N] 视图），按 tensors 名建 `{name: tensor}` 字典就会把 20480 B 的槽指到 5120 B 的张量上，init 的
+`cudaMemset` 直接 `cudaErrorInvalidValue`。现在从生成的 `layer.cu` 里读 `"buf.N", "<kind> <name> <bytes>
+<reset> <by_reader>"` 来分配（这也顺带证明了：融合后每个 `a.*`/`m.*` 的 out/tensor 槽，**尺寸逐字节等于**两个
+子层各自构建时的尺寸）。
+
+**第三个问题（最隐蔽）：计数器行数。** 两个子层按"地板"建（96 slots / 96 maps / 48 counter lines），但
+`dsv41_mhc_nodes` 返回时会把 `max_bufs` 降到当前用量，所以我在地板撤掉后只重设了 `max_bufs`/`max_maps`，
+`STATIC_NODE_COUNTER_LINES` 落回 config.cuh 的 **16**——而图里有 **34** 个节点带计数器，第 17 个开始写越
+`G::cnt`（16 个字），表现为**非法内存访问**（不是 static assert，因为 `config_checks` 只比较生成值和
+`max_counter_lines` 自身）。修好后 `max_counter_lines = mpk._counter_lines`。
+
+**实测（L8，pos 31906，TP8，20 reps）**：
+
+    两次 launch（attn 108.5 µs + moe）: median 108.5-109.2 µs（min 106.9）
+    一次融合 launch                    : median  93.8- 94.7 µs（min  91.3）
+    -> 每层 -14.5 µs（-13%），40 层 = **-0.58 ms**，4.32 ms 的步 -> ~3.74 ms
+
+**正确性（这条链是精确的，不是"在带内"）**：融合 kernel 跑完后，`a.x_out` **5120/5120**、`m.x_out`
+**5120/5120**、`m.streams_out` **20480/20480** 与"attn kernel 然后 moe kernel"那条两 kernel 链**逐 bit 相同**。
+连续 **5 次** launch 每一次都相同 → in-kernel reset 在融合后仍然幂等（这正是 §12.44 的 CUDA graph 做不到的，
+也是它被否掉的原因）。
+
+**对照实验**：把 MoE 的图去掉、只留 attention 走同一个 builder（`FUSE_NO_MOE=1`），结果同样 bit-identical 于
+两 kernel 链——说明这条 builder（一个 mpk、scoped 前缀、schedule 拼接、声明式缓冲）本身没有引入偏差，1 个
+子层和 2 个子层的差别只在这三个问题上。
+
+**还剩的**：40 层全都融合（每层一个融合 build），然后拿 §12.40 的证书（64/77 band + logits 1.12x + argmax 343）
+在整步上复核。每层 -14.5 µs 是从 L8 这一层量的；L0-L7 的 attention 是 swa 变体、内核更小，空隙占比更高，
+收益只会更大（纸面 ~680 µs），但要用整步实测确认，不能用单层外推当结论。

@@ -629,32 +629,32 @@ class StaticMegakernel(PersistentKernel):
             assert p is None or p.name == "engram_rows", "act_quant_layer: poll with x a graph tensor or engram_rows' output"
             p = None
         nc = 2048   # a task's columns (the parts path: whole 128-column blocks, at most one pass of 2048)
-        if p is None:       # tasks/act_quant.cuh reads x by pointer and waits for no node
-            self._dtypes("act_quant_layer", input=(input, bfloat16), output=(output, uint8))
-            buf_slots = [self._tensor_slot(input)]
-        elif p.name in ("gemm_fp8_tile", "gemm_tile") and p.params[0] == COMBINE["slots"]:
-            # a bf16 GEMM's K parts in slots too (gemm_tile: params [mode, K, N, polled], the same slots layout and the
-            # same params 0/2 act_quant.cuh reads)
+        # A GEMM's K parts in slots (gemm_tile: params [mode, K, N, polled], the same slots layout and the same params
+        # 0/2 act_quant.cuh reads): the parts path. Any other input is read by pointer, including a NODE's bf16 [T, K]
+        # output -- the fused graph's MoE x is the attention's mHC post (FINDINGS 12.49), and the wait on that node
+        # comes from the input map's slices (a task's token is the dim the grid cuts), not from `poll`.
+        fused = p is not None and p.name in ("gemm_fp8_tile", "gemm_tile") and p.params[0] == COMBINE["slots"]
+        if fused:
             self._dtypes("act_quant_layer", input=(input, float32), output=(output, uint8))
             # the widest whole-128-block slice of K that divides it: 2048 normally, but attention's wo_a output is only
             # G OL columns (TP4 2048, TP8 1024) and tasks/act_quant.cuh runs any NC of whole 128-column blocks
             nc = next(n for n in (2048, 1024, 512, 256, 128) if K % n == 0)
             buf_slots = []
             at_most_parts(p, 10)   # tasks/act_quant.cuh: at most 10 K parts
-        else:
-            raise ValueError(f"act_quant_layer: x must be a graph input, a gemm_fp8_tile or gemm_tile node's output in slots; "
-                             f"it comes from {p.name}")
+        else:               # tasks/act_quant.cuh reads x by pointer
+            self._dtypes("act_quant_layer", input=(input, bfloat16), output=(output, uint8))
+            buf_slots = [self._tensor_slot(input)]
         assert input.num_dims == 2 and output.num_dims == 2 and (output.dim(0), output.dim(1)) == (T, K)
-        assert p is not None or K % 512 == 0   # tasks/act_quant.cuh: 16 columns per thread, 2 per 32-column group, whole warps
-        if p is None:         # (token, column slice): slices of whole warps' 512 columns; default one per token
+        assert fused or K % 512 == 0   # tasks/act_quant.cuh: 16 columns per thread, 2 per 32-column group, whole warps
+        if not fused:         # (token, column slice): slices of whole warps' 512 columns; default one per token
             grid, maps, changeable = (T, 1, 1), [(0, 1, -1), (0, 1, -1)], {1: (512, 1, None)}
         else:                 # (token, column slice): a task polls only its columns' K parts; slices of whole 128-column blocks
             grid, maps, changeable = (T, K // nc, 1), [(0, 1, -1), (0, 1, -1)], {1: (nc, 1, None)}
         self._add_node("act_quant", grid, block_dim, [input, output], maps, [K] + ([0, 0, 1] if poll else []),
                        changeable_grid_dims=changeable,
                        out_buffer=lambda n: (zq_bytes(T, K), -1, False), counters=1, buf_slots=buf_slots,
-                       cost_inputs=[0] if p is not None else [],   # adds the GEMM's K parts
-                       dry=p is not None)   # K parts: its first task on an SM runs once dry while the parts are on their way
+                       cost_inputs=[0] if fused else [],   # adds the GEMM's K parts
+                       dry=fused)   # K parts: its first task on an SM runs once dry while the parts are on their way
 
     def gemm_fp8_tile_layer(
         self,

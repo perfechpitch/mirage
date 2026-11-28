@@ -350,7 +350,16 @@ static void build_bufs(GpuState &s,
       bool const by_reader = bufs[i][4] == "1";
       auto it = given.find(name);
       void *p = (it != given.end() && it->second) ? it->second : nullptr;
+      bool const dbg = getenv("DSV41_RESET_DEBUG") != nullptr;
+      if (dbg && bufs[i][0] != "exchange") {
+        fprintf(stderr, "[bb] buf.%d %s %s bytes %zu p %p%s\n", i, kind, name.c_str(), bytes, p,
+                it == given.end() ? "  (NOT GIVEN)" : "");
+      }
       if (bufs[i][0] == "exchange") {
+        if (dbg) {
+          fprintf(stderr, "[bb] buf.%d %s %s bytes %zu exchange offset %zu p %p\n", i, kind, name.c_str(), bytes,
+                  (size_t)exchange_offset[i], p);
+        }
         p = s.g.rv + exchange_offset[i];
         if (exchange_bytes[i] != bytes) {
           fprintf(stderr,
@@ -532,7 +541,14 @@ static void build_serving(GpuState &s) {
   rl.cnt = 0;
   for (BufReset const &b : s.resets) {
     if (b.by_reader) {
-      MKS_CK(cudaMemset(b.p, b.value, b.bytes));
+      cudaError_t e = cudaMemset(b.p, b.value, b.bytes);
+      if (e != cudaSuccess) {   // which one: the address, its bytes, and where the region's base is
+        fprintf(stderr,
+                "static_host: a re-armed buffer's reset (%p + %zu bytes) failed: %s "
+                "(the exchange region starts at %p)\n",
+                (void *)b.p, b.bytes, cudaGetErrorString(e), (void *)s.g.rv);
+        exit(1);
+      }
       continue;
     }
     if (rl.cnt == MAX_RESETS || b.bytes % 16 != 0 || (uintptr_t)b.p % 16 != 0) {
