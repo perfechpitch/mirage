@@ -286,7 +286,8 @@ class StaticMegakernel(PersistentKernel):
     def l2_prefetch_weights(self, budget_mb: float = 64.0,
                             stop_at: tuple = ("kda_decode", "sparse_mla", "scaled_moe_experts")) -> int:
         """STATIC_L2_PREFETCH (core.cuh kernel_begin): the layer's first GEMMs' weights (gemm_tile's weight, scaled_gemm_tile's
-        weight and its scales; graph inputs) in graph order, those before the first node of a kind in stop_at (the
+        weight and its scales, gemm_fp8_tile's weight and its scales; graph inputs) in graph order, those before the first node
+        of a kind in stop_at (the
         attention or expert core: the GEMMs after it run long after the start, and their weights in flight at the start
         would take bandwidth from the first GEMMs) and within budget_mb (the tensor that crosses it: its first bytes up to
         it, whole MB), prefetched into L2 by the CTAs that start before the previous kernel ends (PDL): they claim 1 MB
@@ -300,7 +301,8 @@ class StaticMegakernel(PersistentKernel):
         for n in nodes:
             if n.name in stop_at:
                 break
-            ws = {"gemm_tile": n.inputs[1:2], "scaled_gemm_tile": n.inputs[1:3]}.get(n.name, [])
+            ws = {"gemm_tile": n.inputs[1:2], "scaled_gemm_tile": n.inputs[1:3],
+                  "gemm_fp8_tile": n.inputs[1:3]}.get(n.name, [])
             for t in ws:
                 if t.guid in seen or producer_of(t, nodes) is not None:
                     continue

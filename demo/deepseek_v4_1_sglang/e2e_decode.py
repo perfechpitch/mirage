@@ -595,6 +595,27 @@ _CAP = False        # True while a CUDA graph is being captured: nothing inside 
 _G = []             # one graph per segment (see _segments)
 _SEGS = []
 _SX = _SR = None    # the [T, HID] x and the [T, HC, HID] residual the next sublayer reads
+SUB = []            # per layer: (attn, R view, x_out, moe, R'' view or None, x_out or None)
+
+
+def _prepare_sublayers() -> None:
+    """The per-layer tensors _sublayer binds, resolved once.
+
+    Every one of them is an address that does not change from step to step (a node's own output buffer, rebound once by
+    the first step), so re-doing the dict lookups and the .view() in the hot loop was 160 dict hits and 160 view objects
+    a step for values that are constant after the first step. BIT-NEUTRAL BY CONSTRUCTION: nothing here computes, it
+    only remembers the same tensors _sublayer would have looked up."""
+    SUB.clear()
+    for i in range(a.layers):
+        aR = attn[i].w["streams_out"].view(T, HC, HID)
+        aX = attn[i].w["x_out"]
+        # R'' when this MoE hosts an Engram (its residual REPLACES R', so the next attention's post reads R''), R'
+        # otherwise -- full_decode.py:498 takes the same branch. Using streams_out here was the harness's one real
+        # divergence from the reference chain: bit-exact at L0, 56% off at L1, and 1.35x of the logits band instead
+        # of 0.87x (FINDINGS 12.45.1).
+        mR = (moe[i].w["streams_eg"] if "streams_eg" in moe[i].w else moe[i].w["streams_out"]).view(T, HC, HID)
+        mX = moe[i].w.get("x_out")
+        SUB.append((attn[i], aR, aX, moe[i], mR, mX))
 
 
 def _sublayer(i: int) -> None:
@@ -610,6 +631,7 @@ def _sublayer(i: int) -> None:
     Host-only instrumentation is therefore gated on _CAP rather than left in: a torch.cuda.synchronize() inside a
     capture is an error, and a dist.barrier() is worse."""
     global _SX, _SR
+    ai, aR, aX, mi, mR, mX = SUB[i]
     xx, R = _SX, _SR
     if not _CAP:
         if DEBUG:                            # every rank, so a rank that never reaches the launch is visible
@@ -629,32 +651,28 @@ def _sublayer(i: int) -> None:
                     t.view(torch.uint8).fill_(0xAB)
                     log(f"attn L{i}: {tn} tagged 0xAB")
     _t0 = time.perf_counter() if (HOSTT and not _CAP) else 0.0
-    attn[i].run(xx, p, R)
+    ai.run(xx, p, R)
     if not _CAP:
-        _wait(attn[i], f"attn L{i}")
+        _wait(ai, f"attn L{i}")
         _sync()                              # the ranks in lockstep before the next kernel (see _sync)
         if HOSTT:
             _HW["attn"] = _HW.get("attn", 0.0) + time.perf_counter() - _t0
         if TRACE and i in TRACE:
             torch.cuda.synchronize(dev)
             log(f"attn L{i} AFTER" + "\n" + _trace(attn[i], f"L{i} after"))
-    R = attn[i].w["streams_out"].view(T, HC, HID)
-    xx = attn[i].w["x_out"]                  # the post's next input = this MoE's x
+    R = aR
+    xx = aX                               # the post's next input = this MoE's x
     _t0 = time.perf_counter() if (HOSTT and not _CAP) else 0.0
-    moe[i].run(xx, R, emb=EG_EMB.get(i))
+    mi.run(xx, R, emb=EG_EMB.get(i))
     if not _CAP:
-        _wait(moe[i], f"moe L{i}")
+        _wait(mi, f"moe L{i}")
         _sync()
         if HOSTT:
             _HW["moe"] = _HW.get("moe", 0.0) + time.perf_counter() - _t0
-    # R'' when this MoE hosts an Engram (its residual REPLACES R', so the next attention's post reads R''), R'
-    # otherwise -- full_decode.py:498 takes the same branch. Using streams_out here was the harness's one real
-    # divergence from the reference chain: bit-exact at L0, 56% off at L1, and 1.35x of the logits band instead
-    # of 0.87x (FINDINGS 12.45).
-    R = (moe[i].w["streams_eg"] if "streams_eg" in moe[i].w else moe[i].w["streams_out"]).view(T, HC, HID)
+    R = mR
     # (norm_next) the next attention's x; the last layer's: the head's input. An Engram host writes no x_out --
     # EG_LAYERS follows every host with its own layer, which overwrites xx from R'' first.
-    xx = moe[i].w.get("x_out") if not (EG_ON and i in EG_HOST) else xx
+    xx = mX if not (EG_ON and i in EG_HOST) else xx
     if not _CAP and a.sync_every and (i + 1) % a.sync_every == 0 and i + 1 < a.layers:
         _sync()
     _SX, _SR = xx, R
@@ -786,6 +804,7 @@ def step():
         print(f"[e2e] rank {RANK} entering the step: rows {T}, positions {int(p[0])}", flush=True)
     if TABLES is not None:                   # once for the step: every attention layer reads these (see attn's build)
         Lm.attn_demo.window_tables(TABLES)
+    Lm.set_launch_stream()                   # (all 80 launches are on this step's stream: cached, see _launch)
     if _G:
         for k, (lo, hi) in enumerate(_SEGS):
             if lo:
@@ -874,10 +893,10 @@ if PTRS:                                      # diagnosis: two names on one addr
                 log(f"  L{li} attn {nm:20s} 0x{p:x} {t.numel() * t.element_size():7d}B"
                     + (f"  ALIASES {alias}" if alias else ""))
 
+_prepare_sublayers()      # (the per-layer tensors _sublayer binds: constant from here on, see its docstring)
 step()
 torch.cuda.synchronize()
-log("one step done" + (f"; logits {tuple(moe[-1].w['logits'].shape)}" if moe[-1].head else ""))
-# Which sublayer first went bad. Every layer keeps its own x_out, so one pass locates the break: this is the line
+log("one step done" + (f"; logits {tuple(moe[-1].w['logits'].shape)}" if moe[-1].head else ""))# Which sublayer first went bad. Every layer keeps its own x_out, so one pass locates the break: this is the line
 # that turns "the output is NaN" into "L3 or L4, by timing" (FINDINGS_correctness.md §4). Ran on the default path
 # too, not only under DEBUG: a run whose numbers are NaN must not read as a clean step.
 def _fin(t):

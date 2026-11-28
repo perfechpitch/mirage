@@ -126,10 +126,45 @@ def backed(v: torch.Tensor, rows: int) -> bool:
     return v.is_contiguous() and v.untyped_storage().nbytes() - v.storage_offset() * v.element_size() >= rows * rowb
 
 
+def _install_l2_prefetch(mb: float) -> None:
+    """STATIC_L2_PREFETCH for the DSV41 layers: the layer's first GEMMs' weights, pulled into L2 by the CTAs that are
+    already waiting at the start.
+
+    Why it is worth trying here: every launch's prologue sits at the TP start barrier for ~18 us (the 1453 us of
+    inter-kernel gaps in FINDINGS 12.45.5) while the layer's first GEMMs have not started reading their weights yet.
+    Those CTAs have idle bandwidth and nothing else to do. The demo's glm53 layers have had this since it was written;
+    the DSV41 layers never called it, so it has never been measured on this model.
+
+    stop_at names the DSV41 cores (moe_demo's expert node, csa2 demo's attention core): past them the GEMMs run long
+    after the start, and their weights in flight then would only take bandwidth from the first ones.
+
+    It changes no arithmetic -- it is a cache hint plus a pointer list, so it is bit-neutral by construction -- but a
+    build flag changes, so every layer recompiles once.
+
+    DSV41_STATIC_PREFETCH_MB (default 0 = off, the measured default is whatever this says; see FINDINGS 12.46).
+    """
+    from mirage.mpk import static_megakernel as _smk
+    _PF["mb"] = mb
+    if _PF["done"] or mb <= 0:
+        return
+    _PF["done"] = True
+    orig = _smk.StaticMegakernel.compile_static
+
+    def compile_static(self, *a, **k):
+        try:
+            n = self.l2_prefetch_weights(_PF["mb"], stop_at=("sparse_attn", "swiglu_moe_experts"))
+        except Exception:      # (a graph with neither core: nothing to stop at)
+            n = 0
+        _PF["bytes"] += n
+        return orig(self, *a, **k)
+
+    _smk.StaticMegakernel.compile_static = compile_static
+
+
+_PF = {"mb": 0.0, "done": False, "bytes": 0}
+
+
 def _build_shared(build, *args, **kw):
-    """build(*args, **kw) (attn_demo.build / moe_demo.build): (sk, bufs, info, shared). With DSV41_SHARE_MODULES, compile_static
-    first generates the layer's code; when a module of the same code, flags, device and rank is loaded, the build stops there
-    and returns that module and its node buffers (shared: the first layer's w, for _init_binds; else None)."""
     if not SHARE:
         return (*build(*args, **kw), None)
     if TIMING:
@@ -451,15 +486,28 @@ def _launch(layer) -> None:
     per sublayer" configuration FINDINGS 8.1 records as the finite baseline -- e2e_decode's _sync() then supplies the
     barrier. Which one is in use is read from the build (layout()["serving"]), never from the environment, so a flag
     and an env var that disagree cannot dispatch the wrong way.
+
+    The stream is cached (set_launch_stream, once a step): torch.cuda.current_stream() builds a Stream object per call
+    -- 80 calls a step, each through _get_device_index / is_available -- and the cudaStream_t it wraps is the same
+    number for a whole step (a caller that changes streams inside a step must call it again).
     """
     sk = layer.sk
     if not hasattr(layer, "_serving"):
         layer._serving = bool(sk.layout().get("serving"))
     if layer._serving:
-        sk.launch_stream(torch.cuda.current_stream().cuda_stream, layer.pdl)
+        sk.launch_stream(_STREAM[0] if _STREAM[0] else torch.cuda.current_stream().cuda_stream, layer.pdl)
         return
     sk.launch()
     sk.wait()
+
+
+_STREAM = [0]
+
+
+def set_launch_stream() -> None:
+    """The stream this step's launches go on (cached for _launch: see its docstring). Call once per step, before any
+    layer runs, and again after anything that changes the current stream."""
+    _STREAM[0] = torch.cuda.current_stream().cuda_stream
 
 
 def tpb_flag(flags: list, tp: int, pdl: bool, what: str) -> None:
@@ -492,6 +540,9 @@ def tpb_flag(flags: list, tp: int, pdl: bool, what: str) -> None:
         "launch n has NOT necessarily finished n - 1 and the barrier's bound on the drift is void. Drop --pdl / "
         "DSV41_STATIC_PDL, or set DSV41_STATIC_TPB=0 and keep PDL")
     flags.append("-DSTATIC_TP_BARRIER")
+
+
+_install_l2_prefetch(float(os.environ.get("DSV41_STATIC_PREFETCH_MB", "0") or 0))
 
 
 class StaticAttn(MhcMixin):
@@ -640,7 +691,11 @@ class StaticAttn(MhcMixin):
                 _bind_xflag_in(self)
         else:
             assert self.rows == T, "a step of fewer rows: the pools bound (DSV41_STATIC_POOL=1)"
-            self.w["x"].copy_(x)
+            # Rebind x rather than copy it: x is the previous sublayer's x_out, a T-row bf16 [T, HID] layer buffer, which
+            # _bind_x reads in place (the same path the serving hook's pool takes). The copy it replaces was a 10 KB
+            # device-to-device memcpy per attention layer -- 40 per step -- purely to move the same bytes between two
+            # buffers the kernel could have read directly. StaticMoE.run has always rebound this way.
+            _bind_x(self, x)
             if not getattr(self, "tables_shared", False):
                 # tables_shared: this step's positions and window tables are ONE set for every attention layer, filled
                 # once by the caller and rebound into each layer (window_tables is a pure function of positions, so a
