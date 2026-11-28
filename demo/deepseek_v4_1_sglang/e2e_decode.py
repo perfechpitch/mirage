@@ -59,6 +59,11 @@ A.add_argument("--spans", action="store_true",
                help="after the timed loop, run one more step and report every launch's own span (the kernel's "
                     "start-barrier-to-last-SM-end device time, from its stamps): sum(spans) vs the step time separates "
                     "GPU occupancy from the host's launch gaps")
+A.add_argument("--skew", action="store_true",
+               help="after the timed loop, run one more step and attribute the inter-launch gap per GPU per launch: the "
+                    "kernel's entry stamp (before the TP start barrier) vs g.start_barrier (after it and the resets) vs "
+                    "its last SM end. Separates 'the barrier costs a fixed N us' from 'the ranks finish skewed, so the "
+                    "barrier waits for the laggard' -- different fixes")
 A.add_argument("--dump", default=None,
                help="after the first step, write every layer's x_out and streams_out (bf16) and the logits to this "
                     "directory: two runs' dumps must be bit-identical (sync vs async mode proves the fast path, two "
@@ -1152,6 +1157,95 @@ if a.spans:
         os.makedirs(a.out, exist_ok=True)
         json.dump({"spans_us": dict(zip(names, spans)), "sum_us": tot, "step_us_median": med},
                   open(os.path.join(a.out, "spans.json"), "w"), indent=1)
+
+if a.skew:
+    # Where the inter-launch gap actually goes, per GPU per launch. Every kernel stamps STAMP_START (t_start: the SM's
+    # first instruction, before the TP start barrier and before the reset loop) and STAMP_END (its last task), and writes
+    # g.start_barrier after the barrier and the resets -- so three quantities that the 17.8 us/launch gap is made of:
+    #   launch->entry   unknown (no stamp before the kernel exists)
+    #   entry->barrier  the start barrier's wait for the last rank + this launch's resets   <- the suspect
+    #   barrier->end    the kernel's own work (this is what span_us reports)
+    # and the gap between two launches, per GPU: start(n + 1) - end(n).
+    import numpy as _np
+    from mirage.mpk.static_harness import Harness
+    step()
+    torch.cuda.synchronize()
+    dist.barrier()
+    lay = []
+    for i in range(a.layers):
+        lay += [(f"attn{i}", attn[i].sk), (f"moe{i}", moe[i].sk)]
+    rows = []   # (name, [(entry, barrier, end) per GPU])
+    for nm, sk in lay:
+        lay_d = sk.layout()
+        per = []
+        for g in range(sk.num_gpus):
+            st = Harness(sk)._array(g, "stamps", _np.int64).reshape(lay_d["num_sms"], lay_d["num_stamps"])
+            per.append((int(st[:, lay_d["stamp_start"]].min()), int(Harness(sk)._array(g, "start_barrier", _np.int64)[0]),
+                        int(st[:, lay_d["stamp_end"]].max())))
+        rows.append((nm, per))
+    # The barrier's 6.3 us: is it a fixed cost, or this rank waiting for a laggard? Each process only sees its own GPU's
+    # stamps, so gather them: per launch, the spread of the barriers across the 8 ranks is exactly how long the first
+    # rank to arrive waited, and the spread of the ends is the skew the next barrier has to absorb.
+    _t = torch.tensor([[p[0], p[1], p[2]] for _, per in rows for p in per], dtype=torch.int64,
+                      device=f"cuda:{torch.cuda.current_device()}")
+    _all = [torch.zeros_like(_t) for _ in range(WORLD)]
+    dist.all_gather(_all, _t)
+    _all = torch.stack(_all).cpu().numpy()          # (WORLD, launches, 3)
+    if RANK == 0:
+        bar_spread = (_all[:, :, 1].max(axis=0) - _all[:, :, 1].min(axis=0)) / 1e3
+        end_spread = (_all[:, :, 2].max(axis=0) - _all[:, :, 2].min(axis=0)) / 1e3
+        ent_spread = (_all[:, :, 0].max(axis=0) - _all[:, :, 0].min(axis=0)) / 1e3
+        q = lambda x: (f"p50 {_np.median(x):5.1f}  p90 {_np.percentile(x, 90):5.1f}  mean {x.mean():5.1f}  "
+                       f"max {x.max():6.1f}")
+        print(f"[skew] across {WORLD} ranks, per launch: barrier spread {q(bar_spread)}", flush=True)
+        print(f"[skew]                                entry spread  {q(ent_spread)}", flush=True)
+        print(f"[skew]                                end spread    {q(end_spread)}", flush=True)
+        gap_r = [None] * (len(rows) - 1)
+        for k in range(1, len(rows)):
+            prev_end = _all[:, k - 1, 2]
+            gap_r[k - 1] = ((_all[:, k, 1] - prev_end) / 1e3)
+        gap_r = _np.array(gap_r)
+        print(f"[skew] prev end -> this barrier (per rank) {q(gap_r.ravel())}", flush=True)
+        wo = _np.argsort(-gap_r.max(axis=0))[:10]
+        print("[skew] the 10 worst launches (rank-mean gap us): " +
+              "  ".join(f"{rows[k + 1][0]} {gap_r[:, k].mean():.0f}" for k in wo), flush=True)
+    if RANK == 0:
+        bc, sk_e, gap = [], [], []
+        for k, (nm, per) in enumerate(rows):
+            e = _np.array([p[0] for p in per], dtype=_np.int64)
+            b = _np.array([p[1] for p in per], dtype=_np.int64)
+            d = _np.array([p[2] for p in per], dtype=_np.int64)
+            bc.append((b - e) / 1e3)                      # entry -> past the barrier (per GPU)
+            sk_e.append((d.max() - d.min()) / 1e3)        # ends' skew
+            if k:
+                prev_end = _np.array([p[2] for p in rows[k - 1][1]], dtype=_np.int64)
+                gap.append((b - prev_end) / 1e3)          # last launch's end -> this launch's barrier
+        bc, sk_e, gap = (_np.array(x) for x in (bc, sk_e, gap))
+        f = lambda x, t: (f"{t:22s} mean {x.mean():7.1f} us  p50 {_np.median(x):6.1f}  p90 {_np.percentile(x, 90):6.1f}  "
+                          f"max {x.max():6.1f}")
+        print(f"[skew] {len(rows)} launches on {len(rows[0][1])} GPUs", flush=True)
+        print("[skew] " + f(bc, "entry->past barrier"), flush=True)
+        print("[skew] " + f(sk_e[1:], "ends' skew (max-min)"), flush=True)
+        print("[skew] " + f(gap, "prev end->barrier"), flush=True)
+        work = _np.array([[(p[2] - p[1]) / 1e3 for p in per] for _, per in rows])
+        print(f"[skew] sum(barrier->end) {work.max(axis=1).sum():.1f} us; the timed step was {med:.1f} us -> "
+              f"gaps {med - work.max(axis=1).sum():.1f} us", flush=True)
+        print(f"[skew] sum(entry->barrier) {bc.sum():.1f} us over {bc.size} launches = "
+              f"{bc.sum() / len(rows):.1f} us/launch", flush=True)
+        # the worst layers by barrier cost, and by ends' skew
+        wb = sorted(zip(bc.mean(axis=1), [n for n, _ in rows]), reverse=True)[:6]
+        ws = sorted(zip(sk_e[1:], [n for n, _ in rows[1:]]), reverse=True)[:6]
+        print("[skew] the 6 costliest barriers: " + "  ".join(f"{n} {v:.0f}" for v, n in wb), flush=True)
+        print("[skew] the 6 most skewed ends:  " + "  ".join(f"{n} {v:.0f}" for v, n in ws), flush=True)
+        # one layer in full: the distribution across the 8 ranks
+        for nm in ("attn0", "moe0", "attn20", "moe20"):
+            k = [i for i, (n, _) in enumerate(rows) if n == nm][0]
+            per = rows[k][1]
+            print(f"[skew] {nm:6s} entry->barrier per GPU " + " ".join(f"{c:.1f}" for c in bc[k]) +
+                  f" | ends " + " ".join(f"{(p[2] - p[1]) / 1e3:.1f}" for p in per), flush=True)
+        json.dump({"barrier_us": bc.tolist(), "end_skew_us": sk_e[1:].tolist(), "gap_us": gap.tolist(),
+                   "names": [n for n, _ in rows], "step_us_median": med},
+                  open(os.path.join(a.out, "skew.json"), "w"), indent=1)
 
 dist.barrier()
 dist.destroy_process_group()
