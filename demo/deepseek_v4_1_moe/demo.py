@@ -74,11 +74,20 @@ ROUTER_PARTS = 8   # the router's K parts: 5 K tiles of 128 each, a task's K fit
 HQ, HQ_SF = "swiglu_moe_experts.h_q", "swiglu_moe_experts.h_q_scales"   # the expert node's scratch (given: the check reads h_q)
 
 
-def build_graph(mpk: StaticMegakernel, w: dict, valid_rows: int = None) -> None:
+def build_graph(mpk: StaticMegakernel, w: dict, valid_rows: int = None, bind=None, mhc: bool = True) -> None:
     """Declare the layer calls on the tensors of w (load_weights and the inputs). valid_rows < T (11-21): a decode build of
-    that many live rows (the others idle: not routed, their pairs row 0's experts at weight 0)."""
+    that many live rows (the others idle: not routed, their pairs row 0's experts at weight 0).
+
+    bind, mhc (fusing an attention and this MoE into one kernel, FINDINGS 12.49): bind(k, w[k]) -> a DTensor (the tensor is
+    a graph tensor, e.g. this layer's x produced by that attention's post; None falls back to attach_input), and mhc=False
+    leaves the residual's post to the caller (the fused graph has one mHC post per layer, not one per sublayer)."""
     t = {}
-    a = lambda k: t.setdefault(k, mpk.attach_input(torch_tensor=w[k], name=k))   # one tensor per name: writers and readers
+    def a(k):   # one tensor per name: writers and readers
+        if k in t:
+            return t[k]
+        g = bind(k, w[k]) if bind is not None else None
+        t[k] = g if g is not None else mpk.attach_input(torch_tensor=w[k], name=k)
+        return t[k]
     nt = lambda dims, dtype, name: mpk.new_tensor(dims=dims, dtype=dtype, name=name)
     I, KO = w["sgu_weight"].shape[0] // 2, w["sd_weight"].shape[1]
     logit_part, pairs = nt((T, E), float32, "logit_part"), nt((T, K), int64, "pairs")
@@ -97,7 +106,7 @@ def build_graph(mpk: StaticMegakernel, w: dict, valid_rows: int = None) -> None:
     routed = nt((T * K, HID), float32, "routed_rows")
     mpk.swiglu_moe_experts_layer(x_q=x_q, pairs=pairs, w13=a("w13"), w13_scales=a("w13_scales"), w2=a("w2"),
                                  w2_scales=a("w2_scales"), output=routed, swiglu_limit=SWIGLU_LIMIT)      # the routed experts
-    if "streams" in w and "h_comb" not in w:     # the sublayer's end in the kernel: the sums land in mHC's post (StaticMegakernel.dsv41_mhc_nodes)
+    if mhc and "streams" in w and "h_comb" not in w:     # the sublayer's end in the kernel: the sums land in mHC's post (StaticMegakernel.dsv41_mhc_nodes)
         sent = nt((mpk.num_gpus * T, HID), bfloat16, "y_sent")
         mpk.sum_store_layer(input=sd_part, routed=routed, output=None, sent=sent)
         mpk.dsv41_mhc_nodes(a, w, sent)
@@ -106,6 +115,10 @@ def build_graph(mpk: StaticMegakernel, w: dict, valid_rows: int = None) -> None:
         mpk.sum_store_layer(input=sd_part, routed=routed, output=a("y"), sent=sent)                 # y on every GPU
     else:
         mpk.sum_store_layer(input=sd_part, routed=routed, output=a("y"))                            # y = routed + shared
+    # (mhc=False, the fused layer of 12.49) the caller's mHC post reads this y and the sent partials: it is a sum_store
+    # node itself, which is what hc_post_combine_layer requires of its `sent`
+    if not mhc:
+        return sent
     if "h_comb" in w:      # only mHC's coefficients beside the sublayer (the framework runs the all-reduce and the post)
         mpk.dsv41_mhc_stats_nodes(a, w)
     if "eg_wkv" in w or "eg_kv" in w:   # (11-20) the next layer's Engram on this post's streams (engram_nodes)

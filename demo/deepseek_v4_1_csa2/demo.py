@@ -133,9 +133,13 @@ def window_tables(w: dict):
     w["window_rows"].copy_(t[:, None] * W + (p[:, None] - torch.arange(W, device=p.device)) % W)
 
 
-def build_graph(mpk: StaticMegakernel, w: dict, variant: str, ratio: int, csrc: bool, heads: int):
+def build_graph(mpk: StaticMegakernel, w: dict, variant: str, ratio: int, csrc: bool, heads: int, bind=None):
     """Declare the variant's layer calls on the tensors of w (load_weights and state_tensors). num_gpus > 1: sum_store does the
-    all-reduce."""
+    all-reduce.
+
+    bind (fusing two sublayers, FINDINGS 12.49): called as bind(k, w[k]) instead of attach_input when the tensor is a graph
+    tensor, e.g. this layer's x made by the previous sublayer's post, so that the reader has a real dependency edge
+    instead of a stub. Returning None falls back to attach_input. Only mpk is a StaticMegakernel either way."""
     compressed, full, reindex = variant != "swa", variant.startswith("full"), variant == "reindex"
     mpk.poll_ns = int(os.environ.get("DSV41_POLL_NS", "0"))   # the waits' sleep between polls, ns (0: spin)
     xb = int(mpk.num_gpus > 1)   # sum_store's exchange buffer
@@ -145,7 +149,12 @@ def build_graph(mpk: StaticMegakernel, w: dict, variant: str, ratio: int, csrc: 
         mpk.max_bufs = 25   # a Reuse layer: config.cuh's default 24 and sum_store's exchange buffer
     NQ, G = heads * D, heads // 8
     t = {}
-    a = lambda k: t.setdefault(k, mpk.attach_input(torch_tensor=w[k], name=k))   # one tensor per name: writers and readers
+    def a(k):   # one tensor per name: writers and readers
+        if k in t:
+            return t[k]
+        g = bind(k, w[k]) if bind is not None else None
+        t[k] = g if g is not None else mpk.attach_input(torch_tensor=w[k], name=k)
+        return t[k]
     nt = lambda dims, dtype, name: mpk.new_tensor(dims=dims, dtype=dtype, name=name)
     x_q, qr_q = nt((T, HID), uint8, "x_q"), nt((T, QL), uint8, "qr_q")
     mpk.act_quant_layer(input=a("x"), output=x_q)                                                   # x -> e4m3, per 32

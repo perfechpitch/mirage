@@ -3257,3 +3257,69 @@ KV 行数从 128 涨到 640（**5 倍**），时间只多 **~3 µs**。所以那
 能动的只有最后一项，而它要求**减少 launch 数**——即 §12.46 末尾说的 sublayer 融合（80 → 40）。上面这条
 否证也说明：融合的收益不会来自"让 pipeline 并发"，而是单纯地少 40 次 CTA 分发 + 少 40 次 TP barrier，
 纸面 ~700 µs。
+
+## 12.49 sublayer 融合逐项拆障：结构上建得起来，plan 必须用两个真实 hand plan 拼（2026-11-28）
+
+§12.48 把 4.95 ms 归成"kernel 3076 + barrier 504 + launch 1378"，并指出只有减少 launch 数能动。这一节把融合
+这件事从"纸面"推到**可执行的构造**：它不是设计问题，是四个具体缺口的工程问题，现在四个都解决了，剩下一项
+（真实 harness 上的融合 kernel）已缩小到"把两个真实 hand plan 拼起来"。
+
+### 12.49.1 四个缺口和它们的解法
+
+| 缺口 | 现象 | 解法 | 状态 |
+|---|---|---|---|
+| buffer 槽位 | 两个子层的 `_new_buf` 共用一个计数，`config.cuh` 的 `MAX_BUFS=24` 不够 | `#ifndef STATIC_MAX_BUFS` 早已存在（`StaticMegakernel.max_bufs`） | 已有；融合两层实测 **38** |
+| TMA map 槽位 | `MAX_MAPS=32` 是**硬编码常量**，两个子层的权重 map 放不下（实测 40） | 加 `STATIC_MAX_MAPS` 覆盖 + `StaticMegakernel.max_maps`，同 `max_bufs` 的形状：`config.cuh`、`_map`/`_gemm_map` 的两处断言、生成代码的 `#define`、`config_checks` 的 `static_assert` | **本轮新增** |
+| 张量名冲突 | 两个 `build_graph` 都声明 `x`/`y`/`x_q`/`logit_part` | 前缀作用域（`s0.`/`s1.`，`fused_spike.scoped`）；`hand_plan` 按名查表，拼 plan 期间把 `compiler.tname` 的前缀剥掉 | 本轮验证：两个 hand plan 都能在带前缀的图上跑通 |
+| 依赖边 | moe 的 `x` 必须等 attn 的 post；`attach_input` 造的是图输入、没有边 | `build_graph(..., bind=)`：`bind(k, w[k])` 返回 DTensor 就把该张量接成图内的边；attn 侧本来就把 `x_out -> streams_out` 注册进 `compiler.PRODUCER_ALIAS`，所以 moe 的 `x` 绑到 attn 的 `x_out` 就是一条真边 | **本轮新增**（两个 demo 各一个 hook，默认关闭） |
+
+另外加了 `compiler.compile_plan(..., validate_grids=False)`：`candidate_grids` 是按**单个**子层的 map 推导的，
+合并图上会把某些节点判成非法（实测 moe 的一个 `gemm_fp8_tile`：`(40,1,1)` vs 候选只剩 `(40,2,1)`）。融合的
+plan 由真实 hand plan 给出，本来就不该再过这道推导。
+
+### 12.49.2 实测：一个 mpk 上两张图建得起来
+
+`fused_spike.py`（attention 层 3 + 它自己的 MoE，TP8，pos 31906）：
+
+    s0 (attn): 25 buffer slots     s0 的 hand plan: 225 tasks
+    s1 (moe) : 38 buffer slots     s1 的 hand plan: 280 tasks
+    18 nodes, 505 tasks, 3.4 per SM（每 SM 的任务表放 62）    max_bufs 38  max_maps 40
+
+即：**一次 launch 里放两个子层的 18 个节点、505 个 task，只占每 SM 3.4 个槽位**。任务表不是瓶颈（这是融合
+最容易被担心的一项，实测差了 18 倍）。
+
+### 12.49.3 唯一剩下的约束：plan 不能合成，必须拼两个真实 hand plan
+
+第一版用"图顺序 + round robin"合成 plan，`nvcc` 直接拒：
+
+    act_quant: "whole 128-column blocks, at most one pass of 2048 columns, K % NC == 0"
+    gemm_fp8_tile: "fused act_quant: two jobs' stages in the ring at once"
+
+原因是**每个 task 的 grid 和它自己的 ring/列切分是绑死的**（`act_quant` 的 `NC = K / grid.y`；`x_q` 在真实
+构建里是 `grid [1,2,1]` —— 从 `schedules/schedule_gpu0.json` 读出来的，K=5120 时它就是这么编过的）。合成
+plan 换个 grid 就换掉列宽，task 自己的 `static_assert` 立刻不成立。改成"两个真实 hand plan 按 SM 拼接"之后
+（225+280=505），`act_quant` 的 K 分段与 ring 两条断言都消失了。
+
+### 12.49.4 一个必须记下来的坑：`fused_spike` 的形状不是模型的形状
+
+拼接后还剩 `act_quant_parts_task<K=5120, P=1, NC=5120>` 一条断言。定位到它是 **`oa_q` 那个 fused tap**：
+spike 里 `oa_q` 是 `(5120,)`，而真实 TP8 构建里它是 `G*OL = 1024`（`act_quant.cuh` 的注释就写着"attention's
+wo_a output is G OL = 1024 there"）。也就是说这条失败是 spike 自己喂权重的方式带来的（它走的是 plain demo 的
+`layer_tensors` + `state_tensors`，没有 mHC 的 `streams`，也没按 variant 取 oa_q 的分片），**不是融合机制的
+限制**。真实 harness 的 `attn3` 用同一份代码、同一个 grid `[1,2,1]` 是编过的（上表）。
+
+结论：**融合原型不能建在 plain demo 上，必须建在 `dsv41_static_layer.StaticAttn/StaticMoE` 的权重与 variant 上**
+——那条链的 `build_graph` + `hand_plan` 已经自洽，融合只需在它之上换成一个 mpk、两次 build_graph、拼两个 plan。
+
+### 12.49.5 顺带的两份实测（今天这台机器）
+
+    40 层，pos 32344，--reps 5 --warmup 2，无 --spans：median **4.3228 ms / 231 tok/s**（p10 4300.6）
+    + DSV41_STATIC_IS_TCGEN05=1：median **4.3055 ms / 232 tok/s**（p10 4292.3，**p90 4468.6 vs 8569.7**）
+
+`IS_TCGEN05` 的 median 在噪声内（-0.4%），但把 p90 的 8.5 ms 尾巴收掉了（那一档是首步后的抖动）。它改的是
+indexer 的打分路径，`act_quant`/`sparse_attn` 的数值不变（`IS_TCGEN05` 注释："the same y bits"），要作为默认
+开关还需要跑一遍 §12.40 的证书。基线比记录里的 4.95 ms 低，是因为那份数字带 `--spans` 且当时机器在编译。
+
+**空隙的归属再确认一次**：serve 形态下 `_launch` 只是 `sk.launch_stream(stream, pdl)`（`static_harness.py`），
+没有 host 侧对齐；80 次 launch 的 1.24 ms 空隙（4.32 - 3.08）因此全在 GPU 侧：CTA teardown + 下一次的 grid
+分发 + 6.3 µs 的入口 barrier。所以"减少 launch 数"是唯一的路，融合的纸面收益仍是 ~40 × 17 µs ≈ 680 µs。

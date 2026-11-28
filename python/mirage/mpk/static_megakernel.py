@@ -242,7 +242,8 @@ class StaticMegakernel(PersistentKernel):
         for i, m in enumerate(self._maps):
             if m[3] == key:
                 return i
-        assert len(self._maps) < MAX_MAPS, f"more than {MAX_MAPS} tensor maps (config.cuh MAX_MAPS)"
+        mm = getattr(self, "max_maps", MAX_MAPS)   # a fused graph may raise it (the layer then defines STATIC_MAX_MAPS)
+        assert len(self._maps) < mm, f"more than {mm} tensor maps (StaticMegakernel.max_maps, config.cuh MAX_MAPS)"
         self._maps.append((kind, source, tuple(dims), key))
         return len(self._maps) - 1
 
@@ -253,7 +254,8 @@ class StaticMegakernel(PersistentKernel):
         for i in range(len(self._maps) - len(box_rows) + 1):
             if all(self._maps[i + j][3] == ("bf16", ("t", tensor.guid), (rows, K, b)) for j, b in enumerate(box_rows)):
                 return i
-        assert len(self._maps) + len(box_rows) <= MAX_MAPS, f"more than {MAX_MAPS} tensor maps (config.cuh MAX_MAPS)"
+        mm = getattr(self, "max_maps", MAX_MAPS)
+        assert len(self._maps) + len(box_rows) <= mm, f"more than {mm} tensor maps (StaticMegakernel.max_maps, config.cuh MAX_MAPS)"
         first = len(self._maps)
         for b in box_rows:
             self._maps.append(("bf16", ("t", tensor), (rows, K, b), ("bf16", ("t", tensor.guid), (rows, K, b))))

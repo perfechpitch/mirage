@@ -92,13 +92,18 @@ def candidate_grids(node: Node) -> List[Tuple[int, int, int]]:
     return list(itertools.product(*per_axis))
 
 
-def apply_grids(pk, grids: Dict[int, tuple]) -> List[Node]:
-    """Regrid every node the plan gives a grid (kn_graph.regrid, params unchanged); returns the nodes as they are then."""
+def apply_grids(pk, grids: Dict[int, tuple], validate: bool = True) -> List[Node]:
+    """Regrid every node the plan gives a grid (kn_graph.regrid, params unchanged); returns the nodes as they are then.
+
+    validate=False keeps each node's own grid without checking it against candidate_grids: a graph that fuses several
+    sublayers (FINDINGS 12.49) is built with the grids its sublayers chose, and candidate_grids' derivation assumes one
+    sublayer's maps (it refuses e.g. a MoE gemm_fp8_tile that the fused build hands a different y split). Callers that
+    synthesize a plan must pass the grids the build already used."""
     for n in graph_nodes(pk):
         if n.graph_idx not in grids:
             continue
         grid = tuple(grids[n.graph_idx])
-        if grid not in candidate_grids(n):
+        if validate and grid not in candidate_grids(n):
             raise ValueError(f"node {n.graph_idx} ({n.name}): grid {grid} is not one of {candidate_grids(n)}")
         pk.kn_graph.regrid(n.graph_idx, grid, n.params)
     return graph_nodes(pk)
@@ -341,7 +346,7 @@ def twoshot_kinds(pk, nodes: List[Node]) -> Dict[int, str]:
     return kinds if "twoshot" in kinds.values() else {}
 
 
-def compile_plan(pk, plan: dict, out_dir: str) -> Tuple[List[str], dict]:
+def compile_plan(pk, plan: dict, out_dir: str, validate_grids: bool = True) -> Tuple[List[str], dict]:
     """Returns (the schedule file paths in GPU order, {"grids": {name#graph_idx: grid}}). See the module comment. For pk's GPUs
     and SMs (StaticMegakernel.num_gpus, num_sms); an SM's list holds at most static_schedule.MAX_TASKS_PER_SM - 1 tasks (then
     the end entry). With STATIC_AR_TWOSHOT (static_schedule.ar_twoshot) the GPUs' lists together must not deadlock with its
@@ -350,7 +355,7 @@ def compile_plan(pk, plan: dict, out_dir: str) -> Tuple[List[str], dict]:
     if len(plan["lists"]) != num_gpus:
         raise ValueError(f"the plan has lists for {len(plan['lists'])} GPUs, compiling for {num_gpus}")
     os.makedirs(out_dir, exist_ok=True)
-    nodes = apply_grids(pk, {int(k): v for k, v in plan["grids"].items()})
+    nodes = apply_grids(pk, {int(k): v for k, v in plan["grids"].items()}, validate=validate_grids)
     # the launch mode: clusters of 2 when every pair of a node that can pair (can_pair: sum_rmsnorm with 2 tasks per token) fits on
     # one cluster after renumbering the lists (pair_clusters); those nodes then take their cluster_pair_params. Otherwise (or
     # plan "cluster_launch": false) the plain launch, and the nodes keep their params (sum_rmsnorm: the swap through G).

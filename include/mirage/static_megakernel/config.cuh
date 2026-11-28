@@ -113,7 +113,12 @@ constexpr int MAX_TASKS_PER_SM =
 constexpr int MAX_BUFS =
     STATIC_MAX_BUFS;         // buffer slots (G::buf): node outputs, scratch
                              // buffers, graph tensors read by pointer
-constexpr int MAX_MAPS = 32; // tensor map slots (Maps::m)
+// STATIC_MAX_MAPS: a graph that fuses several sublayers needs more map slots than one sublayer does (each sublayer's
+// weights get their own maps); StaticMegakernel.max_maps defines it (as STATIC_MAX_BUFS)
+#ifndef STATIC_MAX_MAPS
+#define STATIC_MAX_MAPS 32
+#endif
+constexpr int MAX_MAPS = STATIC_MAX_MAPS; // tensor map slots (Maps::m)
 
 // ---- counters (u32, zeroed before each launch). Counters in one 128-B line
 // slow each other down, so each node has its own lines:

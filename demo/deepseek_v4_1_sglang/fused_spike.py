@@ -84,6 +84,8 @@ class FusedKernel(StaticMegakernel):
 
 sms = torch.cuda.get_device_properties(0).multi_processor_count
 mpk = FusedKernel(num_gpus=NG)
+# two sublayers' weight maps do not fit config.cuh's 32 (STATIC_MAX_MAPS: StaticMegakernel.max_maps)
+mpk.max_maps = int(os.environ.get("FUSED_MAX_MAPS", "64"))
 print(f"[spike] one kernel, {NG} GPUs x {sms} SMs, layer {L} ({variant}), {a.sublayers} sublayers", flush=True)
 
 
@@ -155,25 +157,45 @@ for s in range(a.sublayers):
         compiler.PRODUCER_ALIAS[guid_of(prefix("x", tag))] = guid_of(prefix("y", tags[s - 1]))
     print(f"[spike] {tag} ({'attn' if attention else 'moe'}): built, {len(mpk._bufs)} buffer slots so far", flush=True)
 
-# ---- one plan over every node: graph order, round robin over the SMs ---------------------------------------
+# ---- the plan: the sublayers' own hand plans, concatenated per SM -------------------------------------------
+# A synthetic round-robin plan cannot replace them: each task's grid is coupled to its ring/column split, and the
+# attention's fused act_quant (the oa_q tap, changeable_grid_dims y in exactly 2) asserts on the split the hand plan
+# chooses. Merging keeps every node's proven schedule and only adds the cross-sublayer wait (the PRODUCER_ALIAS edge).
 nodes = compiler.graph_nodes(mpk)
-grids = {n.graph_idx: tuple(n.grid) for n in nodes}
-lists = [[] for _ in range(sms)]
-k = 0
-for n in nodes:
-    gx, gy, gz = grids[n.graph_idx]
-    for x in range(gx):
-        for y in range(gy):
-            for z in range(gz):
-                lists[k % sms].append((n.graph_idx, (x, y, z)))
-                k += 1
-plan = {"grids": grids, "lists": [copy.deepcopy(lists) for _ in range(NG)]}
+real_nodes = compiler.graph_nodes
+merged, per_sm = {"grids": {}}, [[] for _ in range(sms)]
+for s in range(a.sublayers):
+    tag, attention = tags[s], s % 2 == 0
+    mine = [n.graph_idx for n in nodes if compiler.tname(mpk, n.outputs[0]).startswith(tag + ".")]
+    real_nodes, real_tname = compiler.graph_nodes, compiler.tname
+    compiler.graph_nodes = lambda pk, mine=mine: [n for n in real_nodes(pk) if n.graph_idx in mine]
+    # the hand plans look their nodes up by tensor name ("x_q", "o_q", ...): strip this sublayer's prefix meanwhile
+    compiler.tname = lambda pk, t, tag=tag: (lambda nm: nm[len(tag) + 1:] if nm.startswith(tag + ".") else nm)(real_tname(pk, t))
+    try:
+        if attention:
+            cap = ws[s][0]["compress_cache"].shape[1] if "compress_cache" in ws[s][0] else 256
+            cmp_rows = ws[s][0]["cmp_weight"].shape[0] if "cmp_weight" in ws[s][0] else 0
+            p = attn_demo.hand_plan(mpk, heads, cap, cmp_rows, sms)
+        else:
+            p = moe_demo.hand_plan(mpk, sms)
+    finally:
+        compiler.graph_nodes, compiler.tname = real_nodes, real_tname
+    merged["grids"].update({int(k): tuple(v) for k, v in p["grids"].items()})
+    for sm in range(sms):
+        per_sm[sm] += p["lists"][0][sm]          # (the same lists on every GPU)
+    print(f"[spike] {tag} ({'attn' if attention else 'moe'}): {sum(len(l) for l in p['lists'][0])} tasks from its hand plan",
+          flush=True)
+plan = {"grids": merged["grids"], "lists": [copy.deepcopy(per_sm) for _ in range(NG)]}
+k = sum(len(l) for l in per_sm)
 print(f"[spike] {len(nodes)} nodes, {k} tasks, {k / sms:.1f} per SM (the table holds {62})", flush=True)
 if k / sms > 60:
     print(f"[spike] WARNING: {k / sms:.1f} tasks per SM, the table holds 62", flush=True)
 
+mpk.__dict__.setdefault("_mb", 0)
+print(f"[spike] max_bufs {len(mpk._bufs)} max_maps {len(mpk._maps)}", flush=True)
+
 os.makedirs(a.out, exist_ok=True)
-paths, info = compiler.compile_plan(mpk, plan, os.path.join(a.out, "schedules"))
+paths, info = compiler.compile_plan(mpk, plan, os.path.join(a.out, "schedules"), validate_grids=False)
 nb = False
 given = lambda n: n.info["out_buffer"] is not None and not n.info["exchange"] and \
     not (nb and n.info["out_buffer"](n)[1] >= 0 and not n.info["out_buffer"](n)[2])
