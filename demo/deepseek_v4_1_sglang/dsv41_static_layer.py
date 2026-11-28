@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 import torch
 
@@ -264,7 +265,14 @@ class MhcMixin:
     layer's bindings (every rebind goes through _rb; DSV41_SHARE_MODULES: _own before a launch)."""
 
     def _rb(self, name: str, ptr: int):
-        """sk.rebind, remembered as this layer's binding; with a shared module only while this layer holds it (else _own)."""
+        """sk.rebind, remembered as this layer's binding; with a shared module only while this layer holds it (else _own).
+
+        Memoized: a step re-binds the same addresses every launch (x, R, positions, the Engram rows), and a rebind is a
+        host call per (name, tensor) inside host.cuh's maps. Skipping an unchanged one is exactly equivalent -- the
+        binding is a slot's address, not a state machine -- and it is host time directly off the critical path: 40
+        launches a step at ~18 us of Python each is what the GPU waits for (FINDINGS 12.53.3's 12 us p50 gap)."""
+        if self.binds.get(name) == ptr and (not SHARE or getattr(self.sk, "_owner", None) is self):
+            return
         self.binds[name] = ptr
         if not SHARE or getattr(self.sk, "_owner", None) is self:
             self.sk.rebind(name, ptr)
@@ -983,6 +991,13 @@ class _Scoped:
         return False
 
 
+
+# DSV41_FUSE_HT: attribute the fused layer's HOST time (per launch, microseconds a step). The GPU waits for this: a step
+# is 40 launches and the measured prev-end -> start-barrier gap is 12 us (p50). Diagnosis only.
+HT_ON = os.environ.get("DSV41_FUSE_HT", "0") != "0"
+HT = {k: 0.0 for k in ("x", "pos", "R", "emb", "launch")}
+
+
 class StaticFusedLayer:
     """One layer's attention and its MoE in ONE static megakernel (FINDINGS 12.50): 40 launches a step instead of 80.
 
@@ -1156,12 +1171,16 @@ class StaticFusedLayer:
         """One decode step of this layer in one launch: the attention, then its MoE (which also runs the Engram node or
         the head when the layer has one). Returns the next sublayer's x [T, HID] bf16."""
         sa, sm = self.sa, self.sm
+        _ht = time.perf_counter if HT_ON else None
+        _t0 = _ht() if _ht else 0.0
         self.rows = n = x.shape[0]
         ok = x.is_contiguous() and x.dtype == torch.bfloat16 and x.shape[1:] == (HID,) and \
             (n == T or (0 < n < T and backed(x, T)))
         if not ok:
             sa.w["x"][:n].copy_(x)
         self._rb("a.x", x.data_ptr() if ok else sa.w["x"].data_ptr())
+        if _ht:
+            _t1 = _ht(); HT["x"] += _t1 - _t0; _t0 = _t1
         if positions is not None and not getattr(sa, "tables_shared", False):
             # (DSV41_E2E_SHARE_TABLES) one table set for every layer, filled once in step(): the kernel was built and
             # rebound on that tensor, so there is nothing to copy here -- StaticAttn.run's own branch
@@ -1169,6 +1188,8 @@ class StaticFusedLayer:
             attn_demo.window_tables(sa.w)
         if sa.w.get("positions") is not None:
             self._rb("a.positions", sa.w["positions"].data_ptr())
+        if _ht:
+            _t1 = _ht(); HT["pos"] += _t1 - _t0; _t0 = _t1
         if R is not None:
             assert R.is_contiguous() and R.dtype == torch.bfloat16 and R.shape[1:] == (HC, HID) and 0 < R.shape[0] <= T
             ptr = R.data_ptr() if (R.shape[0] == T or backed(R, T)) else None
@@ -1178,6 +1199,8 @@ class StaticFusedLayer:
             # the ATTENTION's residual only: the MoE's is the attention's own streams_out, a graph edge (see __init__),
             # so there is no "m.streams" to rebind
             self._rb("a.streams", ptr)
+        if _ht:
+            _t1 = _ht(); HT["R"] += _t1 - _t0; _t0 = _t1
         if emb is not None:                # (Engram) the next layer's n-gram rows, the MoE's gather wrote them
             self.eg_emb_ref = emb
             self._rb("m.eg_emb", emb.data_ptr())
@@ -1186,8 +1209,12 @@ class StaticFusedLayer:
             self.eg_ids_ref = ids
             self._rb("a.eg_ids", ids.data_ptr())
             self._rb("m.eg_ids", ids.data_ptr())
+        if _ht:
+            _t1 = _ht(); HT["emb"] += _t1 - _t0; _t0 = _t1
         _launch(self)
         self.steps += 1
+        if _ht:
+            _t1 = _ht(); HT["launch"] += _t1 - _t0
         return sm.w["x_out"][:n] if "x_out" in sm.w else sm.w["y"][:n]
 
     def out_streams(self) -> torch.Tensor:

@@ -176,8 +176,10 @@ CHAINDUMP = os.environ.get("DSV41_E2E_CHAINDUMP", "")
 GRAPH = os.environ.get("DSV41_E2E_GRAPH", "0") != "0"
 # DSV41_E2E_FUSE: one kernel a layer (FINDINGS 12.50) -- the attention and its MoE fused into one static megakernel,
 # 40 launches a step instead of 80. Built from the two layers' own graphs and their own verified schedules, so the
-# arithmetic is bit-identical (5 consecutive launches on four layer variants) and only the launch count changes.
-FUSE = os.environ.get("DSV41_E2E_FUSE", "0") != "0" or a.fuse_sublayers
+# arithmetic is bit-identical (160/160 dataflow tensors at 40 layers, FINDINGS 12.52.4) and only the launch count
+# changes. ON by default: it is the faster verified path (4.95 -> 4.23 ms, FINDINGS 12.57); DSV41_E2E_FUSE=0 is the
+# two-kernel chain the correctness oracles were built from.
+FUSE = os.environ.get("DSV41_E2E_FUSE", "1") != "0" or a.fuse_sublayers
 # DSV41_E2E_SIG: print a bitwise fingerprint of the logits after every step (rank 0). Every step repeats the same
 # token at the same position, so any change between steps is a replay that is not idempotent -- the reset protocol
 # question (core.cuh kernel_begin). Diagnosis only.
@@ -323,13 +325,26 @@ EG_ON = bool(PRE) and bool(EG_HOST)
 _read = Lm.reader(a.checkpoint)
 
 
-def _hc_pre(sm):
+# DSV41_EG_ASYNC=1: the Engram re-derivation stays on the DEVICE and is not synchronized. Its only host read is
+# hc_coef's first HC floats (_hc_pre: .cpu()), and that read is what makes the two Engram layers the step's only
+# cuda.synchronize's -- measured (FINDINGS 12.53.3): the inter-launch gap is p50 12.0 us but mean 30.9 with a 374 us
+# max, ~690 us a step in the tail, and those two syncs are the only candidates. Every read below is a device op on
+# this step's launch stream, so dropping the .cpu() only moves the read into the stream: the launches that follow are
+# ordered after it, and the arithmetic (same ops, same dtype) is unchanged. The weight normalization's gamma is read
+# once (-1: not a per-step checkpoint read) -- same float32 bytes, so the products are the same.
+EG_ASYNC = os.environ.get("DSV41_EG_ASYNC", "1") != "0"
+_EG_GAMMA = {}
+
+
+def _hc_pre(sm, dev_only=None):
     """The MoE's ffn_pre mix (hc_coef's first HC floats, fp32): model.py carries ONE mix across sublayers, so the
     attention of L reads the pre of MoE L-1, not its own triplet (using L's own was 13.6% off)."""
     t = sm.bufs[0].get("hc_coef")
     if t is None:
         raise RuntimeError(f"MoE L{sm.layer}: no hc_coef buffer (a build without the mHC nodes?)")
     cf = t.contiguous().view(torch.float32).reshape(-1) if t.dtype != torch.float32 else t.reshape(-1)
+    if dev_only if dev_only is not None else EG_ASYNC:
+        return cf[:HC].detach().float()          # device: no .cpu(), no implicit sync (EG_ASYNC)
     return cf[:HC].detach().float().cpu()
 
 
@@ -338,13 +353,20 @@ def _apply_pre(R, pre, L, kind, d):
     own write is."""
     v = R.float().view(HC, HID)
     y = (pre.to(d)[:, None] * v.to(d)).sum(0)
-    g = _read(f"layers.{L}.{kind}_norm.weight").float().to(d)
+    if (L, kind) in _EG_GAMMA:
+        g = _EG_GAMMA[(L, kind)]
+    else:
+        g = _read(f"layers.{L}.{kind}_norm.weight").float().to(d)
+        if EG_ASYNC:
+            _EG_GAMMA[(L, kind)] = g
     return (y.bfloat16().float() * torch.rsqrt(y.square().mean() + cfg["norm_eps"]) * g).bfloat16()
 
 
 def eg_next_x(sm, L, d):
-    """Layer L's attention input, from the R'' the MoE L-1 just produced (synchronous: the buffer is read on the
-    host, so the launch must have finished -- the price of the re-derivation, paid twice a step)."""
+    """Layer L's attention input, from the R'' the MoE L-1 just produced. The buffer is read on the DEVICE now
+    (EG_ASYNC), so the launch does not have to have finished on the host: the torch ops are enqueued on the stream
+    the launches are on, ordered after MoE L-1 and before L's attention (with EG_ASYNC=0 it is the old host read --
+    the price of the re-derivation, paid twice a step)."""
     return _apply_pre(sm.w["streams_eg"][0].reshape(-1), _hc_pre(sm), L, "attn", d)
 
 
@@ -746,7 +768,12 @@ def _segments():
     An Engram layer's attention reads norm(pre . R''), and R'' is a device value the previous kernels just wrote, so
     that read needs a real synchronize -- which a CUDA graph cannot contain. Everything between two such layers is a
     pure launch stream and becomes one graph: without this, the harness pays 80 host round trips (1.79 ms of the
-    5.04 ms step) to submit work the GPU could have started itself."""
+    5.04 ms step) to submit work the GPU could have started itself. EG_ASYNC removes the need for those cuts (the
+    re-derivation is a few device ops on the launch stream): the whole step is one segment, and its graph carries a
+    reset_gen first so that every replay starts from the same launch number (which is what made the multi-replay
+    graphs non-idempotent, FINDINGS 12.45.4)."""
+    if EG_ASYNC:
+        return [(0, a.layers - 1)]
     cuts = [c for c in (sorted(EG_LAYERS) if EG_ON else []) if 0 < c < a.layers]
     segs, lo = [], 0
     for c in cuts:
@@ -765,8 +792,27 @@ def _seg_entry(lo: int):
     return X_EG, moe[lo - 1].w["streams_eg"].view(T, HC, HID)
 
 
+GRAPH_RESET = os.environ.get("DSV41_E2E_GRAPH_RESET", "0") != "0"
+
+
+def _reset_gen(stream=None) -> None:
+    """Zero this GPU's launch number, arrival count and hello slot on the capture stream (one call per rank: every
+    rank owns its own three words). Inside a whole-step graph this would make replay k start where replay 1 did.
+
+    MEASURED, and why it is OFF by default: it deadlocks. Zeroing this rank's copy of the EXCHANGE_HELLO slots also
+    wipes what a peer may already have written for the step it is still in (the ranks are not host-synchronized per
+    step -- that is the point of the kernel's start barrier), and a peer that has finished its last launch never
+    writes that number again, so the wait for it cannot be satisfied. Measured: 8 ranks, all SMs at 100%, the step
+    never returning. A per-replay reset needs a rendezvous that is atomic with it (a device-side "all ranks are done
+    with the previous step, now zero" kernel), not a stream op in front of the first launch."""
+    lay = (FSUB[0][0] if FUSE else attn[0])
+    lay.sk.reset_gen(int(stream if stream is not None else torch.cuda.current_stream().cuda_stream))
+
+
 def capture_graph() -> None:
-    """One uncaptured pass over every segment (the warm-up a capture needs), then one graph per segment."""
+    """One uncaptured pass over every segment (the warm-up a capture needs), then one graph per segment. The first
+    segment's graph opens with a reset_gen: every replay then starts at launch number 1, which is what the kernel's
+    start barrier (`hello >= gen`) and its exchange-set parity are relative to."""
     global _CAP, _G, _SEGS, _SX, _SR
     assert not _CAP and not _G
     _SEGS = _segments()
@@ -779,10 +825,12 @@ def capture_graph() -> None:
             _segment(lo, hi)
         torch.cuda.synchronize(dev)
         _G = []
-        for lo, hi in _SEGS:
+        for k, (lo, hi) in enumerate(_SEGS):
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 _SX, _SR = _seg_entry(lo)
+                if k == 0 and GRAPH_RESET:
+                    _reset_gen()
                 _segment(lo, hi)
             _G.append(g)
     finally:
@@ -874,7 +922,8 @@ def step():
     _SX, _SR = _seg_entry(0)
     for i in range(a.layers):
         if EG_ON and i in EG_LAYERS:
-            torch.cuda.synchronize(dev)
+            if not EG_ASYNC:                 # (the device-side re-derivation needs no host sync, FINDINGS 12.53.3)
+                torch.cuda.synchronize(dev)
             X_EG[0].copy_(eg_next_x(moe[i - 1], i, dev))
             _SX = X_EG
         _sublayer(i)
@@ -1131,8 +1180,6 @@ if os.environ.get("DSV41_E2E_ONE", "0") != "0":
     os._exit(0)
 
 if GRAPH:
-    assert not FUSE, ("--fuse-sublayers with DSV41_E2E_GRAPH: a captured graph is not idempotent here (FINDINGS 12.44) "
-                      "and the fused path is the one being measured; time it uncaptured")
     capture_graph()
 
 for _ in range(a.warmup):
@@ -1162,6 +1209,10 @@ for _ in range(a.reps):
         fu = _HW.get("fused", 0.0) * 1e6            # (--fuse-sublayers: one launch a layer, attn and moe above are 0)
         log(f"  host per step: attn {at:.0f} us, moe {mo:.0f} us, fused {fu:.0f} us, total {at + mo + fu:.0f} us "
             f"of a {evs[-1]:.0f} us step ({100 * (at + mo + fu) / evs[-1]:.0f}%)")
+        if Lm.HT_ON:
+            tot = sum(Lm.HT.values()) * 1e6
+            log("  fused host by section: " + ", ".join(f"{k} {v * 1e6:.0f}" for k, v in Lm.HT.items()) +
+                f" (sum {tot:.0f} us a step = {tot / a.layers:.1f} us a launch)")
 evs.sort()
 med = evs[len(evs) // 2]
 if _prof is not None:

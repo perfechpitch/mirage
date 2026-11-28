@@ -3591,3 +3591,89 @@ post"占的比例更大。
 
 所以下一步的优先级改了：不是"把 post 提前"，而是**把 Engram 的 host 重算搬进 kernel**（`DSV41_EG_X=1`，让
 MoE 的 post 直接从 R'' 归一化出下一层的 `x`，第 1 次就没有同步点，顺带解锁 CUDA graph）。
+
+## 12.54 Engram 的 host 重算搬到 device：4.29 ms（233 tok/s），逐位不变
+
+§12.53.3 把剩下的空隙归到了两个 host 同步点上：Engram 层（L1、L14）的 `x` 是 host 从 R'' 重算的
+（`eg_next_x`：`hc_coef` 前 4 个 fp32 取 `.cpu()`，再 `norm(pre·R'')`），那两次 `.cpu()` 是整步里唯一的真同步，
+也是 `prev end → barrier` 那个 p50 12 µs / mean 31 µs / max 374 µs 长尾的来源。
+
+`DSV41_EG_ASYNC=1`（现在默认）：`_hc_pre` 不 `.cpu()`，`_apply_pre` 的三个读（`hc_coef`、`streams_eg`、
+`norm.weight`）全部是 device 上的 torch op，排在**本步的 launch stream** 上——所以它们自然排在 MoE L-1 之后、
+attention L 之前，和原来 host 读的是同一批字节（`streams_eg` 是 kernel 写的张量，不是拷贝）。gamma 只读一次
+（`-1`：不是每步的 checkpoint 读，float32 字节相同，乘积相同）。
+
+    融合 + host Engram（12.53）   4785.1 µs  209 tok/s
+    融合 + device Engram          4285.5 µs  233 tok/s   −500 µs（正好是两次同步）
+    再 + rebind 记忆化            4232.9 µs  236 tok/s（HOSTT 开着，含它的计时开销）
+
+**逐位验证**：40 层 163 个数据流张量（`attn/moe` 的 `x_out`/`streams_out` + `streams_eg` + logits）与
+`DSV41_EG_ASYNC=0` 的那次 dump **163/163 完全相同**；层级别记分卡与两 kernel 链**逐行相同**（64/77，最差 3.62）；
+logits vs dec_io2 1.12x、vs dec_io3 0.87x，argmax 343，top-5 集合与 dec_io3 相同。所以这不是"换了一条近似路径"，
+是同一条路径少了一次 host 往返。
+
+（`--dump` 下 `logits.bin` 是 bf16 [T][129280] 的交错写出，比较时要取 `o.reshape(-1, 2)[:, 1]`：第 0 列是 T=1
+的行里没写的 0。这一点写在这里，因为直接 reshape(-1) 会读成 27x band。）
+
+## 12.55 整步一个 CUDA graph：**两条路都实测否掉**（12.45.4 的 follow-up）
+
+`EG_ASYNC` 之后整步不再有 host 读，`_segments()` 因此只剩一段 `[(0, 39)]`，可以整步 capture 了
+（`DSV41_E2E_GRAPH=1`）。capture 成功（`captured 1 graphs over segments [(0, 39)]`），但：
+
+**(a) 每次 replay 前把 launch 号归零（`DSV41_E2E_GRAPH_RESET=1`，新的 `reset_gen_func`）→ 死锁。**
+多卡全 SM 100%、步骤永不返回。原因：归零写的是本 rank 那份 exchange 区里的 **hello slot**，而 peer 可能已经为
+它自己还在跑的这一步写过了；它写完就等，不会再写同一个号，于是本 rank 的 `hello >= gen` 永远等不到。
+要这样归零，必须有一个**与归零原子**的 rendezvous（"所有 rank 都跑完了上一步，现在归零"），不能用 stream 上的
+一个 memset 假装。（原来那段注释说"方向是每次 replay 归零 launch 序号"，本节的结论是：这条方向需要设备端的
+步屏障，不是一次 memset。）
+
+**(b) 不归零 → 第 2 步起漂移，而且慢到 89.5 ms。** `DSV41_E2E_SIG=1` 逐张量指纹：第 1 步 baseline，第 2 步起
+156 个张量变（`attn1.*` 起），与 12.45.4 的"另一个不动点"一致；而且 launch 号单调涨过 40 之后，各 rank 的 start
+barrier 不再有约束力，实测 **89.53 ms/步（11 tok/s）**——比不 capture 慢 20 倍。
+
+**结论：整步 graph 不进主线。** 它要的是 reset/parity 协议的重构（每步一个设备端步屏障 + 每步归零），那是另一
+条工作线，不是这台机器上把 launch 数减半的余量。40 次 launch 的 826 µs 空隙里，能靠 host 省下的部分已经在
+12.54 里拿走了。
+
+## 12.56 host 侧 811 µs 的分解：**53% 是 launch 本身的 7 KB 参数块**
+
+`DSV41_FUSE_HT=1`（fused layer 的 `run()` 里分段计时，诊断用）给出每步：
+`launch 679 µs`、`x 273 µs`、`R 166`、`pos 147`、`emb 19`（10 步累计值 / 10；开着计时本身会让总量略大于
+HOSTT 的 811 µs/步）。
+
+`x` 那 6.8 µs/launch 是 `is_contiguous`/`dtype`/`data_ptr` 加一次 `_rb`（12.55 的记忆化只把重复的 rebind 去掉，
+第一次仍要付）。**`launch` 的 17 µs/launch 是主项**，它是一次 `cudaLaunchKernelEx`：融合 kernel 的参数是
+`Maps`（`__grid_constant__`，52 个 `CUtensorMap` × 128 B = 6.6 KB）**按值**加 `G`（50 个缓冲槽指针 + reset 表），
+每次 launch 驱动都要把这 7 KB 拷进命令缓冲。
+
+这条账说明**空隙里能靠 Python 省的部分已经基本拿完**：把 launch 从 17 µs 降到 ~7 µs 需要把 `maps` 从按值改成
+按指针（`cp.async.bulk.tensor` 的 tmap 操作数因此不再是 const 空间里的参数）——那是一次 kernel 签名层面的改动，
+所有 TMA 任务一起动，风险与收益都要重新量，不在本轮做。剩下的 852 µs 空隙 ≈ 40 × 12 µs 的提交节拍 + 尾部抖动。
+
+## 12.57 验收（本轮全部实测，instrumentation 全关，位置 31906 / 40 层）
+
+| 配置 | 中位数 | p10 | 吞吐 | span 合计 | 核间空隙 | host/步 |
+|---|---|---|---|---|---|---|
+| 两 kernel（80 launch），起点 | 4952.0 µs | 4932.0 | 202 tok/s | 3067.6 µs | 1923.7 µs（38.5%） | 1388 µs |
+| 融合（40 launch） | 4785.1 µs | 4754.7 | 209 tok/s | 3407.5 µs | 1439.1 µs（29.7%） | 745 µs |
+| **融合 + device Engram + rebind 记忆化** | **4234.2 µs** | **4216.5** | **236 tok/s** | 3423.8 µs | 852.2 µs（19.9%） | 715 µs |
+
+`--reps 20 --warmup 3`，同日同机同输入，背靠背；`--spans` 那次（reps 8）是 4276.0 µs / 852.2 µs 空隙，与上表一致。
+
+**总账：4.95 ms → 4.23 ms（−14.5%），202 → 236 tok/s（+17%）。** 分解：
+- 融合把 80 次 launch 变 40：空隙 −485 µs、host −46%（但 span +340 µs，净 −145 µs）
+- device Engram 去掉每步两次 host 同步：−500 µs
+- rebind 记忆化：−50 µs
+
+**正确性（本轮同一个二进制、同一份输入）**：
+| 项 | 结果 |
+|---|---|
+| 163 个数据流张量（40 层 × `x_out`/`streams_out` + `streams_eg` + logits）vs 两 kernel 链 | **163/163 逐位相同** |
+| 80 个 `in{L}_x` / `in{L}_R`（每层被 launch 时的输入）vs 两 kernel 链 | **80/80 逐位相同** |
+| 层级别记分卡（vs `chain_ok`，同一 77 行） | **64/77，逐行与两 kernel 链相同**，最差 3.62（L2 apost） |
+| logits vs dec_io2 | 5.054e-2 = **1.12x band**，argmax **343** |
+| logits vs dec_io3 | 3.906e-2 = **0.87x band**，argmax **343**，top-5 集合相同 |
+| L0–L19 vs `chain_ok` | 逐位相同（relRMS 0） |
+
+**没进主线的三条路（都有实测数字，别重走）**：CUDA graph（单段 4.49 ms 但多次 replay 不幂等，12.45.4；整步一张图
+两条都死：归零→死锁、不归零→89.5 ms，12.55）、L2 prefetch、PDL（与 TP start barrier 设计互斥）。

@@ -632,6 +632,28 @@ static const char *static_launch_stream(cudaStream_t stream, bool pdl) {
 #endif
 }
 
+// (a whole step as ONE graph) zero what kernel_begin's start barrier compares against: the launch number, this GPU's
+// arrival count, and its hello slot (the peers' hello slots are the peers' own copies: each rank zeroes its own). The
+// barrier is `hello >= gen` on a launch number that only ever grows, so a replay whose first launch reads the previous
+// replay's 40 never waits at all -- which is exactly how the multi-replay drift was measured (FINDINGS 12.45.4): the
+// arithmetic was fine, the ORDERING of the ranks was what the host's old inter-launch spacing had been providing.
+// Reset once per replay, on the stream the launches are captured on, and every replay starts where the first one did.
+static const char *static_reset_gen(cudaStream_t stream) {
+#ifdef STATIC_RESET_IN_KERNEL
+  if (g_st.size() != 1) return "reset_gen: one GPU in this process (a layer built for one GPU, or init_rank_func)";
+  static_host::GpuState &s = static_host::g_gpus[0];
+  ST_CK(cudaSetDevice(g_dev0));
+  ST_CK(cudaMemsetAsync(s.g.gen_ptr, 0, sizeof(unsigned), stream));
+  ST_CK(cudaMemsetAsync(s.g.arrive, 0, sizeof(unsigned), stream));
+  ST_CK(cudaMemsetAsync(reinterpret_cast<unsigned char *>(s.g.rv) + static_mk::EXCHANGE_HELLO, 0,
+                        (size_t)static_mk::GPUS * 16, stream));
+  return nullptr;
+#else
+  (void)stream;
+  return "reset_gen needs the serving build (-DSTATIC_RESET_IN_KERNEL)";
+#endif
+}
+
 // per GPU the time between the last launch's two events, in microseconds (after static_wait)
 static cudaError_t static_elapsed(std::vector<float> &us) {
   us.assign(g_st.size(), 0.f);
@@ -802,6 +824,13 @@ static PyObject *py_launch_stream(PyObject *self, PyObject *args) {
   if (err) { PyErr_SetString(PyExc_RuntimeError, err); return NULL; }
   Py_RETURN_NONE;
 }
+static PyObject *py_reset_gen(PyObject *self, PyObject *args) {
+  unsigned long long stream;
+  if (!PyArg_ParseTuple(args, "K", &stream)) return NULL;
+  const char *err = static_reset_gen(reinterpret_cast<cudaStream_t>(stream));
+  if (err) { PyErr_SetString(PyExc_RuntimeError, err); return NULL; }
+  Py_RETURN_NONE;
+}
 static PyObject *py_wait(PyObject *self, PyObject *args) {
   cudaError_t err;
   Py_BEGIN_ALLOW_THREADS
@@ -851,6 +880,9 @@ static PyMethodDef StaticMethods[] = {
   {"elapsed_func", py_elapsed, METH_NOARGS, "per GPU the microseconds between the events around the last launch's kernel"},
   {"set_device_func", py_set_device, METH_VARARGS, "(device): the CUDA device of GPU 0, before init_func"},
   {"launch_stream_func", py_launch_stream, METH_VARARGS, "(stream, pdl): one launch on the caller's stream (one GPU, serving build)"},
+  {"reset_gen_func", py_reset_gen, METH_VARARGS,
+   "(stream): zero the launch number, the arrival count and this GPU's hello slot, on the caller's stream (a whole-step "
+   "CUDA graph: inside the capture, so every replay starts where the first launch of the first replay did)"},
   {"rebind_func", py_rebind, METH_VARARGS, "(name, pointer): graph tensor name read at that address from the next launch on (one GPU)"},
   {"wait_func", py_wait, METH_NOARGS, "wait for every GPU"},
   {"done_func", py_done, METH_NOARGS, "whether every GPU has finished the last launch (no wait)"},
@@ -895,6 +927,12 @@ class StaticKernel:
         """One launch on the caller's CUDA stream (torch.cuda.current_stream().cuda_stream), capturable in a CUDA graph: a layer
         built for one GPU with -DSTATIC_RESET_IN_KERNEL, inside another framework's step; pdl: a programmatic launch."""
         self.module.launch_stream_func(int(stream), bool(pdl))
+
+    def reset_gen(self, stream: int):
+        """Zero the launch number, this GPU's arrival count and its hello slot, on the caller's stream (captured in a
+        whole-step CUDA graph: the start barrier is `hello >= gen` on a counter that only grows, so without this the
+        second replay of a graph does not wait for its peers at all -- FINDINGS 12.45.4)."""
+        self.module.reset_gen_func(int(stream))
 
     def wait(self):
         """Wait for every GPU; RuntimeError if a kernel failed."""
